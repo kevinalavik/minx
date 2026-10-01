@@ -25,6 +25,11 @@ the kernel currently halts).
 11. Hardening — NOT STARTED.
 12. Polish — NOT STARTED.
 
+## Git delivery
+- Phase 1 commit `7707359` is local. Push was attempted twice: first failed with GitHub HTTP 503,
+  retry failed because this environment cannot read GitHub credentials (`could not read Username`).
+  Retry pushing at the next phase boundary when credentials/network are available.
+
 ## Known gaps
 - CPU initialization, exceptions, memory management, SMP startup, scheduler, userland and shell
   remain unimplemented.
