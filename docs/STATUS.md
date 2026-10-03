@@ -71,5 +71,9 @@ sh tools/shot.sh build/minx.iso /tmp/shot.ppm 10   # screenshot the framebuffer
 ```
 
 ## Push status
-Pushing has been attempted after each verified phase; see the notes at the
-bottom of the git log for the outcome of the last attempt.
+`git push origin HEAD` fails in this environment with
+`could not read Username for 'https://github.com'` — no credential helper and no
+token available, and AGENTS.md forbids putting tokens in files or remotes.
+Everything is committed locally in logical commits with the model co-author
+trailer; push as soon as credentials exist. The earlier phase-one attempt hit
+the same wall (see commit "docs: record phase one push limitation").
