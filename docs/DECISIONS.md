@@ -195,3 +195,50 @@ Alternatives: fixing it now.
 Reason: it is wrong but nothing observes the difference yet, and phase 3's real
 work was elsewhere. It is recorded in STATUS.md as a known gap rather than
 quietly left, so it does not become folklore.
+
+## 2026-10-03 — Per-CPU state through %gs, with the pointer in the first word
+Decision: each per-CPU slot's first member is a pointer to its own state, and
+`percpu_self()` is a single `movq %gs:0`.
+Alternatives: indexing the array by a processor number in a register (which
+needs a `swappergs`-style scheme to find the number first); an MSR per field; a
+segment-relative offset per member, which hard-codes every field's offset into the
+assembly that touches it.
+Reason: the accessor is what has to be inlinable, because it is called from
+interrupt handlers that are counting ticks. A "read the processor number, then
+index" accessor needs a register the caller may already be using, and a
+per-member GS offset turns every `percpu_t` change into an assembly change. One
+indirection through the first word keeps the struct a plain C struct and the
+accessor one instruction. The cost is that the accessor cannot find its own
+answer, so `percpu_self_index()` is the one lookup that compares a pointer against
+the array instead.
+
+## 2026-10-03 — The AP trampoline is our own, not Limine's handoff
+Decision: `kernel/arch/x86_64/smp_trampoline.S` takes an application processor
+from real mode to the kernel, and the kernel sends the startup IPIs itself.
+Alternatives: using Limine's per-CPU `goto_address`; mapping the reset vector to
+the kernel's own wait stub; writing the reset vector page directly.
+Reason: the kernel owns its page tables after the CR3 switch and Limine's
+`goto_address` is a boot-time handoff into a world this kernel has already
+replaced, so its preconditions no longer hold. Writing a wait-for-SIPI loop into
+the physical page at `0xfffffff0` would work on this machine, but that page is the
+firmware's and is not in the memory map as usable. Mapping `0xfffff000` in the
+kernel's own tables changes nothing, because a released processor is in real mode
+with paging off and never consults them -- which is the non-obvious part, and the
+reason the obvious fix is not a fix.
+
+## 2026-10-03 — The INIT half of INIT/SIPI is not sent yet
+Decision: `smp_start_all()` sends the two startup IPIs without the preceding INIT,
+and reports a processor that does not come up rather than taking the machine down
+to find out.
+Alternatives: sending a targeted INIT (which resets the sender too); sending the
+"all excluding self" INIT (which releases the processors straight into whatever
+the bootloader's code is at the reset vector); failing the self-test when the
+count is short.
+Reason: an INIT is a level interrupt whose destination field is ignored, so it
+resets every processor including the sender. Releasing a processor sends it to
+`0xfffffff0`, where hardware holds the firmware's wait-for-startup loop and this
+machine holds the bootloader's code; the released processor executes it, faults
+with no IDT of its own, and triple-faults the machine. An incomplete phase that
+still boots and says what it could not do is more useful than a red build that
+says nothing about why.
+
