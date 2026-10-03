@@ -117,7 +117,8 @@ called "Example Model 1" through any CLI tool:
 ## Build and tooling rules
 - Host tools: gcc or clang, GNU make, binutils, nasm or GNU as, xorriso, QEMU
   (`qemu-system-x86_64`), git. Prefer `-ffreestanding` with the host compiler; if a cross
-  toolchain is needed, detect it and fail with a clear message. Install missing tools if permitted.
+  toolchain is needed, detect it and fail with a clear message. Install missing tools if 
+  permitted using the host package manager. Do not setup a sandbox, and prefer CLANG and LLVM
 - `make run` is the contract: clean checkout -> build -> boot to a shell on the graphical
   console in QEMU (`SMP=4` default, `-m 512M`, serial also on stdio, KVM if available else TCG).
   Also provide `all`, `debug`, `test`, `iso`, `clean`, `distclean`, `help`.
