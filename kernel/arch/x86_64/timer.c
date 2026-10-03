@@ -32,8 +32,23 @@ static void lapic_timer_disable(void);
 static volatile uint64_t pit_ticks;
 #define PIT_IRQ_HZ 100
 
+/* The TSC reading taken when the 8253's counter was zeroed, so the TSC and the
+ * 8253 can be compared over the same interval. */
+static uint64_t pit_start_tsc;
+
 uint64_t monotonic_ns(void) {
-    return (rdtsc_ordered() / tsc_hz) * NSEC_PER_SEC;
+    /* Keep the sub-second remainder instead of dividing to whole seconds first:
+     * rdtsc/tsc_hz is a second count, so rounding it away first throws away
+     * every microsecond and leaves a clock that only ticks once a second and
+     * always reads as a whole number.  Multiplying the whole TSC by 1e9 would
+     * overflow after a few minutes at gigahertz rates, so the quotient and the
+     * remainder are converted separately. */
+    uint64_t tsc = rdtsc_ordered();
+    uint64_t seconds = tsc / tsc_hz;
+    uint64_t remainder = tsc % tsc_hz;
+
+    return seconds * NSEC_PER_SEC +
+           remainder * NSEC_PER_SEC / (tsc_hz ? tsc_hz : 1);
 }
 
 uint64_t monotonic_ms(void) {
@@ -49,6 +64,18 @@ uint64_t timer_uptime_ms(void) {
     if (ticks == 0)
         return monotonic_ms();
     return ticks * 1000ull / PIT_IRQ_HZ;
+}
+
+/* The same interval measured with the TSC instead of the 8253.
+ *
+ * The two only mean anything side by side if they start at the same instant, so
+ * this is a delta from the point where the 8253's counter was zeroed, not from
+ * boot: comparing a TSC reading taken at boot against a tick count started later
+ * measures the boot time as a clock error. */
+uint64_t timer_tsc_since_pit_ms(void) {
+    uint64_t elapsed = rdtsc_ordered() - pit_start_tsc;
+    return elapsed / tsc_hz * 1000ull + (elapsed % tsc_hz) * 1000ull /
+                                       (tsc_hz ? tsc_hz : 1);
 }
 
 /* --- PIT: the calibration time base -------------------------------------- */
@@ -77,17 +104,21 @@ static uint32_t pit_ticks_for_us(uint32_t us) {
     return (uint32_t)ticks;
 }
 
-/* Measure the LAPIC timer's rate against the PIT.
+/* Run one exact 65536-tick window on the 8253's channel 2 and report what
+ * happened inside it.
  *
  * Channel 2 is wired to the 8255's speaker path and its OUT2 pin is readable on
- * bit 5 of port 0x61, so counting 65536 ticks gives an exact window of
- * 65536 / 1193182 s without depending on the TSC frequency at all.  The window
- * is opened by raising the gate with the speaker enabled and closed by OUT2
- * going low.
- */
-static bool pit_calibrate(uint32_t *ticks_per_ms) {
-    const uint32_t window_ticks = 0x10000;   /* 65536 */
+ * bit 5 of port 0x61, so counting 65536 ticks gives a window of exactly
+ * 65536 / 1193182 s -- a real-time reference that depends on no frequency
+ * guess, which is the whole point: anything calibrated against the TSC needs a
+ * clock other than the TSC to calibrate against.  The window is opened by
+ * raising the gate with the speaker path enabled and closed by OUT2 going low.
+ *
+ * Both measurements are taken from the same window because taking two windows
+ * doubles the cost and lets the two readings drift apart. */
+#define PIT_WINDOW_TICKS 0x10000u   /* 65536 */
 
+static bool pit_exact_window(uint64_t *tsc_delta, uint32_t *lapic_delta) {
     /* Speaker path off, gate low. */
     uint8_t saved = (uint8_t)(inb(PIT_GATE) & ~0x0c);
     outb(PIT_GATE, (uint8_t)(saved | 0x01));
@@ -107,6 +138,8 @@ static bool pit_calibrate(uint32_t *ticks_per_ms) {
     lapic_timer_disable();
     lapic_write_reg(LAPIC_COUNT, 0xffffffffu);
 
+    uint64_t tsc_start = rdtsc_ordered();
+
     unsigned spins = 0;
     while ((inb(PIT_GATE) & PIT_GATE_BIT) == 0) {
         if (++spins > 200000000u) {
@@ -120,20 +153,36 @@ static bool pit_calibrate(uint32_t *ticks_per_ms) {
     /* Leave the gate low and the speaker off. */
     outb(PIT_GATE, saved);
 
-    uint32_t raw = lapic_read_reg(LAPIC_CURRENT_COUNT);
+    uint32_t lapic_raw = lapic_read_reg(LAPIC_CURRENT_COUNT);
+    uint64_t tsc_elapsed = rdtsc_ordered() - tsc_start;
 
     lapic_timer_disable();
 
-    /* The counter counts down, so the elapsed ticks are the difference between
-     * where it started and where it ended. */
-    uint64_t elapsed = (uint64_t)(uint32_t)(0xffffffffu - raw) + 1ull;
-    if (elapsed == 0)
+    if (tsc_delta)
+        *tsc_delta = tsc_elapsed;
+    if (lapic_delta) {
+        /* The counter counts down, so the elapsed ticks are the difference
+         * between where it started and where it ended. */
+        *lapic_delta = (uint32_t)(0xffffffffu - lapic_raw) + 1u;
+    }
+    return true;
+}
+
+/* Measure the LAPIC timer's rate against the 8253.
+ *
+ * This is the reference every other clock is measured against, so it must not
+ * be measured against the TSC: a TSC of unknown frequency cannot check itself. */
+static bool pit_calibrate(uint32_t *ticks_per_ms) {
+    uint64_t window_ticks = PIT_WINDOW_TICKS;
+
+    uint32_t elapsed;
+    if (!pit_exact_window(NULL, &elapsed))
         return false;
 
     /* ticks_per_ms = elapsed / window_ms, where
      * window_ms = window_ticks / PIT_FREQ * 1000.  Rearranged to keep the
      * multiply in 64 bits: elapsed * PIT_FREQ stays well inside uint64. */
-    uint64_t per_ms = elapsed * PIT_FREQ / ((uint64_t)window_ticks * 1000ull);
+    uint64_t per_ms = (uint64_t)elapsed * PIT_FREQ / ((uint64_t)window_ticks * 1000ull);
     if (per_ms < 1000ull || per_ms > 100000000ull)
         return false;
 
@@ -395,6 +444,7 @@ int pit_irq_init(void) {
 
     pit_program_rate(PIT_IRQ_HZ, divisor);
     pit_ticks = 0;
+    pit_start_tsc = rdtsc_ordered();
 
     if (irq_enable(0) != 0)
         return -1;
@@ -439,8 +489,60 @@ static void lapic_timer_disable(void) {
     }
 }
 
+/* Measure the TSC's real frequency against the 8253.
+ *
+ * The CPUID leaves that could report a TSC frequency are optional and frequently
+ * report nothing at all, and the fallback of assuming one is wrong in whichever
+ * direction the assumption was not checked: on a machine whose TSC runs faster
+ * than the guess, every calibrated delay comes out short -- a "10 ms" wait that
+ * lasts 2 ms, a timeout that fires early, a heartbeat that beats five times too
+ * fast.  There is no way to notice that from inside the kernel unless something
+ * independent is measured against it, and the 8253 is the only such thing here.
+ *
+ * Returns false and leaves the detected value alone if the measurement does not
+ * look like a clock: a TSC that advanced by an implausible amount over a 55 ms
+ * window is more likely a mis-read than a very fast processor. */
+static bool tsc_calibrate(void) {
+    uint64_t detected = tsc_frequency();
+
+    uint64_t elapsed;
+    if (!pit_exact_window(&elapsed, NULL))
+        return false;
+    if (elapsed == 0)
+        return false;
+
+    /* hz = tsc_ticks * PIT_FREQ / window_ticks, entirely in 64 bits. */
+    uint64_t hz = elapsed * PIT_FREQ / PIT_WINDOW_TICKS;
+
+    /* Between 1 MHz and 100 GHz.  Below that it is not a TSC; above it, either
+     * the window was not the window it claims to be or this is not a machine
+     * worth guessing about. */
+    if (hz < 1000000ull || hz > 100000000000ull)
+        return false;
+
+    /* Within 1 per cent of the detected value there is nothing to correct, and
+     * leaving the CPUID number alone keeps its provenance in the log. */
+    if (detected != 0) {
+        uint64_t diff = detected > hz ? detected - hz : hz - detected;
+        if (diff * 100ull <= detected)
+            return false;
+    }
+
+    delay_set_tsc_hz(hz);
+    kprintf("timer: TSC measured at %lu.%03lu MHz against the 8253 "
+            "(detected %lu Hz was wrong)\n",
+            (unsigned long)(hz / 1000000ull),
+            (unsigned long)((hz / 1000ull) % 1000ull),
+            (unsigned long)detected);
+    return true;
+}
+
 int timer_init(void) {
+    /* The TSC has to be right before anything measures anything, because every
+     * delay in the kernel is a TSC delta and the 8253 is the only clock here
+     * that can be trusted to check it. */
     delay_init();
+    tsc_calibrate();
     tsc_hz = tsc_frequency();
 
     kprintf("timer: TSC at %lu MHz (%s)\n",

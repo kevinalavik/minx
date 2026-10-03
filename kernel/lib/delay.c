@@ -3,9 +3,11 @@
  * Busy-waiting on a raw rdtsc() delta needs the TSC frequency, which is not
  * fixed across the machines this kernel is expected to run on.  CPUID leaf
  * 0x15 gives the crystal ratio, leaf 0x16 gives the frequency directly, and KVM
- * exposes leaf 0x40000010.  When none of those are available we assume 1 GHz,
- * which only ever makes a delay longer than requested -- never shorter, so
- * callers can rely on it as a minimum.
+ * exposes leaf 0x40000010.  Those leaves are optional and often report nothing
+ * at all, so they are only ever a first guess: timer_init() measures the TSC
+ * against the 8253 at boot and calls delay_set_tsc_hz() with the result.  Every
+ * delay in the kernel is a TSC delta, so a guess that is wrong is a kernel whose
+ * timeouts fire early rather than late, which is the harder direction to notice.
  */
 #include "delay.h"
 
@@ -67,8 +69,9 @@ void delay_init(void) {
     reported_kvm = kvm;
     reported_cpuid16 = cpuid16;
     if (hz == 0) {
-        /* No frequency information: assume 1 GHz, so a requested delay always
-         * comes out at least as long as asked for. */
+        /* No frequency information from the firmware.  The guess is only a
+         * placeholder: timer_init() replaces it with a measurement against the
+         * 8253 before any delay is taken. */
         hz = 1000000000ull;
     }
     tsc_hz = hz;
@@ -79,6 +82,19 @@ uint64_t tsc_frequency(void) {
     if (!calibrated)
         delay_init();
     return tsc_hz;
+}
+
+/* Replace the detected TSC frequency with a measured one.
+ *
+ * timer.c measures the TSC against the 8253 at boot and hands the result here.
+ * The detected value stays available through delay_report(), because "the
+ * firmware said 1 GHz and the hardware said otherwise" is worth being able to
+ * see in the log. */
+void delay_set_tsc_hz(uint64_t hz) {
+    if (hz == 0)
+        return;
+    tsc_hz = hz;
+    calibrated = true;
 }
 
 bool tsc_is_invariant(void) {

@@ -89,7 +89,7 @@ static void line_submit(void) {
         kprintf("up %lu ms (%lu PIT ticks, %lu ms of TSC)\n",
                 (unsigned long)console_uptime_ms(),
                 (unsigned long)pit_uptime_ticks(),
-                (unsigned long)monotonic_ms());
+                (unsigned long)timer_tsc_since_pit_ms());
     } else if (strcmp(line, "meminfo") == 0) {
         kprintf("heap: %lu KiB total, %lu KiB free, %lu KiB used, "
                 "largest free %lu bytes\n",

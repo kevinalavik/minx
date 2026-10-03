@@ -41,6 +41,10 @@ uint64_t lapic_timer_ticks(void);
  * not depend on the TSC frequency being known. */
 uint64_t timer_uptime_ms(void);
 
+/* The same interval as timer_uptime_ms(), measured with the TSC instead of the
+ * 8253 and from the same starting point, so the two can be compared. */
+uint64_t timer_tsc_since_pit_ms(void);
+
 /* Busy-wait helpers that respect a TSC frequency already calibrated. */
 void timer_sleep_ms(uint64_t ms);
 
