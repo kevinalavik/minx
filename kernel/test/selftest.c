@@ -19,14 +19,16 @@
 #include "delay.h"
 #include "fb.h"
 #include "input.h"
-#include "irq.h"
-#include "percpu.h"
 #include "io.h"
+#include "irq.h"
+#include "keyboard.h"
+#include "percpu.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "panic.h"
 #include "serial.h"
 #include "string.h"
+#include "timer.h"
 #include "types.h"
 
 /* How long to keep the framebuffer on screen after the tests finish. */
@@ -436,50 +438,129 @@ static void test_acpi(void) {
     test_pass("phase2-acpi");
 }
 
-static void test_pic(void) {
-    /* The remap exists so no IRQ vector collides with a CPU exception: the 32
-     * exceptions occupy 0..31, so the 8259s must start at 32 and 40. */
-    uint16_t mask = pic_irq_mask();
-
-    if (mask == 0xffff) {
-        test_fail("phase2-pic", "every PIC line is still masked");
+/* Interrupt delivery.
+ *
+ * The IOAPIC owns the lines once it is up, and the 8259s are masked for good,
+ * so the interesting checks are the IOAPIC's redirection entries and -- the part
+ * that actually matters -- that an interrupt reaches the CPU at all.  The LAPIC
+ * timer and the 8253 are both wired up, and both are counted here, which is the
+ * end-to-end proof that page tables, the APIC and the IDT all work together. */
+static void test_interrupts(void) {
+    if (!interrupts_via_ioapic()) {
+        test_fail("phase2-interrupts",
+                  "the IOAPIC does not own the interrupt lines");
         return;
     }
 
-    /* IRQ0 (the 8253) and IRQ1 (the keyboard) must be unmasked for the console
-     * to be usable; everything else should stay masked until a driver asks. */
-    if ((mask & 1u) != 0) {
-        test_fail("phase2-pic", "IRQ0 (timer) is masked");
-        return;
-    }
-    if ((mask & 2u) != 0) {
-        test_fail("phase2-pic", "IRQ1 (keyboard) is masked");
+    /* With the IOAPIC in charge the legacy chips must stay masked; anything else
+     * means a line has two possible sources and can be delivered twice. */
+    if (pic_irq_mask() != 0xffff) {
+        test_fail("phase2-interrupts",
+                  "the 8259s are not fully masked while the IOAPIC owns the "
+                  "lines (mask %#x)", pic_irq_mask());
         return;
     }
 
-    /* Round-trip a line we do not use.  Unmasking means clearing the bit in the
-     * hardware mask, so the readback has to go from set to clear and back. */
+    if (!lapic_available()) {
+        test_fail("phase2-interrupts", "no local APIC");
+        return;
+    }
+
+    /* Round-trip a line's mask bit through the chip, the same way the 8259 read
+     * back its own mask: an unmask that the hardware ignored has to show up.
+     * Every line starts masked, because ioapic_init() masks the whole chip until
+     * a driver claims the lines it needs. */
+    irq_disable(7);
+    if (!irq_line_masked(7)) {
+        test_fail("phase2-interrupts",
+                  "masking IRQ7 left the IOAPIC's bit clear");
+        return;
+    }
     irq_enable(7);
-    if ((pic_irq_mask() & 0x80u) != 0) {
-        test_fail("phase2-pic", "unmasking IRQ7 left the bit set in the chip");
+    if (irq_line_masked(7)) {
+        test_fail("phase2-interrupts",
+                  "unmasking IRQ7 left the IOAPIC's bit set");
         return;
     }
     irq_disable(7);
-    if ((pic_irq_mask() & 0x80u) == 0) {
-        test_fail("phase2-pic", "masking IRQ7 left the bit clear in the chip");
-        return;
-    }
 
     if (irq_handler(0) == NULL) {
-        test_fail("phase2-pic", "no handler is registered for IRQ0");
+        test_fail("phase2-interrupts", "no handler is registered for IRQ0");
         return;
     }
     if (irq_handler(1) == NULL) {
-        test_fail("phase2-pic", "no handler is registered for IRQ1");
+        test_fail("phase2-interrupts", "no handler is registered for IRQ1");
         return;
     }
 
-    test_pass("phase2-pic");
+    /* Interrupts are still off at this point in the boot, so turn them on for
+     * the length of the measurement and turn them off again: a test that left
+     * them on would race every later check. */
+    if (boot_info.have_timer && !lapic_timer_ticks()) {
+        uint64_t before = lapic_timer_ticks();
+        uint64_t pit_before = pit_uptime_ticks();
+
+        sti();
+        delay_ms(120);
+        cli();
+
+        uint64_t after = lapic_timer_ticks();
+        uint64_t pit_after = pit_uptime_ticks();
+
+        /* The LAPIC timer runs at about 1 kHz, so 120 ms is around 120 ticks.
+         * Requiring at least a handful rather than an exact count keeps this
+         * from being a test of QEMU's timer rather than of the kernel. */
+        if (after - before < 10) {
+            test_fail("phase2-interrupts",
+                      "the LAPIC timer fired %lu times in 120 ms",
+                      (unsigned long)(after - before));
+            return;
+        }
+        if (pit_after - pit_before < 2) {
+            test_fail("phase2-interrupts",
+                      "the 8253 fired %lu times in 120 ms",
+                      (unsigned long)(pit_after - pit_before));
+            return;
+        }
+
+        kprintf("\ninterrupts: LAPIC timer %lu ticks, 8253 %lu ticks in "
+                "120 ms\n", (unsigned long)(after - before),
+                (unsigned long)(pit_after - pit_before));
+    }
+
+    test_pass("phase2-interrupts");
+}
+
+/* The PS/2 controller has to be found, configured and routed, or the graphical
+ * console cannot be typed into.  No scancodes are required here: a keyboard that
+ * nobody has touched yet says nothing, and the interactive path is what proves
+ * they arrive. */
+static void test_keyboard(void) {
+    if (!keyboard_present()) {
+        test_fail("phase2-keyboard", "no PS/2 keyboard was detected");
+        return;
+    }
+    if (!keyboard_ready()) {
+        test_fail("phase2-keyboard",
+                  "the keyboard did not pass its self test");
+        return;
+    }
+    if (keyboard_uses_8042_translation()) {
+        /* Translation is the normal arrangement: the keyboard speaks set 2 and
+         * the controller converts.  It only matters that one of the two was
+         * chosen deliberately, which the log line above already records. */
+        kprintf("\nkeyboard: set 2 with 8042 translation\n");
+    }
+    if (irq_handler(1) == NULL) {
+        test_fail("phase2-keyboard", "IRQ1 has no handler");
+        return;
+    }
+    if (irq_line_masked(1)) {
+        test_fail("phase2-keyboard", "IRQ1 is masked");
+        return;
+    }
+
+    test_pass("phase2-keyboard");
 }
 
 /* The input queue has to survive the pattern the keyboard produces: make, then
@@ -557,7 +638,8 @@ void test_run_all(void) {
     test_interrupt_path();
     test_exception_report();
     test_acpi();
-    test_pic();
+    test_interrupts();
+    test_keyboard();
     test_input_queue();
 
     kprintf("\n%u passed, %u failed\n", passed, failed);
