@@ -1,0 +1,13 @@
+build/
+*.o
+*.d
+*.a
+*.elf
+*.iso
+*.img
+*.bin
+*.log
+qemu.log
+.cache/
+third_party/_fetched/
+.gdb_history

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Enforces the model co-author trailer. Rejects tool names as the co-author.
+msg="$1"
+if ! grep -Eq '^Co-authored-by: .+ <.+@.+>$' "$msg"; then
+  echo "commit-msg: missing 'Co-authored-by: <Model Name> <noreply@vendor>' trailer" >&2
+  exit 1
+fi
+if grep -Ei '^Co-authored-by: .*(claude code|codex|opencode|freebuff|codebuff)' "$msg" >/dev/null; then
+  echo "commit-msg: co-author must be the MODEL name, not the tool name" >&2
+  exit 1
+fi
+exit 0
