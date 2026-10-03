@@ -87,3 +87,111 @@ Decision: the Makefile prefers clang and falls back to gcc when
 Alternatives: requiring clang outright.
 Reason: AGENTS.md asks for clang, and it is the default here, but a host with a
 mismatched `llvm-libs` package should still be able to build the kernel.
+
+## 2026-10-03 — The HHDM offset comes from Limine, not a constant
+Decision: request `limine_hhdm_request` and use the offset the bootloader
+returns, in `kernel/mm/hhdm.c`.
+Alternatives: hard-coding `0xffff800000000000`.
+Reason: the offset is a property of the bootloader's build, not of the
+architecture. A kernel that assumes it computes correct addresses for a machine
+that chose differently, and the failure appears far from the cause: page-table
+frames that resolve to the wrong physical addresses, a direct map that maps the
+wrong thing. Taking it from the bootloader turns a silent assumption into a
+value the log can print.
+
+## 2026-10-03 — The kernel's physical address is discovered, not computed
+Decision: find where the bootloader actually put the image by walking its own
+page tables (`vmm_walk_translate`), instead of assuming
+`image_virt - 0xffffffff80000000`.
+Alternatives: asking the bootloader, or hard-coding the load address.
+Reason: Limine places the image at an address derived from the firmware's
+preferences, and it is not the one the link script suggests — on this machine
+the image is at physical `0x1f92a000`, not at zero. The arithmetic is wrong in a
+way that produces a plausible-looking physical address, so it is used to *check*
+the answer rather than to produce one.
+
+## 2026-10-03 — No PML4 self-mapping; prove the tables are inside the direct map
+Decision: no self-reference at `PML4[PML4_INDEX(HHDM_OFFSET)]`. Instead
+`tables_under_direct_map()` checks that every page-table frame the allocator has
+handed out is below the top of the direct map.
+Alternatives: the conventional self-map, which is what `vmalloc()`-style
+allocators use.
+Reason: the kernel image and the direct map share PML4 slot 511, so a
+self-reference written there overwrites the direct map's own entry. Every kernel
+address then walks to "not present" and the machine triple-faults on the very
+first `CR3` load. The direct map already covers every frame the allocator can
+return, so the check is a proof rather than a duplication: if a frame ever falls
+outside it the kernel says so instead of faulting later.
+
+## 2026-10-03 — The bootloader's reclaimable memory is held across the CR3 switch
+Decision: `pmm_init()` holds every reclaimable range before the CR3 switch and
+`pmm_release_boot_tables()` frees them afterwards, both in `kernel/mm/pmm.c`.
+Alternatives: freeing them as soon as they are seen.
+Reason: Limine's page tables are still the active CR3 when the allocator first
+learns about those ranges. Releasing them early hands out frames that the
+page-table walk is reading, and the result is a fault inside the allocator with
+no useful context.
+
+## 2026-10-03 — The ISA IRQ to IOAPIC pin map is probed, not assumed
+Decision: default to the identity map (pin *n* aliases ISA IRQ *n*), then use the
+8253 to find its own pin at boot by masking every other pin in turn and seeing
+which one answers. A line whose pin is taken that way reports itself
+unroutable so `irq_enable()` fails rather than pretending.
+Alternatives: identity only; or a machine-type quirk table.
+Reason: the identity map is what the architecture suggests and what real
+hardware does, but QEMU's IOAPIC model routes the 8253's IRQ0 to pin 2, and an
+IOAPIC delivers a vector rather than the pin it came from — so a wrong pin is
+indistinguishable from a line that never fires. A quirk table fixes QEMU and
+breaks the next machine; a probe is right on both, costs about a tenth of a
+second, and turns a class of silent bug into a boot-log line.
+
+## 2026-10-03 — LINT0 in fixed delivery, legacy lines edge-triggered
+Decision: LINT0 is unmasked in fixed (not ExtINT) delivery, and the sixteen
+legacy ISA lines are routed edge-triggered.
+Alternatives: leaving LINT0 in ExtINT as the firmware set it, and routing the
+legacy lines level-triggered.
+Reason: ExtINT makes the APIC take the vector from its own LVT entry and ignore
+the one in the message, so every device arrives on the same vector and the
+dispatcher cannot tell a keystroke from a clock tick. And an ISA interrupt is a
+pulse: as a level-triggered entry the chip latches it in its remote-IRR bit and
+re-asserts it for as long as the line stays high, so any device that leaves its
+line asserted — a PS/2 controller with a byte in its output buffer, an 8253 that
+holds its output pin high — produces an endless stream of interrupts nobody
+asked for. Level-triggered entries are for PCI devices with an interrupt-status
+register.
+
+## 2026-10-03 — The TSC is measured against the 8253, not taken from CPUID
+Decision: `timer_init()` runs the 8253's channel-2 gate window (65536 ticks =
+65536/1193182 s of exactly known time), counts TSC ticks across it, and installs
+the result through `delay_set_tsc_hz()`. The CPUID leaves are tried first and
+kept in the boot log.
+Alternatives: believing CPUID; assuming 1 GHz when it says nothing; calibrating
+against the LAPIC timer.
+Reason: all three CPUID leaves that can report a TSC frequency are optional and
+reported zero on the machine this was developed on. The fallback was wrong in
+the direction that makes delays *short*, which is the direction nothing notices:
+a timeout fires early and looks like a fast machine. The LAPIC timer cannot be
+the reference either, because it is itself measured and the two would only be
+compared against each other. The 8253 is the one clock here that depends on no
+frequency guess.
+
+## 2026-10-03 — The bitmap physical allocator, not a buddy allocator
+Decision: one bit per 4 KiB frame over the firmware's usable ranges
+(`kernel/mm/pmm.c`), with contiguous runs available because page tables and large
+mappings need them.
+Alternatives: a buddy allocator, dlmalloc's mmap-like path, one of the allocators
+named in AGENTS.md.
+Reason: it is small enough to read in one sitting, every operation is O(1), and
+it cannot fail to coalesce. Fragmentation is therefore not a class of bug here —
+it is handled once, in the one place that needs contiguity. The bitmap itself
+comes out of a static array because it cannot be allocated by the allocator it
+describes.
+
+## 2026-10-03 — `PTE_CACHE_*` is left as it is until something depends on it
+Decision: the cacheability flags keep using bits 6:7 (the PAT field) rather than
+the PWT/PCD/PS combination the SDM describes, and the framebuffer window stays
+write-combining while MMIO windows are nominally "uncacheable".
+Alternatives: fixing it now.
+Reason: it is wrong but nothing observes the difference yet, and phase 3's real
+work was elsewhere. It is recorded in STATUS.md as a known gap rather than
+quietly left, so it does not become folklore.
