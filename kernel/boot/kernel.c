@@ -10,17 +10,27 @@
 #include <limine.h>
 
 #include "console.h"
+#include "conio.h"
 #include "cpu.h"
 #include "delay.h"
 #include "fb.h"
+#include "input.h"
 #include "io.h"
+#include "irq.h"
+#include "keyboard.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "percpu.h"
+#include "power.h"
 #include "serial.h"
 #include "string.h"
 #include "test.h"
+#include "timer.h"
 #include "types.h"
+
+#include "acpi.h"
+#include "apic.h"
 
 /* Size of the boot CPU's kernel stack.  Generous, because deep call chains in
  * the filesystem and the scheduler need the headroom. */
@@ -228,6 +238,116 @@ static void report_initrd(const struct limine_module_response *resp) {
             m->size, m->address);
 }
 
+/* Bring up the CPU's interrupt hardware.  ACPI first, because it tells us where
+ * the LAPIC is; then the legacy PIC (remapped and masked), the LAPIC itself, the
+ * IOAPIC, and finally the timer. */
+static void cpu_interrupts_init(void) {
+    if (acpi_init(boot_info.rsdp, boot_cmdline.loglevel >= 1) != 0)
+        kwarn("ACPI discovery failed; falling back to the default APIC address");
+
+    unsigned ncpus = 0;
+    const acpi_cpu_t *cpus = acpi_cpu_table(&ncpus);
+
+    /* Register every processor ACPI listed, so the online count and the
+     * per-CPU table agree even before phase 4 starts the application CPUs. */
+    if (ncpus == 0) {
+        (void)percpu_register(boot_info.bsp_lapic_id);
+    } else {
+        for (unsigned i = 0; i < ncpus; i++) {
+            (void)percpu_register(cpus[i].lapic_id);
+            kprintf("cpu: %u: ACPI id %u, LAPIC id %u%s\n", i, cpus[i].id,
+                    cpus[i].lapic_id, cpus[i].enabled ? "" : " (disabled)");
+        }
+    }
+    boot_info.acpu_count = ncpus;
+    percpu_by_index(PERCPU_BOOTSTRAP)->online = true;
+    percpu_by_index(PERCPU_BOOTSTRAP)->started = true;
+
+    kprintf("cpu: %u processor(s) known, %u online\n", percpu_count(),
+            percpu_online_count());
+
+    /* Remap the 8259s out of the exception vector range before they can fire. */
+    pic_init();
+
+    bool have_apic = lapic_init() == 0;
+    bool have_ioapic = have_apic && ioapic_init() == 0;
+
+    if (have_ioapic) {
+        /* Every line now belongs to the IOAPIC, so the legacy PICs can never be
+         * unmasked again. */
+        pic_disable();
+        boot_info.interrupts_via_ioapic = true;
+    } else if (have_apic) {
+        kwarn("no IOAPIC: falling back to the legacy PIC for IRQ routing");
+    } else {
+        kwarn("no local APIC: staying on the 8259s, and the LAPIC timer cannot "
+              "be used");
+    }
+
+    if (timer_init() != 0)
+        kwarn("no LAPIC timer: the kernel will not preempt");
+    else
+        boot_info.have_timer = true;
+
+    /* The 8253 can drive a periodic interrupt through IRQ0 whether or not the
+     * LAPIC is reachable, which is what keeps the time base alive until phase 3
+     * maps the APIC window. */
+    if (pit_irq_init() != 0)
+        kwarn("the PIT timer could not be started either");
+
+    rtc_init();
+    boot_info.have_rtc = true;
+}
+
+/* The idle loop: pump the input queue and halt between events until something
+ * wakes us.  Declared before kmain_stage2, which starts it. */
+static void interactive_console(void);
+
+static char heartbeat_buf[24];
+
+/* Format an unsigned into a small rotating buffer and return it as a string.
+ * Only used by the heartbeat, which cannot afford a kprintf on every tick. */
+static const char *utoa_to_buf(uint64_t value) {
+    static unsigned slot;
+
+    slot = (slot + 1) % 2;
+    char *buf = &heartbeat_buf[slot * 12];
+    if (utoa(value, 10, false, buf, 12) < 0)
+        buf[0] = '\0';
+    return buf;
+}
+
+/* A heartbeat on the serial port alone.  It goes straight to COM1 rather than
+ * through the console so it does not disturb what is on screen, and it makes the
+ * interrupt path observable even when the keyboard is not answering. */
+#define HEARTBEAT_MS 5000
+
+static void heartbeat(uint64_t now_ms, uint64_t *last_ms) {
+    if (now_ms - *last_ms < HEARTBEAT_MS)
+        return;
+    *last_ms = now_ms;
+
+    serial_puts("[hb] up ");
+    serial_puts(utoa_to_buf(now_ms));
+    serial_puts(" ms, pit ");
+    serial_puts(utoa_to_buf(pit_uptime_ticks()));
+    serial_puts(" ticks, irq0 ");
+    serial_puts(utoa_to_buf((uint64_t)irq_count(0)));
+    serial_puts(" irq1 ");
+    serial_puts(utoa_to_buf((uint64_t)irq_count(1)));
+    serial_puts(" scancodes ");
+    serial_puts(utoa_to_buf(keyboard_scancodes()));
+    serial_puts(" events ");
+    serial_puts(utoa_to_buf(keyboard_events()));
+    serial_puts(", input queued ");
+    serial_puts(utoa_to_buf(input_pending()));
+    serial_puts(", if=");
+    serial_puts(interrupts_enabled() ? "1" : "0");
+    serial_puts(" picmask=");
+    serial_puts(utoa_to_buf(pic_irq_mask()));
+    serial_puts("\n");
+}
+
 /* Runs on the kernel's own stack; kmain() switches to it and never returns. */
 static void kmain_stage2(void) {
     print_banner(bootloader_info_request.response);
@@ -269,6 +389,8 @@ static void kmain_stage2(void) {
 
     report_initrd(module_request.response);
 
+    cpu_interrupts_init();
+
     const fb_info_t *fbi = fb_get_info();
     if (fbi->ready) {
         kprintf("console: framebuffer %ux%u, %u bpp; text %ux%u cells\n",
@@ -286,17 +408,44 @@ static void kmain_stage2(void) {
     kprintf("tsc: %lu MHz, %s\n",
             (unsigned long)(tsc_frequency() / 1000000),
             tsc_is_invariant() ? "invariant" : "not invariant");
+    delay_report();
 
     kprintf("boot complete: graphical console live, serial mirrored\n");
+
+    /* Bring up input before either path continues, so the self test can check
+     * that a keyboard was actually found and configured rather than assuming
+     * it. */
+    if (keyboard_init() != 0)
+        kwarn("no keyboard: the graphical console will not accept typing");
 
     if (boot_cmdline.test) {
         test_run_all();
         test_linger_and_exit();
     }
 
-    /* Phase 2 onwards continues here.  Until then, park the CPU so the
-     * graphical console and the serial mirror stay on screen. */
-    khang();
+    interactive_console();
+}
+
+/* The idle loop: pump the input queue and halt between events until something
+ * wakes us. */
+static void interactive_console(void) {
+    kprintf("interrupts enabled; %u IRQ line(s) unmasked\n",
+            16 - __builtin_popcount(pic_irq_mask()));
+
+    conio_banner();
+    sti();
+
+    /* Spin rather than halt: until a time source is known to wake the CPU, a
+     * halt here would park the machine in the first interrupt gap.  Phase 5
+     * replaces this loop with the scheduler's idle path. */
+    uint64_t last = timer_uptime_ms();
+    for (;;) {
+        if (conio_pump() == 0) {
+            for (unsigned spin = 0; spin < 64; spin++)
+                pause_cpu();
+        }
+        heartbeat(timer_uptime_ms(), &last);
+    }
 }
 
 /* --- entry -------------------------------------------------------------- */

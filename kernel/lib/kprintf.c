@@ -198,8 +198,7 @@ int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
 
         case 'u':
         case 'x':
-        case 'X':
-        case 'p': {
+        case 'X': {
             unsigned long long v;
             unsigned base = 10;
             bool upper = false;
@@ -207,10 +206,6 @@ int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
             if (*p == 'x' || *p == 'X') {
                 base = 16;
                 upper = (*p == 'X');
-            } else if (*p == 'p') {
-                base = 16;
-                if (width == 0)
-                    width = 18;
             }
             if (length == 2)
                 v = va_arg(ap, unsigned long long);
@@ -230,6 +225,26 @@ int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
             } else {
                 sink_pad(&s, numbuf, width, left, zero ? '0' : ' ');
             }
+            break;
+        }
+
+        case 'p': {
+            /* A pointer is always pointer-sized, so it must be read as one
+             * regardless of the length modifiers the caller happened to write. */
+            void *ptr = va_arg(ap, void *);
+            unsigned long long v = (unsigned long long)(uintptr_t)ptr;
+
+            if (v == 0) {
+                sink_puts(&s, "(nil)");
+                break;
+            }
+            if (width == 0)
+                width = 16;
+            int n = format_unsigned(numbuf, sizeof(numbuf), v, 16, false);
+            if (n < 0)
+                break;
+            sink_puts(&s, "0x");
+            sink_pad(&s, numbuf, width, left, zero ? '0' : ' ');
             break;
         }
 

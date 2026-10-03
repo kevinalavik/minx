@@ -13,9 +13,14 @@
 
 #include "boot.h"
 #include "console.h"
+#include "acpi.h"
+#include "apic.h"
 #include "cpu.h"
 #include "delay.h"
 #include "fb.h"
+#include "input.h"
+#include "irq.h"
+#include "percpu.h"
 #include "io.h"
 #include "kmalloc.h"
 #include "kprintf.h"
@@ -359,6 +364,184 @@ static void test_string(void) {
     test_pass("phase1-string");
 }
 
+/* ACPI discovery and the interrupt controllers it describes. */
+static void test_acpi(void) {
+    if (!acpi_ready()) {
+        test_fail("phase2-acpi", "no MADT was parsed (RSDP revision %u)",
+                  acpi_version());
+        return;
+    }
+
+    unsigned cpus = 0;
+    const acpi_cpu_t *list = acpi_cpu_table(&cpus);
+
+    if (cpus == 0) {
+        test_fail("phase2-acpi", "the MADT listed no processors");
+        return;
+    }
+    if (cpus > MAX_CPU_COUNT) {
+        test_fail("phase2-acpi", "the MADT listed %u processors, over the "
+                  "kernel's limit of %u", cpus, MAX_CPU_COUNT);
+        return;
+    }
+
+    /* Two processors cannot share a LAPIC id: everything that targets a CPU by
+     * id (IPIs, IOAPIC destinations) would then reach the wrong one. */
+    for (unsigned i = 0; i < cpus; i++) {
+        for (unsigned j = i + 1; j < cpus; j++) {
+            if (list[i].lapic_id == list[j].lapic_id) {
+                test_fail("phase2-acpi",
+                          "processors %u and %u both have LAPIC id %u", i, j,
+                          list[i].lapic_id);
+                return;
+            }
+        }
+    }
+    if (!acpi_has_lapic()) {
+        test_fail("phase2-acpi", "the MADT did not name a local APIC");
+        return;
+    }
+    if (acpi_madt() == NULL || acpi_madt_length() < ACPI_MADT_HEADER_SIZE) {
+        test_fail("phase2-acpi", "the MADT record is missing or too short");
+        return;
+    }
+
+    /* The first processor must be the one that is actually running, otherwise
+     * the topology the kernel logged is not the topology it is on. */
+    if (percpu_lapic_id(PERCPU_BOOTSTRAP) != boot_info.bsp_lapic_id) {
+        test_fail("phase2-acpi",
+                  "the boot processor's MADT entry has LAPIC id %u, the "
+                  "bootloader said %u",
+                  percpu_lapic_id(PERCPU_BOOTSTRAP), boot_info.bsp_lapic_id);
+        return;
+    }
+
+    unsigned ioapics = 0;
+    const acpi_ioapic_t *io = acpi_ioapic_table(&ioapics);
+    if (ioapics == 0) {
+        test_fail("phase2-acpi", "the MADT listed no IOAPIC");
+        return;
+    }
+
+    /* An IOAPIC's MMIO base is a full 32-bit address: truncating it to a byte,
+     * which is easy to do, turns 0xfec00000 into 0x00. */
+    if (io[0].base == 0 || io[0].base < 0x1000u) {
+        test_fail("phase2-acpi",
+                  "IOAPIC 0 has implausible base %#lx, which is what a "
+                  "truncated field looks like",
+                  (unsigned long)io[0].base);
+        return;
+    }
+
+    test_pass("phase2-acpi");
+}
+
+static void test_pic(void) {
+    /* The remap exists so no IRQ vector collides with a CPU exception: the 32
+     * exceptions occupy 0..31, so the 8259s must start at 32 and 40. */
+    uint16_t mask = pic_irq_mask();
+
+    if (mask == 0xffff) {
+        test_fail("phase2-pic", "every PIC line is still masked");
+        return;
+    }
+
+    /* IRQ0 (the 8253) and IRQ1 (the keyboard) must be unmasked for the console
+     * to be usable; everything else should stay masked until a driver asks. */
+    if ((mask & 1u) != 0) {
+        test_fail("phase2-pic", "IRQ0 (timer) is masked");
+        return;
+    }
+    if ((mask & 2u) != 0) {
+        test_fail("phase2-pic", "IRQ1 (keyboard) is masked");
+        return;
+    }
+
+    /* Round-trip a line we do not use.  Unmasking means clearing the bit in the
+     * hardware mask, so the readback has to go from set to clear and back. */
+    irq_enable(7);
+    if ((pic_irq_mask() & 0x80u) != 0) {
+        test_fail("phase2-pic", "unmasking IRQ7 left the bit set in the chip");
+        return;
+    }
+    irq_disable(7);
+    if ((pic_irq_mask() & 0x80u) == 0) {
+        test_fail("phase2-pic", "masking IRQ7 left the bit clear in the chip");
+        return;
+    }
+
+    if (irq_handler(0) == NULL) {
+        test_fail("phase2-pic", "no handler is registered for IRQ0");
+        return;
+    }
+    if (irq_handler(1) == NULL) {
+        test_fail("phase2-pic", "no handler is registered for IRQ1");
+        return;
+    }
+
+    test_pass("phase2-pic");
+}
+
+/* The input queue has to survive the pattern the keyboard produces: make, then
+ * break for the same key, with modifiers changing in between. */
+static void test_input_queue(void) {
+    input_event_t ev;
+
+    input_init();
+    if (!input_empty()) {
+        test_fail("phase2-input", "the queue was not empty after init");
+        return;
+    }
+    if (input_pop(&ev)) {
+        test_fail("phase2-input", "popping an empty queue returned an event");
+        return;
+    }
+
+    /* Fill it past the end and confirm the overflow is reported rather than
+     * quietly overwriting events.  The ring uses sequence counters rather than a
+     * spare sentinel slot, so all INPUT_QUEUE_SIZE slots are usable. */
+    unsigned accepted = 0;
+    for (unsigned i = 0; i < INPUT_QUEUE_SIZE + 8; i++) {
+        ev.type = INPUT_KEY_DOWN;
+        ev.key = 'a' + (i % 26);
+        ev.modifiers = 0;
+        ev.x = ev.y = 0;
+        ev.buttons = 0;
+        if (input_push(&ev))
+            accepted++;
+    }
+    if (accepted != INPUT_QUEUE_SIZE) {
+        test_fail("phase2-input", "the queue accepted %u events into %u slots",
+                  accepted, INPUT_QUEUE_SIZE);
+        return;
+    }
+    if (input_pending() != accepted) {
+        test_fail("phase2-input", "the queue reports %zu pending, %u pushed",
+                  input_pending(), accepted);
+        return;
+    }
+
+    /* Events must come back in the order they went in. */
+    for (unsigned i = 0; i < accepted; i++) {
+        if (!input_pop(&ev)) {
+            test_fail("phase2-input", "the queue emptied after %u of %u",
+                      i, accepted);
+            return;
+        }
+        if (ev.key != (uint32_t)('a' + (i % 26))) {
+            test_fail("phase2-input", "event %u came back as %u, expected %u",
+                      i, ev.key, (uint32_t)('a' + (i % 26)));
+            return;
+        }
+    }
+    if (!input_empty()) {
+        test_fail("phase2-input", "the queue still had events after draining");
+        return;
+    }
+
+    test_pass("phase2-input");
+}
+
 /* --- entry --------------------------------------------------------------- */
 
 void test_run_all(void) {
@@ -373,6 +556,9 @@ void test_run_all(void) {
     test_string();
     test_interrupt_path();
     test_exception_report();
+    test_acpi();
+    test_pic();
+    test_input_queue();
 
     kprintf("\n%u passed, %u failed\n", passed, failed);
     kprintf("TEST-READY\n");

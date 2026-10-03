@@ -35,6 +35,11 @@ typedef struct {
     uint32_t bsp_lapic_id;
 
     uint32_t memmap_entries;
+    uint32_t acpu_count;    /* processors the MADT listed */
+
+    bool     have_timer;
+    bool     have_rtc;
+    bool     interrupts_via_ioapic;
 
     uint32_t acpi_version;   /* 0 = not parsed yet */
 } boot_info_t;

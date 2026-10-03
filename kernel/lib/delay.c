@@ -11,26 +11,46 @@
 
 #include "cpu.h"
 #include "io.h"
+#include "kprintf.h"
 #include "types.h"
 
 static uint64_t tsc_hz;
 static bool calibrated;
 
-static uint64_t detect_tsc_hz(void) {
+/* Raw CPUID values behind the detection, reported at boot so a wrong
+ * calibration is visible rather than mysterious. */
+static uint32_t reported_leaf15;
+static uint32_t reported_kvm;
+static uint32_t reported_cpuid16;
+
+/* KVM's hypervisor leaf is only meaningful when the vendor string matches. */
+#define KVM_SIGNATURE 0x4b564d45u   /* "KVMK" */
+
+static uint64_t detect_tsc_hz(uint32_t *leaf15_ratio, uint32_t *kvm_hz,
+                              uint32_t *cpuid16_hz) {
     uint32_t a, b, c, d;
 
-    /* CPUID leaf 0x16: EAX = crystal clock in Hz, EBX = 0. */
+    /* CPUID leaf 0x16: EAX = crystal clock in Hz, EBX = 0 when available. */
     cpuid_raw(0x16, 0, &a, &b, &c, &d);
+    *cpuid16_hz = a;
     if (a != 0)
         return a;
 
-    /* KVM's TSC frequency leaf. */
-    cpuid_raw(0x40000010, 0, &a, &b, &c, &d);
-    if (a != 0)
-        return a;
+    /* KVM reports the TSC frequency in its hypervisor leaf. */
+    cpuid_raw(0x40000000, 0, &a, &b, &c, &d);
+    if (b == KVM_SIGNATURE) {
+        cpuid_raw(0x40000010, 0, &a, &b, &c, &d);
+        *kvm_hz = a;
+        if (a != 0)
+            return a;
+    } else {
+        *kvm_hz = 0;
+    }
 
-    /* CPUID leaf 0x15: ECX = numerator, EBX:EAX = denominator. */
+    /* CPUID leaf 0x15: ECX = numerator, EBX:EAX = denominator, so the crystal
+     * frequency is ECX * 1e9 / (EBX:EAX). */
     cpuid_raw(0x15, 0, &a, &b, &c, &d);
+    *leaf15_ratio = c != 0 && b != 0 ? (c << 16) | a : 0;
     if (c != 0 && b != 0)
         return (uint64_t)c * 1000000000ull / (uint64_t)b;
 
@@ -41,7 +61,11 @@ void delay_init(void) {
     if (calibrated)
         return;
 
-    uint64_t hz = detect_tsc_hz();
+    uint32_t leaf15 = 0, kvm = 0, cpuid16 = 0;
+    uint64_t hz = detect_tsc_hz(&leaf15, &kvm, &cpuid16);
+    reported_leaf15 = leaf15;
+    reported_kvm = kvm;
+    reported_cpuid16 = cpuid16;
     if (hz == 0) {
         /* No frequency information: assume 1 GHz, so a requested delay always
          * comes out at least as long as asked for. */
@@ -61,6 +85,16 @@ bool tsc_is_invariant(void) {
     uint32_t a, b, c, d;
     cpuid_raw(0x80000007, 0, &a, &b, &c, &d);
     return (d & (1u << 8)) != 0;
+}
+
+/* Reported at boot: a wrong TSC frequency silently skews every calibrated
+ * interval, so the raw CPUID values are worth having in the log. */
+void delay_report(void) {
+    kprintf("tsc: %lu Hz detected, %s\n", (unsigned long)tsc_frequency(),
+            tsc_is_invariant() ? "invariant TSC" : "TSC may vary");
+    kprintf("tsc: cpuid.16=%u Hz kvm.0x40000010=%u Hz cpuid.15=%#x "
+            "(all zero means the assumed fallback was used)\n",
+            reported_cpuid16, reported_kvm, reported_leaf15);
 }
 
 /* rdtsc is not serialising by itself; without LFENCE the compiler and the CPU

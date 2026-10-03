@@ -14,4 +14,8 @@ void delay_seconds(uint64_t seconds);
 uint64_t tsc_frequency(void);
 bool tsc_is_invariant(void);
 
+/* Raw CPUID values behind that detection, reported at boot so a wrong
+ * calibration is visible rather than mysterious. */
+void delay_report(void);
+
 #endif /* MINX_DELAY_H */

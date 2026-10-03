@@ -9,6 +9,7 @@
 #include "boot.h"
 #include "console.h"
 #include "io.h"
+#include "irq.h"
 #include "kprintf.h"
 #include "panic.h"
 #include "string.h"
@@ -87,6 +88,12 @@ void isr_report_exception(regs_t *regs) {
 
 void isr_dispatch(regs_t *regs) {
     uint64_t vector = regs->vector;
+
+    /* The remapped 8259 IRQs land on vectors 32..47. */
+    if (vector >= IRQ_BASE_VECTOR && vector < IRQ_BASE_VECTOR + IRQ_MAX) {
+        irq_dispatch(regs, (unsigned)(vector - IRQ_BASE_VECTOR));
+        return;
+    }
 
     isr_handler_t handler = vector < 256 ? handlers[vector] : NULL;
     if (handler != NULL) {

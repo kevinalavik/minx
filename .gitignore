@@ -11,3 +11,4 @@ qemu.log
 .cache/
 third_party/_fetched/
 .gdb_history
+initrd/tree.stamp

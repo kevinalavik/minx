@@ -83,7 +83,9 @@ void idt_set_gate(int vector, void *handler, uint8_t ist, uint8_t dpl);
 /* Pushed by the assembly stubs in idt_asm.S.  The layout matches the order in
  * which pushq instructions run, and is also the ABI between the kernel and
  * user space (see syscall entry). */
-typedef struct {
+/* Named `regs` as well as typedef'd, because driver headers take the frame as
+ * `struct regs *` and that reads better than the typedef everywhere. */
+typedef struct regs {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t vector;
