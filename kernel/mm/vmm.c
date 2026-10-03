@@ -48,7 +48,21 @@ page_table_t *vmm_tables(void) { return &vmm.tables; }
 uint64_t vmm_translate(uint64_t virt) {
     if (!vmm.active)
         return vmm_walk_translate(virt, NULL);
-    return pte_phys(pt_get(&vmm.tables, virt));
+
+    pte_t leaf = pt_get(&vmm.tables, virt);
+    if (leaf == 0)
+        return 0;
+
+    /* A large page's address field is only where the mapping starts, so the
+     * offset inside the page has to be put back.  Without this every address
+     * in the first half of a 2 MiB page translates to the page's own base --
+     * which is not a wrong answer for the first address and a wrong answer for
+     * every other one, and the addresses being asked about are never the first
+     * one. */
+    if (pte_huge(leaf))
+        return pte_phys(leaf) + (virt & (HUGE_2MIB - 1));
+
+    return pte_phys(leaf);
 }
 
 /* --- MMIO requests ------------------------------------------------------ */

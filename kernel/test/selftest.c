@@ -25,11 +25,13 @@
 #include "percpu.h"
 #include "kmalloc.h"
 #include "kprintf.h"
+#include "pmm.h"
 #include "panic.h"
 #include "serial.h"
 #include "string.h"
 #include "timer.h"
 #include "types.h"
+#include "vmm.h"
 
 /* How long to keep the framebuffer on screen after the tests finish. */
 #define TEST_LINGER_MS 4000
@@ -623,6 +625,254 @@ static void test_input_queue(void) {
     test_pass("phase2-input");
 }
 
+/* --- phase 3: memory ----------------------------------------------------- */
+
+/* Every frame the physical manager hands out has to be addressable, writable
+ * and distinct, and giving it back has to put it in the free pool.  The
+ * accounting is checked against the numbers the allocator reports rather than
+ * against a fixed number, because the machine's memory is whatever the
+ * firmware said it was. */
+static void test_pmm(void) {
+    if (!pmm_ready()) {
+        test_fail("phase3-pmm", "the physical allocator is not ready");
+        return;
+    }
+
+    pmm_stats_t before;
+    pmm_get_stats(&before);
+    if (before.free_frames == 0 || before.free_frames > before.total_frames) {
+        test_fail("phase3-pmm", "%lu of %lu frames are free, which cannot "
+                  "be right", (unsigned long)before.free_frames,
+                  (unsigned long)before.total_frames);
+        return;
+    }
+    if (before.free_frames + before.used_frames != before.total_frames) {
+        test_fail("phase3-pmm", "%lu free plus %lu used is not %lu total",
+                  (unsigned long)before.free_frames,
+                  (unsigned long)before.used_frames,
+                  (unsigned long)before.total_frames);
+        return;
+    }
+
+    /* Frames written through the direct map come back with their own contents
+     * intact, which is what makes the direct map worth having. */
+    enum { PAGES = 32 };
+    uint64_t phys[PAGES];
+    uint8_t *virt[PAGES];
+
+    for (unsigned i = 0; i < PAGES; i++) {
+        virt[i] = pmm_alloc_page();
+        if (virt[i] == NULL) {
+            test_fail("phase3-pmm", "frame %u of %u could not be allocated",
+                      i, PAGES);
+            return;
+        }
+
+        uint64_t p = virt_to_phys(virt[i]);
+        phys[i] = p;
+        if ((p & (page_size - 1)) != 0) {
+            test_fail("phase3-pmm", "frame %u is at %#lx, not page aligned",
+                      i, (unsigned long)p);
+            return;
+        }
+        if (!pmm_physical_is_mapped(p)) {
+            test_fail("phase3-pmm", "frame %u at %#lx is outside the direct "
+                      "map", i, (unsigned long)p);
+            return;
+        }
+        if (vmm_translate((uint64_t)virt[i]) != p) {
+            test_fail("phase3-pmm", "frame %u translates to %#lx, expected "
+                      "%#lx", i, (unsigned long)vmm_translate((uint64_t)virt[i]),
+                      (unsigned long)p);
+            return;
+        }
+
+        memset(virt[i], (int)(i + 1), page_size);
+    }
+
+    /* Distinct frames must not share a page, and a write through one must not
+     * turn up in another: a direct map that aliases every frame to the same
+     * physical page passes every single check above. */
+    for (unsigned i = 0; i < PAGES; i++) {
+        for (unsigned j = i + 1; j < PAGES; j++) {
+            if (phys[i] == phys[j]) {
+                test_fail("phase3-pmm", "frames %u and %u are both at %#lx",
+                          i, j, (unsigned long)phys[i]);
+                return;
+            }
+        }
+        if (virt[i][0] != (uint8_t)(i + 1) ||
+            virt[i][page_size - 1] != (uint8_t)(i + 1)) {
+            test_fail("phase3-pmm", "frame %u no longer holds what was "
+                      "written to it", i);
+            return;
+        }
+    }
+
+    for (unsigned i = 0; i < PAGES; i++)
+        pmm_free_page(virt[i]);
+
+    pmm_stats_t after;
+    pmm_get_stats(&after);
+    if (after.free_frames != before.free_frames) {
+        test_fail("phase3-pmm", "free frames went from %lu to %lu across "
+                  "%u allocations and frees", (unsigned long)before.free_frames,
+                  (unsigned long)after.free_frames, PAGES);
+        return;
+    }
+
+    test_pass("phase3-pmm");
+}
+
+/* A run of contiguous frames has to come back contiguous and in order, because
+ * page tables need a single allocation to map a run.  Getting that wrong is
+ * silent: the frames are all distinct and all writable, they are just not next
+ * to each other. */
+static void test_pmm_contiguous(void) {
+    if (!pmm_ready()) {
+        test_fail("phase3-pmm-contiguous", "the physical allocator is not ready");
+        return;
+    }
+
+    enum { COUNT = 16 };
+    uint8_t *run = pmm_alloc_zeroed_pages(COUNT);
+    if (run == NULL) {
+        test_fail("phase3-pmm-contiguous", "no run of %u frames", COUNT);
+        return;
+    }
+
+    uint64_t first = virt_to_phys(run);
+    for (unsigned i = 0; i < COUNT; i++) {
+        uint64_t p = virt_to_phys(run + i * page_size);
+        if (p != first + (uint64_t)i * page_size) {
+            test_fail("phase3-pmm-contiguous", "frame %u of the run is at "
+                      "%#lx, expected %#lx", i, (unsigned long)p,
+                      (unsigned long)(first + (uint64_t)i * page_size));
+            return;
+        }
+        /* A zeroed allocation that is not zero is a page that was handed out
+         * before and not cleared. */
+        if (run[i * page_size] != 0 || run[i * page_size + page_size - 1] != 0) {
+            test_fail("phase3-pmm-contiguous", "frame %u of the run is not "
+                      "zeroed", i);
+            return;
+        }
+    }
+
+    pmm_free_pages(run, COUNT);
+    test_pass("phase3-pmm-contiguous");
+}
+
+/* The direct map is what makes physical memory reachable at all, so every part
+ * of it has to translate back to the address it is supposed to be covering: the
+ * bottom of RAM, the top of the usable range, and the frames the kernel itself
+ * is standing in. */
+static void test_direct_map(void) {
+    if (!vmm_active()) {
+        test_fail("phase3-direct-map", "the virtual memory manager is not active");
+        return;
+    }
+    if (hhdm_offset == 0) {
+        test_fail("phase3-direct-map", "the direct map offset is zero");
+        return;
+    }
+
+    uint64_t highest = pmm_highest_usable_phys();
+    if (highest == 0) {
+        test_fail("phase3-direct-map", "the allocator reports no usable memory");
+        return;
+    }
+
+    struct {
+        uint64_t phys;
+        const char *what;
+    } probes[] = {
+        { 0x1000, "the first page above the BIOS" },
+        { 0x100000, "1 MiB" },
+        { 0x10000000, "256 MiB" },
+        { highest - page_size, "the last usable frame" },
+    };
+
+    for (unsigned i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        uint64_t virt = probes[i].phys + hhdm_offset;
+
+        if (vmm_translate(virt) != probes[i].phys) {
+            test_fail("phase3-direct-map", "%s (%#lx) translates to %#lx",
+                      probes[i].what, (unsigned long)probes[i].phys,
+                      (unsigned long)vmm_translate(virt));
+            return;
+        }
+        if (!pmm_physical_is_mapped(probes[i].phys)) {
+            test_fail("phase3-direct-map", "%s (%#lx) is not covered",
+                      probes[i].what, (unsigned long)probes[i].phys);
+            return;
+        }
+    }
+
+    /* One past the top of usable memory is not mapped: a mapping that ran past
+     * the end of RAM would hand out frames nobody owns. */
+    if (pmm_physical_is_mapped(highest + page_size)) {
+        test_fail("phase3-direct-map", "the direct map covers %#lx, which is "
+                  "past the last usable frame", (unsigned long)(highest + page_size));
+        return;
+    }
+
+    test_pass("phase3-direct-map");
+}
+
+/* Churn the physical allocator hard enough that a bitmap that forgets to clear
+ * bits, or that hands out the same frame twice, runs out of room or repeats an
+ * address.  A hundred megabyte's worth of one-page allocations in a loop is
+ * cheap in instructions and impossible to survive by accident. */
+static void test_pmm_churn(void) {
+    if (!pmm_ready()) {
+        test_fail("phase3-pmm-churn", "the physical allocator is not ready");
+        return;
+    }
+
+    enum { SLOTS = 64 };
+    uint8_t *held[SLOTS];
+    uint64_t held_phys[SLOTS];
+    unsigned held_count = 0;
+
+    for (unsigned round = 0; round < 4096; round++) {
+        unsigned slot = round % SLOTS;
+        if (held[slot] != NULL) {
+            pmm_free_page(held[slot]);
+            held[slot] = NULL;
+        }
+
+        uint8_t *page = pmm_alloc_page();
+        if (page == NULL) {
+            test_fail("phase3-pmm-churn", "the pool ran dry at round %u of "
+                      "4096", round);
+            return;
+        }
+
+        uint64_t p = virt_to_phys(page);
+        for (unsigned i = 0; i < held_count; i++) {
+            if (held_phys[i] == p) {
+                test_fail("phase3-pmm-churn", "round %u was handed frame "
+                          "%#lx, which %u still holds", round,
+                          (unsigned long)p, i);
+                return;
+            }
+        }
+
+        memset(page, (int)(round & 0xff), 64);
+        held[slot] = page;
+        held_phys[slot] = p;
+        if (slot + 1 > held_count)
+            held_count = slot + 1;
+    }
+
+    for (unsigned i = 0; i < SLOTS; i++)
+        if (held[i] != NULL)
+            pmm_free_page(held[i]);
+
+    test_pass("phase3-pmm-churn");
+}
+
 /* --- entry --------------------------------------------------------------- */
 
 void test_run_all(void) {
@@ -641,6 +891,10 @@ void test_run_all(void) {
     test_interrupts();
     test_keyboard();
     test_input_queue();
+    test_pmm();
+    test_pmm_contiguous();
+    test_direct_map();
+    test_pmm_churn();
 
     kprintf("\n%u passed, %u failed\n", passed, failed);
     kprintf("TEST-READY\n");

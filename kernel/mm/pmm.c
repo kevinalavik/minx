@@ -404,10 +404,14 @@ void pmm_free_phys_page(uint64_t phys) {
     if (frame >= pmm.total_frames)
         return;
 
-    /* A frame that is already free must not be counted twice, or the free-frame
-     * total drifts upward every time something is released twice and the
-     * allocator starts believing it has more memory than the machine has. */
-    if (!bit_test(frame)) {
+    /* Only a frame that was actually in use becomes free, so only that one is
+     * counted.  Releasing a frame that is already free must not add to the
+     * total, or a double free inflates the free count and the allocator starts
+     * believing the machine has more memory than it does.  Testing for the
+     * frame being *free* here gets it exactly backwards: a real free would go
+     * uncounted and a double free counted, and neither shows up as an error --
+     * the memory is simply never given back. */
+    if (bit_test(frame)) {
         pmm.free_frames++;
         if (pmm.reserved_frames > 0)
             pmm.reserved_frames--;
@@ -423,7 +427,7 @@ void pmm_free_phys_range(uint64_t phys, size_t bytes) {
 
     for (uint64_t frame = first; frame < last && frame < pmm.total_frames;
          frame++) {
-        if (!bit_test(frame)) {
+        if (bit_test(frame)) {
             pmm.free_frames++;
             if (pmm.reserved_frames > 0)
                 pmm.reserved_frames--;

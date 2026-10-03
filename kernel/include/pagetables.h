@@ -37,6 +37,11 @@ typedef uint64_t pte_t;
 
 #define PTE_ADDR_MASK   0x000ffffffffff000ull
 
+/* Page sizes the hardware encodes in the PS bit, and so the in-page masks a
+ * translation has to add back for a leaf that is not a 4 KiB table entry. */
+#define HUGE_2MIB      0x200000ull
+#define HUGE_1GIB      0x40000000ull
+
 #define PTE_FLAGS_MASK  0x707ff00000000000ull | PTE_NX | PTE_USER
 
 /* Cacheability shorthands, selecting one of the four PAT encodings. */
