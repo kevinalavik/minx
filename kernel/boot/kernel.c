@@ -26,6 +26,7 @@
 #include "pmm.h"
 #include "power.h"
 #include "serial.h"
+#include "smp.h"
 #include "string.h"
 #include "test.h"
 #include "timer.h"
@@ -383,6 +384,35 @@ static void cpu_interrupts_init(void) {
     boot_info.have_rtc = true;
 }
 
+/* Start every processor the firmware described.
+ *
+ * After the interrupts, the allocator and the kernel's own page tables, and
+ * before the console starts taking input, because an application processor that
+ * fails to come up is a much better thing to hear about in the boot log than to
+ * discover later from a machine that is mysteriously single-CPU.
+ *
+ * Each processor that comes up installs its own GDT, IDT and task register,
+ * points GS at its own per-CPU area, arms its own local APIC timer -- the 8253's
+ * line is routed to the boot processor -- and then halts in its idle loop until
+ * phase 5 gives it something to do. */
+static void smp_init(void) {
+    if (percpu_count() <= 1) {
+        kprintf("smp: only one processor; nothing to start\n");
+        return;
+    }
+
+    if (!boot_info.have_vmm) {
+        kwarn("smp: no kernel page tables, so the AP trampoline cannot be "
+              "mapped; staying on one processor");
+        return;
+    }
+
+    int up = smp_start_all();
+    if (up < 0)
+        kwarn("smp: no application processor came up; the kernel is "
+              "single-CPU\n");
+}
+
 /* The idle loop: pump the input queue and halt between events until something
  * wakes us.  Declared before kmain_stage2, which starts it. */
 static void interactive_console(void);
@@ -495,6 +525,11 @@ static void kmain_stage2(void) {
     delay_report();
 
     kprintf("boot complete: graphical console live, serial mirrored\n");
+
+    /* Bring the other processors up before the console starts answering, so a
+     * machine that comes up single-CPU says so while the log is still being
+     * read rather than being discovered much later. */
+    smp_init();
 
     /* Bring up input before either path continues, so the self test can check
      * that a keyboard was actually found and configured rather than assuming

@@ -35,6 +35,7 @@ uint64_t monotonic_ms(void);
  * counter from the 8253's because they are different clocks at different
  * rates. */
 int      lapic_timer_interrupt_init(void);
+int      lapic_timer_arm_local(void);
 uint64_t lapic_timer_ticks(void);
 
 /* Milliseconds since the PIT started, which is a monotonic time base that does

@@ -121,6 +121,13 @@ void lapic_ipi_all_cpus(uint8_t vector);
 
 /* INIT/SIPI sequence used to start an application processor. */
 void lapic_ipi_init(uint8_t target_lapic);
+/* INIT to every processor *except* this one.  An INIT interrupt ignores its
+ * destination field, so a targeted one resets the sender too; this is the only
+ * encoding of INIT that spares the boot processor. */
+void lapic_ipi_init_all_but_self(void);
+/* Release the INIT level again; while it is asserted the processors stay in reset
+ * and accept no startup IPI. */
+void lapic_ipi_init_deassert_all_but_self(void);
 void lapic_ipi_startup(uint8_t target_lapic, uint8_t vector);
 
 /* IOAPIC redirection table. */

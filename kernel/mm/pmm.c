@@ -356,7 +356,6 @@ uint8_t *pmm_alloc_pages(size_t count) {
         return NULL;
 
     uint64_t total = pmm.total_frames;
-
     for (uint64_t i = 0; i + count <= total; i++) {
         uint64_t start = (pmm.cursor + i) % total;
 
@@ -434,6 +433,28 @@ void pmm_free_phys_range(uint64_t phys, size_t bytes) {
         }
         bit_clear(frame);
     }
+}
+
+bool pmm_phys_page_is_free(uint64_t phys) {
+    if (!pmm.ready || !IS_ALIGNED(phys, page_size))
+        return false;
+
+    uint64_t frame = phys / page_size;
+    return frame < pmm.total_frames && !bit_test(frame);
+}
+
+uint64_t pmm_alloc_phys_page_at(uint64_t phys) {
+    if (!pmm_phys_page_is_free(phys))
+        return 0;
+
+    uint64_t frame = phys / page_size;
+    bit_set(frame);
+    pmm.free_frames--;
+
+    /* Start the next search just past this frame, so a caller taking a specific
+     * low address does not leave the cursor parked at the bottom of memory. */
+    pmm.cursor = (frame + 1) % pmm.total_frames;
+    return phys;
 }
 
 void pmm_free_page(void *virt) {

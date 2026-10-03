@@ -328,6 +328,26 @@ void idt_init(void) {
     lidt(&idt.ptr);
 }
 
+/* LIDT and LGDT are per-processor state, not part of the table itself, so a CPU
+ * that comes up later has to be told where the tables are even though the
+ * kernel only ever fills them in once.  Without this an application processor
+ * takes its first interrupt with no IDT at all and double-faults. */
+void idt_reload(void) {
+    lidt(&idt.ptr);
+}
+
+/* A copy of the GDT pseudo-descriptor.  The application-processor trampoline
+ * runs with paging off and has to load the table itself, and it cannot reach
+ * this static in C, so the values are handed to it as plain integers. */
+dt_ptr_t gdt_descriptor(void) {
+    return gdt_ptr;
+}
+
+/* A copy of the IDT pseudo-descriptor, for the same reason. */
+void idt_descriptor(dt_ptr_t *out) {
+    *out = idt.ptr;
+}
+
 void idt_set_gate(int vector, void *handler, uint8_t ist, uint8_t dpl) {
     if (vector < 0 || vector > 255)
         return;

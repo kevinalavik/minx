@@ -20,6 +20,9 @@ void gdt_init(void);
 void gdt_set_kernel_table(void);
 void gdt_set_user_table(void);
 
+/* Reload the GDT and the task register, for a CPU that installed its own TSS. */
+void gdt_reload(void);
+
 /* Pseudo-descriptor loaded by lgdt/lidt. */
 typedef struct {
     uint16_t limit;
@@ -29,6 +32,19 @@ typedef struct {
 static inline void lgdt(const dt_ptr_t *p) {
     __asm__ volatile("lgdt %0" :: "m"(*p) : "memory");
 }
+
+/* A copy of the GDT pseudo-descriptor, so a CPU that starts with paging off can
+ * load the table itself. */
+dt_ptr_t gdt_descriptor(void);
+
+/* Load the IDT into this CPU.  LIDT is per-processor state, so an application
+ * processor needs it even though the kernel fills the table in only once. */
+void idt_reload(void);
+
+/* Copies of the descriptor pseudo-descriptors, for a CPU that has to load the
+ * tables itself because it starts with paging off. */
+dt_ptr_t gdt_descriptor(void);
+void     idt_descriptor(dt_ptr_t *out);
 
 static inline void lidt(const dt_ptr_t *p) {
     __asm__ volatile("lidt %0" :: "m"(*p) : "memory");

@@ -643,6 +643,32 @@ int lapic_timer_interrupt_init(void) {
     return 0;
 }
 
+/* Arm *this* processor's own LAPIC timer at the rate the boot processor uses.
+ *
+ * A local APIC is per-CPU state: an application processor comes out of its
+ * trampoline with an LVT timer entry the firmware left masked and a count
+ * register of zero, and inherits none of the boot processor's programming.  The
+ * 8253's line is routed to the boot processor's local APIC, so a processor that
+ * does not arm its own counter never ticks at all -- which is not only a lost
+ * time slice, it is a processor that can never notice a halt request, so an idle
+ * loop that waits for one would wait forever.
+ *
+ * The rate is reused rather than recalibrated: it was measured against the 8253
+ * by the boot processor, and every processor's local APIC is driven by the same
+ * bus. */
+int lapic_timer_arm_local(void) {
+    if (!lapic_available() || lapic_ticks_per_ms == 0)
+        return -1;
+
+    lapic_write_reg(LAPIC_LVT_TIMER,
+                    (lapic_read_reg(LAPIC_LVT_TIMER) &
+                     ~(LAPIC_LVT_MASKED | 0xffu)) |
+                        LAPIC_LVT_PERIODIC |
+                        (uint32_t)(TIMER_IRQ_VECTOR & 0xffu));
+    lapic_write_reg(LAPIC_COUNT, lapic_ticks_per_ms);
+    return 0;
+}
+
 uint64_t lapic_timer_ticks(void) {
     return lapic_ticks;
 }

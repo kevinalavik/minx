@@ -873,6 +873,103 @@ static void test_pmm_churn(void) {
     test_pass("phase3-pmm-churn");
 }
 
+/* --- phase 4: SMP -------------------------------------------------------- */
+
+/* Per-processor state has to be *per* processor before it can be *shared* state.
+ *
+ * The check is that this processor's %gs resolves to its own slot and to nothing
+ * else.  A kernel that reads one shared slot from every processor passes every
+ * test in the tree while being exactly the thing that cannot work: two processors
+ * counting interrupts into the same counter produce a total that looks plausible
+ * and is wrong, and nothing crashes to say so.
+ *
+ * This does not require a second processor to exist.  It is the property that has
+ * to hold before one is started, and holding it with one processor is what makes
+ * the difference between "no processor came up" and "a processor came up and
+ * corrupted everything". */
+static void test_percpu(void) {
+    unsigned self = percpu_self_index();
+    percpu_t *me = percpu_self();
+
+    if (self >= percpu_count()) {
+        test_fail("phase4-percpu", "%%gs resolves to processor %u, but only "
+                  "%u are known", self, percpu_count());
+        return;
+    }
+
+    if (me != percpu_by_index(self)) {
+        test_fail("phase4-percpu", "processor %u's %%gs slot holds %p, but "
+                  "slot %u is %p", self, (void *)me, self,
+                  (void *)percpu_by_index(self));
+        return;
+    }
+
+    /* %gs:0 has to be the slot's own state pointer, which is what makes the
+     * accessor one instruction instead of an indexed load. */
+    percpu_t *from_gs;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(from_gs));
+    if (from_gs != me) {
+        test_fail("phase4-percpu", "%%gs:0 is %p, not this processor's own "
+                  "state at %p", (void *)from_gs, (void *)me);
+        return;
+    }
+
+    /* Every known processor has a distinct slot, and no two of them claim the
+     * same LAPIC id -- ACPI listed them, so a duplicate would mean two
+     * processors are being started from one entry. */
+    for (unsigned i = 0; i < percpu_count(); i++) {
+        if (percpu_by_index(i) == NULL) {
+            test_fail("phase4-percpu", "processor %u has no slot", i);
+            return;
+        }
+        for (unsigned j = i + 1; j < percpu_count(); j++) {
+            if (percpu_lapic_id(i) == percpu_lapic_id(j)) {
+                test_fail("phase4-percpu", "processors %u and %u share LAPIC "
+                          "id %u", i, j, percpu_lapic_id(i));
+                return;
+            }
+        }
+    }
+
+    if (percpu_by_index(self)->lapic_id != lapic_id()) {
+        test_fail("phase4-percpu", "slot %u says LAPIC id %u, the hardware "
+                  "says %u", self, percpu_by_index(self)->lapic_id,
+                  lapic_id());
+        return;
+    }
+
+    test_pass("phase4-percpu");
+}
+
+/* How many processors are actually running.
+ *
+ * This reports rather than requires.  A machine where the application processors
+ * could not be started is a machine that still boots, still has a console and
+ * still passes every other check, so failing the whole suite here would turn an
+ * incomplete phase into a red build and hide the fact that it is incomplete.
+ * What it does insist on is that the count is possible: never more online than
+ * known, and never less than the one processor that is certainly running. */
+static void test_smp_online(void) {
+    unsigned known = percpu_count();
+    unsigned online = percpu_online_count();
+
+    if (known == 0) {
+        test_fail("phase4-smp", "no processors are known at all");
+        return;
+    }
+    if (online == 0 || online > known) {
+        test_fail("phase4-smp", "%u of %u processors are online, which is "
+                  "not possible", online, known);
+        return;
+    }
+
+    if (online < known)
+        kprintf("smp: %u of %u processor(s) online; the application "
+                "processors did not start\n", online, known);
+
+    test_pass("phase4-smp");
+}
+
 /* --- entry --------------------------------------------------------------- */
 
 void test_run_all(void) {
@@ -895,6 +992,8 @@ void test_run_all(void) {
     test_pmm_contiguous();
     test_direct_map();
     test_pmm_churn();
+    test_percpu();
+    test_smp_online();
 
     kprintf("\n%u passed, %u failed\n", passed, failed);
     kprintf("TEST-READY\n");

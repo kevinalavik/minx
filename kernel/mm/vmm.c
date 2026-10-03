@@ -123,6 +123,76 @@ int vmm_unmap_mmio(uint64_t phys) {
     return -1;
 }
 
+/* Map a physical range at the *same* virtual address.
+ *
+ * Needed by the application-processor trampoline.  It builds a PDPTE out of the
+ * kernel's first four PML4 entries and loads it as CR3 with PAE on, which maps
+ * the low four gigabytes exactly as the kernel's own tables do; the trampoline
+ * is executing from low memory at that moment and has to keep fetching from
+ * there for a few more instructions before it can switch to the real PML4.  So
+ * the page holding it has to be reachable both ways.
+ *
+ * Only the low region is usable for this: the point of the map is that the
+ * virtual address equals the physical one, and nothing above 4 GiB can have
+ * that. */
+int vmm_map_low_identity(uint64_t phys, size_t bytes) {
+    if (phys == 0 || bytes == 0 || !IS_ALIGNED(phys, page_size))
+        return -1;
+
+    if (phys + bytes > 0x100000000ull)
+        return -1;
+
+    if (!vmm.active) {
+        /* Before the switch there are no kernel tables of our own to add to;
+         * the caller has to be after vmm_init(). */
+        return -1;
+    }
+
+    if (!pt_map_range(&vmm.tables, phys, phys, bytes,
+                      PTE_PRESENT | PTE_WRITE | PTE_CACHE_WB)) {
+        kprintf("[warn] vmm: could not identity-map %#lx\n",
+                (unsigned long)phys);
+        return -1;
+    }
+
+    vmm.stats.kernel_pages += bytes / page_size;
+    kprintf("vmm: identity-mapped %lu KiB at %#lx for the AP trampoline\n",
+            (unsigned long)(bytes / 1024), (unsigned long)phys);
+    return 0;
+}
+
+/* Point the reset vector at `phys`.
+ *
+ * The reset vector at 0xfffffff0 is where a processor goes when it is released
+ * from INIT but has not been told where to start.  Real firmware parks a
+ * halt-and-wait loop there, and that is what the documented INIT/SIPI sequence
+ * assumes.  It is not a safe assumption here: whatever the firmware was, it was
+ * replaced by the bootloader's own image, and on this machine an application
+ * processor released from INIT executes bootloader code, faults with no IDT
+ * loaded, and takes the machine down before the startup IPI is ever sent.
+ *
+ * So the kernel maps its own wait-for-SIPI stub over the page.  Only this
+ * kernel's view of that page changes; the physical memory behind it is untouched
+ * and no firmware is stopped or rewritten.
+ *
+ * A page is mapped, so this rounds down. */
+int vmm_map_reset_vector(uint64_t phys) {
+    const uint64_t reset_page = 0xfffff000ull;
+
+    if (phys == 0 || !IS_ALIGNED(phys, page_size))
+        return -1;
+    if (!vmm.active)
+        return -1;
+
+    if (!pt_map_range(&vmm.tables, reset_page, phys, page_size,
+                      PTE_PRESENT | PTE_WRITE | PTE_CACHE_WB))
+        return -1;
+
+    kprintf("vmm: reset vector points at the AP wait stub at %#lx\n",
+            (unsigned long)phys);
+    return 0;
+}
+
 /* --- init --------------------------------------------------------------- */
 
 /* Every page-table frame the kernel has allocated has to be reachable through

@@ -26,7 +26,6 @@
  * 0xFEE00000 window, which every x86 with an APIC implements. */
 #define LAPIC_PHYS_DEFAULT 0xfee00000u
 #define IOAPIC_PHYS_DEFAULT 0xfec00000u
-#define MSR_APIC_BASE 0x1b
 
 static bool lapic_ok;
 static uint32_t lapic_phys = LAPIC_PHYS_DEFAULT;
@@ -173,9 +172,15 @@ int lapic_init(void) {
 
     lapic_ok = true;
 
+    /* IA32_APIC_BASE bit 10 selects x2APIC and bit 11 is the "this processor
+     * exists" bit.  Reading bit 11 to decide between x2APIC and xAPIC says "x2APIC"
+     * on every machine where the APIC is merely enabled, which is most of them --
+     * and it matters: in real x2APIC mode the memory-mapped register window stops
+     * accepting writes, so every line of this file would be talking to a device
+     * that ignores it. */
     kprintf("LAPIC: physical %#x mapped at %#lx, id %u, %s\n", lapic_phys,
             chosen_virt, id,
-            (msr & (1ull << 11)) ? "x2APIC" : "xAPIC");
+            (msr & (1ull << 10)) ? "x2APIC" : "xAPIC");
 
     /* Enable the APIC and accept spurious interrupts at vector 0xff. */
     uint32_t svr = lapic_read(LAPIC_SVR);
@@ -295,6 +300,41 @@ void lapic_ipi_init(uint8_t target_lapic) {
     lapic_write(LAPIC_ICR_HI, (uint32_t)target_lapic << 24);
     lapic_write(LAPIC_ICR_LO,
                 LAPIC_ICR_ASSERT | ((uint32_t)LAPIC_DM_INIT << 8));
+    ipi_wait();
+}
+
+void lapic_ipi_init_all_but_self(void) {
+    if (!lapic_ok)
+        return;
+    /* The one that has to be right.
+     *
+     * An INIT interrupt ignores its destination field: it resets *every*
+     * processor, including the one that sent it.  A kernel that sends a targeted
+     * INIT to start a single application processor therefore resets itself, and
+     * the machine restarts in the middle of bring-up -- which looks like a hang
+     * at exactly the point the INIT was sent.
+     *
+     * The way out is the destination shorthand 10, "all excluding self", which is
+     * the one encoding INIT does honour.  This is what Linux does before its own
+     * INIT/SIPI sequence, and what Limine relies on. */
+    lapic_write(LAPIC_ICR_HI, 0);
+    lapic_write(LAPIC_ICR_LO,
+                LAPIC_ICR_ALL_BUT_SELF | LAPIC_ICR_ASSERT |
+                    ((uint32_t)LAPIC_DM_INIT << 8));
+    ipi_wait();
+}
+
+void lapic_ipi_init_deassert_all_but_self(void) {
+    if (!lapic_ok)
+        return;
+    /* INIT is a *level*: while the line is asserted the processors stay in
+     * reset and no startup IPI is accepted.  Releasing it is a second write with
+     * the assert bit clear, and it is a separate act from asserting it -- which
+     * is why the delay between them is not optional on hardware that takes the
+     * sequence literally. */
+    lapic_write(LAPIC_ICR_HI, 0);
+    lapic_write(LAPIC_ICR_LO,
+                LAPIC_ICR_ALL_BUT_SELF | ((uint32_t)LAPIC_DM_INIT << 8));
     ipi_wait();
 }
 

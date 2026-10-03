@@ -43,6 +43,15 @@ uint64_t pmm_alloc_phys_page(void);
 uint8_t *pmm_alloc_page(void);          /* zeroed, via the direct map */
 uint8_t *pmm_alloc_zeroed_page(void);
 
+/* Allocate one *specific* frame, for the handful of places that need a
+ * particular address rather than any free one: the application-processor
+ * trampoline has to live below 1 MiB, because the startup IPI carries only
+ * eight bits and the CPU derives the entry point by multiplying them by sixteen.
+ * The normal search walks forward from a cursor that is likely already past the
+ * bottom of memory, so these two do the asking instead. */
+bool     pmm_phys_page_is_free(uint64_t phys);
+uint64_t pmm_alloc_phys_page_at(uint64_t phys);
+
 /* Allocate `count` contiguous frames, or 0 if they are not available as a
  * single run.  Contiguity is what page tables and large mappings need, so it is
  * part of the interface rather than something callers work around. */

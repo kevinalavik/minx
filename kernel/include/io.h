@@ -115,6 +115,13 @@ static inline void irq_restore(uint64_t flags) {
 #define MSR_FS_BASE 0xc0000100
 #define MSR_GS_BASE 0xc0000101
 #define MSR_KERNEL_GS_BASE 0xc0000102
+#define MSR_APIC_BASE 0x0000001b
+
+/* EFER bits the SMP trampoline sets: LME turns long mode on, and NXE has to match
+ * the boot processor or the data segments it reloads behave differently. */
+#define MSR_EFER_LME (1ull << 8)
+#define MSR_EFER_LMA (1ull << 10)
+#define MSR_EFER_NXE (1ull << 11)
 
 /* Control registers only accept 64-bit moves in long mode, so these go through
  * a fixed register rather than a general output constraint. */

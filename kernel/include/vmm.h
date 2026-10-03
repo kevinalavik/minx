@@ -41,6 +41,16 @@ page_table_t *vmm_tables(void);
 int  vmm_map_mmio(uint64_t phys, size_t bytes, const char *name);
 int  vmm_unmap_mmio(uint64_t phys);
 
+/* Map a physical range at the same virtual address, below 4 GiB.  For the
+ * application-processor trampoline, which needs to be fetching from low memory
+ * while it builds the PDPTE it crosses the rest of memory with. */
+int  vmm_map_low_identity(uint64_t phys, size_t bytes);
+
+/* Point the reset vector (0xfffff000) at `phys`, which should be a page holding
+ * a wait-for-startup-IPI loop.  See the comment in vmm.c: firmware's own
+ * behaviour there cannot be assumed. */
+int  vmm_map_reset_vector(uint64_t phys);
+
 /* Reserve a virtual address range for a kernel allocator to fill in later, by
  * mapping it through `pages`.  Used for the heap, which grows by attaching
  * regions the physical allocator hands out. */
