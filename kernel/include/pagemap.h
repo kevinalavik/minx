@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 /* Physical address the linear address maps to, or 0 when unmapped. */
-uint64_t vmm_translate(uint64_t virt, bool *writable);
+uint64_t vmm_walk_translate(uint64_t virt, bool *writable);
 
 bool vmm_is_mapped(uint64_t virt);
 bool vmm_is_writable(uint64_t virt);

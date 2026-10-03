@@ -14,6 +14,7 @@
 #include "cpu.h"
 #include "delay.h"
 #include "fb.h"
+#include "hhdm.h"
 #include "input.h"
 #include "io.h"
 #include "irq.h"
@@ -22,12 +23,16 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "percpu.h"
+#include "pmm.h"
 #include "power.h"
 #include "serial.h"
 #include "string.h"
 #include "test.h"
 #include "timer.h"
 #include "types.h"
+#include "vmm.h"
+
+#include "vectors.h"
 
 #include "acpi.h"
 #include "apic.h"
@@ -81,6 +86,16 @@ static volatile struct limine_rsdp_request rsdp_request = {
     .response = NULL,
 };
 
+/* The higher-half direct map's offset.  Limine randomises it, so phys_to_virt()
+ * cannot be a compile-time expression; every caller depends on this being
+ * answered before anything touches physical memory. */
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_hhdm_request limine_hhdm_request = {
+    .id = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0,
+    .response = NULL,
+};
+
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_mp_request mp_request = {
     .id = LIMINE_MP_REQUEST_ID,
@@ -111,6 +126,20 @@ static volatile uint64_t limine_requests_end_marker[] =
 
 /* Filled in from the Limine responses and read by later phases; see boot.h. */
 boot_info_t boot_info;
+
+/* The memory map, kept reachable after the request block's response pointer is
+ * no longer interesting.  The physical memory manager needs it to decide which
+ * frames the firmware is willing to give up. */
+struct limine_memmap_response *boot_memmap(void) {
+    return memmap_request.response;
+}
+
+/* CR3 as it was handed over by the bootloader, so the tables behind it can be
+ * released once the kernel's own are in place. */
+static uint64_t old_cr3;
+
+uint64_t boot_old_cr3(void) { return old_cr3; }
+void boot_set_old_cr3(uint64_t value) { old_cr3 = value; }
 
 
 
@@ -238,15 +267,23 @@ static void report_initrd(const struct limine_module_response *resp) {
             m->size, m->address);
 }
 
-/* Bring up the CPU's interrupt hardware.  ACPI first, because it tells us where
- * the LAPIC is; then the legacy PIC (remapped and masked), the LAPIC itself, the
- * IOAPIC, and finally the timer. */
+/* Build the physical allocator and then the kernel's own page tables.
+ *
+ * Order matters: ACPI has to be parsed first because it names the APIC windows,
+ * those windows have to be *requested* before the tables exist, and only then
+ * can the tables be built.  The 8259s are remapped before all of it so that a
+ * stray line during bring-up lands on a vector that exists. */
 static void cpu_interrupts_init(void) {
+    /* ACPI first: it names the APIC windows and the processors, and everything
+     * below -- the per-CPU table, the MMIO requests, the routing -- depends on
+     * what it found. */
     if (acpi_init(boot_info.rsdp, boot_cmdline.loglevel >= 1) != 0)
         kwarn("ACPI discovery failed; falling back to the default APIC address");
 
     unsigned ncpus = 0;
     const acpi_cpu_t *cpus = acpi_cpu_table(&ncpus);
+    unsigned nioapics = 0;
+    const acpi_ioapic_t *ioapics = acpi_ioapic_table(&nioapics);
 
     /* Register every processor ACPI listed, so the online count and the
      * per-CPU table agree even before phase 4 starts the application CPUs. */
@@ -269,14 +306,57 @@ static void cpu_interrupts_init(void) {
     /* Remap the 8259s out of the exception vector range before they can fire. */
     pic_init();
 
+    /* The local APIC is a single 4 KiB page at a firmware-declared address, and
+     * the IOAPIC likewise.  Neither is in the direct map, because the direct map
+     * is for RAM: device registers have to be mapped uncacheable on purpose. */
+    if (acpi_has_lapic())
+        vmm_map_mmio(acpi_lapic_address(), page_size, "local APIC");
+    for (unsigned i = 0; i < nioapics; i++) {
+        if (ioapics[i].base != 0)
+            vmm_map_mmio(ioapics[i].base, page_size, "IOAPIC");
+    }
+    /* The well-known defaults, in case firmware was silent about them. */
+    vmm_map_mmio(0xfee00000, page_size, "local APIC (default)");
+    vmm_map_mmio(0xfec00000, page_size, "IOAPIC (default)");
+
+    /* Now the physical allocator exists and the tables can be built with it. */
+    if (pmm_init() != 0) {
+        kwarn("the physical allocator failed to start; staying on the "
+              "bootloader's page tables");
+    } else if (vmm_init() != 0) {
+        kwarn("could not build the kernel's page tables; staying on the "
+              "bootloader's");
+    } else {
+        boot_info.have_vmm = true;
+
+        /* Hand the heap real frames now that there is a physical allocator;
+         * the 4 MiB static arena stays as the floor so a failed pmm_init() is
+         * survivable rather than fatal. */
+        kmalloc_attach_pmm(HEAP_INITIAL_BYTES);
+    }
+
     bool have_apic = lapic_init() == 0;
     bool have_ioapic = have_apic && ioapic_init() == 0;
 
     if (have_ioapic) {
-        /* Every line now belongs to the IOAPIC, so the legacy PICs can never be
-         * unmasked again. */
-        pic_disable();
-        boot_info.interrupts_via_ioapic = true;
+        /* Hand the sixteen legacy lines to the IOAPIC before masking the 8259s.
+         * The order matters: while the lines are still delivered by the PICs the
+         * kernel has to be able to un-mask and re-mask a line in irq_enable(),
+         * and after pic_disable() that path goes through the IOAPIC instead. */
+        /* The ISA lines are edge-triggered pulses; level-triggered entries
+         * would make the chip re-assert anything that leaves its line high,
+         * which on the PS/2 controller means a keystroke handled forever. */
+        if (ioapic_route_legacy_lines(VECTOR_IRQ0, lapic_id(), false) == 0) {
+            irq_set_ioapic_delivery(true);
+
+            /* Every line now has a redirection entry, so the legacy PICs can
+             * never be unmasked again. */
+            pic_disable();
+            boot_info.interrupts_via_ioapic = true;
+        } else {
+            kwarn("the IOAPIC could not take the legacy lines; keeping the "
+                  "8259s in charge of them");
+        }
     } else if (have_apic) {
         kwarn("no IOAPIC: falling back to the legacy PIC for IRQ routing");
     } else {
@@ -284,14 +364,18 @@ static void cpu_interrupts_init(void) {
               "be used");
     }
 
+    /* Install the handler before the timer is armed: a periodic timer that
+     * fires into an unhandled vector would be reported as an unexpected
+     * interrupt on every tick. */
+    lapic_timer_interrupt_init();
+
     if (timer_init() != 0)
         kwarn("no LAPIC timer: the kernel will not preempt");
     else
         boot_info.have_timer = true;
 
-    /* The 8253 can drive a periodic interrupt through IRQ0 whether or not the
-     * LAPIC is reachable, which is what keeps the time base alive until phase 3
-     * maps the APIC window. */
+    /* The 8253 keeps a time base running regardless, which is what the uptime
+     * reporting and the scheduler's timeouts are built on. */
     if (pit_irq_init() != 0)
         kwarn("the PIT timer could not be started either");
 
@@ -429,8 +513,18 @@ static void kmain_stage2(void) {
 /* The idle loop: pump the input queue and halt between events until something
  * wakes us. */
 static void interactive_console(void) {
-    kprintf("interrupts enabled; %u IRQ line(s) unmasked\n",
-            16 - __builtin_popcount(pic_irq_mask()));
+    /* Report which lines are actually unmasked.  The 8259s are fully masked by
+     * design once the IOAPIC owns delivery, so counting clear bits in *their*
+     * mask always prints zero and says nothing about the machine. */
+    unsigned open = 0;
+    for (unsigned line = 0; line < IRQ_MAX; line++)
+        if (!irq_line_masked(line))
+            open++;
+
+    kprintf("interrupts enabled; %u interrupt line(s) deliver (via the %s), "
+            "LAPIC timer %s\n", open,
+            boot_info.interrupts_via_ioapic ? "IOAPIC" : "8259",
+            boot_info.have_timer ? "armed" : "absent");
 
     conio_banner();
     sti();
@@ -457,6 +551,12 @@ void kmain(void) {
     idt_init();
 
     serial_init();
+
+    /* The direct map offset has to be known before anything calls
+     * phys_to_virt(): the framebuffer address, the ACPI tables and every frame
+     * the allocator hands out all go through it. */
+    hhdm_init();
+
     kmalloc_init();
     parse_cmdline();
 

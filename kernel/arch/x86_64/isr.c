@@ -12,7 +12,9 @@
 #include "irq.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "percpu.h"
 #include "string.h"
+#include "vectors.h"
 
 static const char *const exception_names[32] = {
     "divide error",             "debug",
@@ -89,9 +91,18 @@ void isr_report_exception(regs_t *regs) {
 void isr_dispatch(regs_t *regs) {
     uint64_t vector = regs->vector;
 
-    /* The remapped 8259 IRQs land on vectors 32..47. */
+    /* The remapped 8259 IRQs land on vectors 32..47, and the IOAPIC redirects
+     * the same lines to the same vectors once it owns them. */
     if (vector >= IRQ_BASE_VECTOR && vector < IRQ_BASE_VECTOR + IRQ_MAX) {
         irq_dispatch(regs, (unsigned)(vector - IRQ_BASE_VECTOR));
+        return;
+    }
+
+    /* The spurious vector is not a real interrupt: nothing was in flight, so
+     * there is nothing to acknowledge and nothing to run.  Counting it and
+     * returning is all that is correct here. */
+    if (vector == VECTOR_LAPIC_SPURIOUS) {
+        percpu_count_interrupt();
         return;
     }
 

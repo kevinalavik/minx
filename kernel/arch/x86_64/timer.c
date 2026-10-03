@@ -9,6 +9,7 @@
 #include "percpu.h"
 #include "string.h"
 #include "types.h"
+#include "vectors.h"
 
 /* --- monotonic clock ----------------------------------------------------- */
 
@@ -24,6 +25,10 @@ static uint32_t lapic_ticks_per_ms;
 
 /* 8253 state, declared here because the uptime conversion needs it before the
  * PIT section further down. */
+/* Stop the LAPIC timer (defined at the bottom of this file, used by both
+ * calibration methods above and by init). */
+static void lapic_timer_disable(void);
+
 static volatile uint64_t pit_ticks;
 #define PIT_IRQ_HZ 100
 
@@ -94,15 +99,19 @@ static bool pit_calibrate(uint32_t *ticks_per_ms) {
     outb(PIT_CH2, 0x00);
     outb(PIT_GATE, (uint8_t)(saved | 0x03));
 
-    /* LAPIC timer at full speed, counting up from 0xffffffff. */
-    lapic_write_reg(LAPIC_TIMER, 0);
-    lapic_write_reg(LAPIC_TIMER, 1u << 16);
+    /* LAPIC timer in one-shot mode, counting down from 0xffffffff with no
+     * divider, so the current-count register reads how far it has come.  The
+     * LVT Timer entry (0x320) selects the mode and vector; the counter is a
+     * different register (0x380), and writing the count to the LVT would arm
+     * nothing at all. */
+    lapic_timer_disable();
+    lapic_write_reg(LAPIC_COUNT, 0xffffffffu);
 
     unsigned spins = 0;
     while ((inb(PIT_GATE) & PIT_GATE_BIT) == 0) {
         if (++spins > 200000000u) {
             outb(PIT_GATE, saved);
-            lapic_write_reg(LAPIC_TIMER, 0);
+            lapic_timer_disable();
             return false;
         }
         pause_cpu();
@@ -111,12 +120,12 @@ static bool pit_calibrate(uint32_t *ticks_per_ms) {
     /* Leave the gate low and the speaker off. */
     outb(PIT_GATE, saved);
 
-    uint32_t raw = lapic_read_reg(LAPIC_TIMER);
+    uint32_t raw = lapic_read_reg(LAPIC_CURRENT_COUNT);
 
-    /* Divide by 16 from now on so the 32-bit counter cannot wrap inside a
-     * preemption period. */
-    lapic_write_reg(LAPIC_TIMER, 0x3b);
+    lapic_timer_disable();
 
+    /* The counter counts down, so the elapsed ticks are the difference between
+     * where it started and where it ended. */
     uint64_t elapsed = (uint64_t)(uint32_t)(0xffffffffu - raw) + 1ull;
     if (elapsed == 0)
         return false;
@@ -143,9 +152,9 @@ static uint32_t pit_reference_hz(void) {
  * soft-float helpers are not available in a freestanding kernel.
  */
 static bool lapic_calibrate(uint32_t *ticks_per_ms) {
-    /* Stop counting, then run at full speed (divide by 1). */
-    lapic_write_reg(LAPIC_TIMER, 0);
-    lapic_write_reg(LAPIC_TIMER, 1u << 16);
+    /* Stop counting, then run one-shot from 0xffffffff with no divider. */
+    lapic_timer_disable();
+    lapic_write_reg(LAPIC_COUNT, 0xffffffffu);
 
     uint64_t tsc_start = rdtsc_ordered();
     uint64_t expected = (tsc_hz / 1000u) * 20u;   /* a 20 ms window */
@@ -154,12 +163,10 @@ static bool lapic_calibrate(uint32_t *ticks_per_ms) {
     while (rdtsc_ordered() - tsc_start < expected)
         pause_cpu();
 
-    uint32_t raw = lapic_read_reg(LAPIC_TIMER);
+    uint32_t raw = lapic_read_reg(LAPIC_CURRENT_COUNT);
     uint64_t tsc_elapsed = rdtsc_ordered() - tsc_start;
 
-    /* Leave the timer divide-by-16 so the 32-bit counter cannot wrap within a
-     * preemption period. */
-    lapic_write_reg(LAPIC_TIMER, 0x3b);
+    lapic_timer_disable();
 
     if (tsc_elapsed == 0)
         return false;
@@ -301,7 +308,7 @@ size_t rtc_format(const rtc_time_t *t, char *buf, size_t size) {
 
 /* --- 8253 on IRQ0: the time base that needs no MMIO --------------------- */
 
-#define PIT_IRQ_VECTOR 32   /* IRQ0, straight after the remapped 8259 range */
+#define PIT_IRQ_VECTOR VECTOR_IRQ0   /* IRQ0 lands on the first device line */
 
 /* Program channel 0 for a periodic rate and count. */
 void pit_program_rate(uint32_t hz, uint32_t divisor) {
@@ -317,6 +324,55 @@ static void pit_irq(struct regs *regs) {
     percpu_count_interrupt();
 }
 
+/* Find out which IOAPIC pin actually carries the 8253's interrupt.
+ *
+ * The kernel can raise this line whenever it likes, which makes it the one
+ * legacy interrupt that can be located rather than assumed, and locating it
+ * matters because "pin n is ISA IRQ n" is an expectation and not a guarantee:
+ * QEMU's IOAPIC model routes the 8253's IRQ0 to pin 2, so a kernel that
+ * programs the identity map gets a 100 Hz clock arriving on IRQ2's vector,
+ * where nothing is listening.  Nothing about the delivery tells the guest that
+ * it came from the wrong pin -- the chip hands over a vector and nothing else --
+ * so the only way to get it right is to go and look.
+ *
+ * Each pin is given the PIT's own vector with every other pin masked, and the
+ * pin whose vector turns up is the one the clock is on.  Masking the others is
+ * what makes the attribution sound: with several pins live, an interrupt cannot
+ * be traced back to the pin that raised it.
+ *
+ * The rate is raised for the probe so that a window short enough to keep the
+ * whole scan down to a fraction of a second still contains several ticks. */
+#define PIT_PROBE_HZ     2000u
+#define PIT_PROBE_WINDOW 6u
+
+static bool pit_probe_pin(unsigned vector) {
+    uint8_t cpu = ioapic_primary_cpu();
+
+    ioapic_mask_all_legacy_pins();
+
+    for (unsigned pin = 0; pin < 16; pin++) {
+        if (ioapic_route_pin_to_vector(pin, vector, cpu) != 0)
+            continue;
+
+        uint64_t before = pit_uptime_ticks();
+
+        sti();
+        delay_ms(PIT_PROBE_WINDOW);
+        cli();
+
+        if (pit_uptime_ticks() != before) {
+            kprintf("timer: the 8253's interrupt is on IOAPIC pin %u, "
+                    "not pin 0\n", pin);
+            ioapic_set_legacy_pin(0, pin);
+            return true;
+        }
+    }
+
+    kprintf("[warn] timer: no IOAPIC pin answered for the 8253; assuming "
+            "pin 0\n");
+    return false;
+}
+
 /* Start the 8253 as a periodic interrupt on IRQ0. */
 int pit_irq_init(void) {
     /* The nearest divisor to PIT_FREQ/PIT_IRQ_HZ that fits in 16 bits. */
@@ -326,11 +382,20 @@ int pit_irq_init(void) {
     if (divisor > 0xffff)
         divisor = 0xffff;
 
+    if (irq_register(0, pit_irq, "pit") != 0)
+        return -1;
+
+    /* Find the real pin before programming it, then route the whole legacy set
+     * once the mapping is known so the table matches what the machine does. */
+    pit_program_rate(PIT_PROBE_HZ, PIT_FREQ / PIT_PROBE_HZ);
+    if (ioapic_count() > 0)
+        pit_probe_pin(PIT_IRQ_VECTOR);
+    if (ioapic_route_legacy_lines(VECTOR_IRQ0, ioapic_primary_cpu(), false) != 0)
+        return -1;
+
     pit_program_rate(PIT_IRQ_HZ, divisor);
     pit_ticks = 0;
 
-    if (irq_register(0, pit_irq, "pit") != 0)
-        return -1;
     if (irq_enable(0) != 0)
         return -1;
 
@@ -350,12 +415,29 @@ uint32_t pit_irq_hz(void) {
 
 /* --- init ---------------------------------------------------------------- */
 
-/* Vector used for the preemption tick; see docs/SYSCALLS.md once it exists. */
+/* The preemption tick gets its own vector rather than one of the sixteen
+ * device lines, so it cannot be confused with the 8253 on IRQ0 -- both are
+ * timers, and both were previously routed to the same vector, where the
+ * dispatcher could not tell which had fired. */
 #ifndef TIMER_IRQ_VECTOR
-#define TIMER_IRQ_VECTOR 32
+#define TIMER_IRQ_VECTOR VECTOR_LAPIC_TIMER
 #endif
 
 uint32_t lapic_timer_ticks_per_ms(void);
+
+/* Stop the LAPIC timer.  Writing zero to the count register halts it; the LVT
+ * Timer entry is left alone because it also carries the vector, which later
+ * phases still need. */
+static void lapic_timer_disable(void) {
+    lapic_write_reg(LAPIC_COUNT, 0);
+    /* Wait for the counter to actually stop: the write is posted, and reading
+     * the current count back immediately can still return the old value. */
+    for (unsigned spins = 0; spins < 1000u; spins++) {
+        if (lapic_read_reg(LAPIC_CURRENT_COUNT) == 0)
+            return;
+        pause_cpu();
+    }
+}
 
 int timer_init(void) {
     delay_init();
@@ -401,20 +483,66 @@ int timer_init(void) {
      * progress indicator available; it is not running now. */
     pit_oneshot(pit_ticks_for_us(1000));
 
-    /* Program a 1 ms tick.  Divide by 16 is already set, and the vector is
-     * periodic. */
+    /* Program a periodic 1 ms tick.
+     *
+     * Two registers are involved and confusing them is silent: the LVT Timer
+     * entry (0x320) holds the vector and the periodic bit, and the count
+     * register (0x380) holds the period.  Writing the period into the LVT arms
+     * no timer at all, which is exactly what used to happen here.  The counter
+     * is a full 32 bits wide and the LVT only carries 8 bits of vector. */
     uint32_t period = ticks_per_ms;
     if (period < 1)
         period = 1;
-    if (period > 0xffffffu)
-        period = 0xffffffu;
+    if (period > 0xffffffffu)
+        period = 0xffffffffu;
 
-    lapic_write_reg(LAPIC_TIMER, 0);
-    lapic_write_reg(LAPIC_TIMER, (0x3u << 16) | (TIMER_IRQ_VECTOR & 0xff) | period);
+    lapic_timer_disable();
 
-    kprintf("timer: LAPIC timer armed for %u us, vector %u\n", 1000,
-            TIMER_IRQ_VECTOR);
+    /* Unmasked, periodic, with the vector in the low byte.  Clearing the mask bit
+     * is the part that matters: the firmware leaves it set, and a masked LVT
+     * arms a timer that counts down and never interrupts -- which looks exactly
+     * like a working timer whose interrupts are being dropped somewhere else. */
+    lapic_write_reg(LAPIC_LVT_TIMER,
+                    (lapic_read_reg(LAPIC_LVT_TIMER) &
+                     ~(LAPIC_LVT_MASKED | 0xffu)) |
+                        LAPIC_LVT_PERIODIC |
+                        (uint32_t)(TIMER_IRQ_VECTOR & 0xffu));
+    lapic_write_reg(LAPIC_COUNT, period);
+
+    kprintf("timer: LAPIC timer armed periodic, vector %u, count %u "
+            "(%u ticks/ms)\n", (unsigned)TIMER_IRQ_VECTOR, period,
+            ticks_per_ms);
     return 0;
+}
+
+/* --- the tick ------------------------------------------------------------ */
+
+/* Ticks on the LAPIC timer.  Kept separate from the 8253's counter: the two are
+ * different clocks at different rates, and phase 5's scheduler needs the one
+ * that actually drives preemption. */
+static volatile uint64_t lapic_ticks;
+
+static void lapic_timer_interrupt(struct regs *regs) {
+    (void)regs;
+    lapic_ticks++;
+    percpu_count_interrupt();
+
+    /* Phase 5 turns this into the scheduler tick.  Until then the counter is
+     * still the proof that the timer interrupt path works at all. */
+    if (lapic_ticks == 1)
+        kprintf("timer: LAPIC timer interrupt arrived (vector %u)\n",
+                (unsigned)VECTOR_LAPIC_TIMER);
+
+    lapic_eoi();
+}
+
+int lapic_timer_interrupt_init(void) {
+    isr_install_handler(VECTOR_LAPIC_TIMER, lapic_timer_interrupt);
+    return 0;
+}
+
+uint64_t lapic_timer_ticks(void) {
+    return lapic_ticks;
 }
 
 uint32_t lapic_timer_ticks_per_ms(void);

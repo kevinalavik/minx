@@ -103,6 +103,22 @@ extern void isr_stub_44(void);
 extern void isr_stub_45(void);
 extern void isr_stub_46(void);
 extern void isr_stub_47(void);
+extern void isr_stub_48(void);
+extern void isr_stub_49(void);
+extern void isr_stub_50(void);
+extern void isr_stub_51(void);
+extern void isr_stub_52(void);
+extern void isr_stub_53(void);
+extern void isr_stub_54(void);
+extern void isr_stub_55(void);
+extern void isr_stub_56(void);
+extern void isr_stub_57(void);
+extern void isr_stub_58(void);
+extern void isr_stub_59(void);
+extern void isr_stub_60(void);
+extern void isr_stub_61(void);
+extern void isr_stub_62(void);
+extern void isr_stub_63(void);
 
 /* IST index for the vectors that need a private stack: #DF, NMI and the
  * machine check exception get one each. */
@@ -141,6 +157,21 @@ static struct {
     { 42, 0, isr_stub_42 }, { 43, 0, isr_stub_43 },
     { 44, 0, isr_stub_44 }, { 45, 0, isr_stub_45 },
     { 46, 0, isr_stub_46 }, { 47, 0, isr_stub_47 },
+    { 48, 0, isr_stub_48 }, { 49, 0, isr_stub_49 },
+    { 50, 0, isr_stub_50 },
+    { 51, 0, isr_stub_51 },
+    { 52, 0, isr_stub_52 },
+    { 53, 0, isr_stub_53 },
+    { 54, 0, isr_stub_54 },
+    { 55, 0, isr_stub_55 },
+    { 56, 0, isr_stub_56 },
+    { 57, 0, isr_stub_57 },
+    { 58, 0, isr_stub_58 },
+    { 59, 0, isr_stub_59 },
+    { 60, 0, isr_stub_60 },
+    { 61, 0, isr_stub_61 },
+    { 62, 0, isr_stub_62 },
+    { 63, 0, isr_stub_63 },
 };
 
 /* --- TSS ---------------------------------------------------------------- */

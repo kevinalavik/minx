@@ -20,9 +20,11 @@
 #define ADDR_MASK 0x000ffffffffff000ull
 #define ADDR_SHIFT 12
 
-/* Walk the four levels.  Returns the physical address the linear address maps
- * to, or 0 when it is not mapped. */
-uint64_t vmm_translate(uint64_t virt, bool *writable) {
+/* Walk the four levels of whatever tables are in CR3.  Returns the physical
+ * address the linear address maps to, or 0 when it is not mapped.  This is the
+ * low-level version used before (and independently of) the kernel owning its own
+ * tables; vmm_translate() is the same walk against the kernel's tables. */
+uint64_t vmm_walk_translate(uint64_t virt, bool *writable) {
     if (writable)
         *writable = false;
 
@@ -55,12 +57,12 @@ uint64_t vmm_translate(uint64_t virt, bool *writable) {
 }
 
 bool vmm_is_mapped(uint64_t virt) {
-    return vmm_translate(virt, NULL) != 0;
+    return vmm_walk_translate(virt, NULL) != 0;
 }
 
 bool vmm_is_writable(uint64_t virt) {
     bool writable = false;
-    if (vmm_translate(virt, &writable) == 0)
+    if (vmm_walk_translate(virt, &writable) == 0)
         return false;
     return writable;
 }

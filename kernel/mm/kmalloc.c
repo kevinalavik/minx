@@ -3,6 +3,7 @@
 #include <stdalign.h>
 
 #include "kprintf.h"
+#include "pmm.h"
 #include "string.h"
 #include "types.h"
 
@@ -38,6 +39,7 @@ static size_t total_bytes;
 static size_t used_bytes;
 static size_t free_bytes;
 static unsigned region_count;
+static bool pmm_backed;   /* the heap has taken real frames at least once */
 
 /* Payloads must stay 16-byte aligned for the atomic FPU/SSE context areas, and
  * a header has to be a whole number of those so that the next block's header
@@ -133,12 +135,42 @@ void kmalloc_init(void) {
     used_bytes = 0;
     free_bytes = 0;
     region_count = 0;
+    pmm_backed = false;
 
     if (!arena_used) {
         kmalloc_attach_region(boot_arena, sizeof(boot_arena));
         arena_used = true;
     }
 }
+
+int kmalloc_attach_pmm(size_t bytes) {
+    if (!pmm_ready())
+        return -1;
+
+    size_t frames = pmm_frames_for(bytes);
+    if (frames == 0)
+        return -1;
+
+    uint8_t *region = pmm_alloc_pages(frames);
+    if (region == NULL) {
+        kprintf("[warn] heap: no %lu contiguous frames for the heap\n",
+                (unsigned long)frames);
+        return -1;
+    }
+
+    /* The frames come back through the direct map, which the virtual memory
+     * manager has to have built; without it phys_to_virt is not a valid
+     * address. */
+    kmalloc_attach_region(region, frames * page_size);
+    pmm_backed = true;
+
+    kprintf("heap: attached %lu KiB from the physical allocator at %p, "
+            "%lu KiB free\n", (unsigned long)(frames * page_size / 1024),
+            region, (unsigned long)kmalloc_free_bytes() / 1024);
+    return 0;
+}
+
+bool kmalloc_has_pmm(void) { return pmm_backed; }
 
 void *kmalloc(size_t size) {
     if (size == 0)

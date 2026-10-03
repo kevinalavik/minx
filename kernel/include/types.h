@@ -10,10 +10,21 @@
 /* Physical/virtual address helpers.  The kernel is linked into the higher
  * half; the direct map window lands 4 GiB above it. */
 #define KERNEL_VIRT_BASE 0xffffffff80000000ULL
-#define HHDM_OFFSET      0xffff800000000000ULL
 
-#define phys_to_virt(p) ((uint64_t)(p) + HHDM_OFFSET)
-#define virt_to_phys(v) ((uint64_t)(v) - HHDM_OFFSET)
+/* The higher-half direct map's base offset.
+ *
+ * This is *not* a constant.  Limine 12 randomises the offset (for KASLR), and
+ * reports it through the protocol's HHDM response; hard-coding
+ * 0xffff800000000000 makes every phys_to_virt() read land somewhere else, which
+ * shows up as the allocator handing out frames whose contents are whatever the
+ * machine happens to have at a random physical address.  mm/hhdm.c asks the
+ * bootloader for the real value at boot and this variable holds it. */
+extern uint64_t hhdm_offset;
+
+#define HHDM_OFFSET hhdm_offset
+
+#define phys_to_virt(p) ((uint64_t)(p) + hhdm_offset)
+#define virt_to_phys(v) ((uint64_t)(v) - hhdm_offset)
 
 #define KERNEL_STACK_TOP 0xffffffff80000000ULL
 

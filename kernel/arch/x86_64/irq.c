@@ -5,6 +5,7 @@
 #include "io.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "percpu.h"
 #include "types.h"
 
 typedef struct {
@@ -57,13 +58,39 @@ bool irq_enabled(unsigned irq) {
     return irq_slots[irq].enabled;
 }
 
+/* Whether the IOAPIC, rather than the 8259s, is delivering the device lines. */
+static bool via_ioapic;
+
+/* Set once the IOAPIC has been given every line and the 8259s have been masked
+ * for good.  From that point the IOAPIC's redirection entries are the only
+ * thing that can deliver a device interrupt. */
+void irq_set_ioapic_delivery(bool enabled) {
+    via_ioapic = enabled;
+}
+
+bool interrupts_via_ioapic(void) {
+    return via_ioapic;
+}
+
 int irq_enable(unsigned irq) {
     if (irq >= IRQ_MAX)
         return -1;
 
-    uint16_t mask = pic_irq_mask();
-    mask &= (uint16_t)~(1u << irq);
-    pic_set_mask(mask);
+    if (via_ioapic) {
+        /* A line whose IOAPIC pin turned out to belong to another device has no
+         * redirection entry, so unmasking it would be a lie.  Failing is the
+         * point: the alternative is a driver that believes it owns an
+         * interrupt line that can never arrive. */
+        if (!ioapic_legacy_line_routable(irq))
+            return -1;
+
+        ioapic_unmask_line(0, irq);
+    } else {
+        uint16_t mask = pic_irq_mask();
+        mask &= (uint16_t)~(1u << irq);
+        pic_set_mask(mask);
+    }
+
     irq_slots[irq].enabled = true;
     return 0;
 }
@@ -72,11 +99,30 @@ int irq_disable(unsigned irq) {
     if (irq >= IRQ_MAX)
         return -1;
 
-    uint16_t mask = pic_irq_mask();
-    mask |= (uint16_t)(1u << irq);
-    pic_set_mask(mask);
+    if (via_ioapic) {
+        ioapic_mask_line(0, irq);
+    } else {
+        uint16_t mask = pic_irq_mask();
+        mask |= (uint16_t)(1u << irq);
+        pic_set_mask(mask);
+    }
+
     irq_slots[irq].enabled = false;
     return 0;
+}
+
+/* Read the mask bit back out of the IOAPIC's redirection entry, the same way
+ * pic_irq_mask() reads the 8259's OCW1: a write the hardware ignored has to be
+ * visible, or the rest of the kernel would believe a line is unmasked when it
+ * is not. */
+bool irq_line_masked(unsigned irq) {
+    if (irq >= IRQ_MAX)
+        return true;
+
+    if (via_ioapic)
+        return ioapic_line_masked(0, irq);
+
+    return (pic_irq_mask() & (1u << irq)) != 0;
 }
 
 void pic_eoi(unsigned irq) {
@@ -92,10 +138,21 @@ void irq_dispatch(struct regs *regs, unsigned irq) {
         return;
 
     irq_slots[irq].count++;
+    percpu_count_interrupt();
 
-    /* Acknowledge before running the handler: a handler that blocks would
-     * otherwise leave the PIC asserting the line and stop further IRQs. */
-    pic_eoi(irq);
+    /* Acknowledge the source before running the handler: a handler that blocked
+     * would otherwise leave the interrupt pending and stop further IRQs.
+     *
+     * When the IOAPIC owns the lines, acknowledging means an end-of-interrupt to
+     * the local APIC, not an OCW2 to the 8259 -- and, for a level-triggered
+     * line, an explicit clear of the IOAPIC's Remote IRR bit, which is what
+     * releases a handler that reads its device to completion. */
+    if (interrupts_via_ioapic()) {
+        ioapic_eoi(irq);
+        lapic_eoi();
+    } else {
+        pic_eoi(irq);
+    }
 
     irq_handler_t handler = irq_slots[irq].handler;
     if (handler != NULL)

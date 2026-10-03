@@ -40,6 +40,7 @@ typedef struct {
     bool     have_timer;
     bool     have_rtc;
     bool     interrupts_via_ioapic;
+    bool     have_vmm;       /* CR3 points at the kernel's own page tables */
 
     uint32_t acpi_version;   /* 0 = not parsed yet */
 } boot_info_t;
@@ -58,6 +59,14 @@ void kstack_enter(void *top, void (*entry)(void)) __attribute__((noreturn));
 
 /* Called by the bootloader once the request block has been answered. */
 void kmain(void);
+
+/* The bootloader's memory map, for the physical memory manager. */
+struct limine_memmap_response *boot_memmap(void);
+
+/* CR3 as the bootloader left it, so its page tables can be released once the
+ * kernel switches to its own. */
+uint64_t boot_old_cr3(void);
+void     boot_set_old_cr3(uint64_t cr3);
 
 /* Small helpers shared by the boot code. */
 int atoi_simple(const char *s);

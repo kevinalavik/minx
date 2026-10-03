@@ -30,6 +30,13 @@ bool irq_enabled(unsigned irq);
 int  irq_enable(unsigned irq);
 int  irq_disable(unsigned irq);
 
+/* Whether the IOAPIC, rather than the 8259s, delivers the device lines, and
+ * whether the mask bit says a line is currently blocked.  The second reads the
+ * hardware back rather than a cached copy, exactly like pic_irq_mask(). */
+void irq_set_ioapic_delivery(bool enabled);
+bool interrupts_via_ioapic(void);
+bool irq_line_masked(unsigned irq);
+
 /* Counters, so the self test can prove an interrupt really fired. */
 uint64_t irq_count(unsigned irq);
 

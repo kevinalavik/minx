@@ -20,6 +20,14 @@ void  kmalloc_init(void);
 /* Hand a page-aligned, page-sized-multiple region to the allocator. */
 void  kmalloc_attach_region(void *base, size_t size);
 
+/* Take `bytes` worth of real frames from the physical allocator and attach them,
+ * mapped through the direct map.  Called once the virtual memory manager is
+ * live; before that the kernel has nothing but the static arena. */
+int kmalloc_attach_pmm(size_t bytes);
+
+/* Whether the heap has ever taken frames from the physical allocator. */
+bool kmalloc_has_pmm(void);
+
 void *kmalloc(size_t size);
 void *kzalloc(size_t size);
 void *kcalloc(size_t count, size_t size);

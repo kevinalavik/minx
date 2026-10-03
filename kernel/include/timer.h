@@ -31,6 +31,12 @@ uint32_t pit_irq_hz(void);
 uint64_t monotonic_ns(void);
 uint64_t monotonic_ms(void);
 
+/* Ticks on the LAPIC timer, which is what drives preemption.  A separate
+ * counter from the 8253's because they are different clocks at different
+ * rates. */
+int      lapic_timer_interrupt_init(void);
+uint64_t lapic_timer_ticks(void);
+
 /* Milliseconds since the PIT started, which is a monotonic time base that does
  * not depend on the TSC frequency being known. */
 uint64_t timer_uptime_ms(void);

@@ -82,6 +82,15 @@ uint32_t acpi_version(void);
 /* Total length in bytes of the MADT, so later phases can map its region. */
 size_t acpi_madt_length(void);
 
+/* Keep an ACPI-defined region out of the physical allocator.
+ *
+ * The RSDP and the tables it points at are read from firmware memory long after
+ * the firmware has formally stopped using it: ACPI tables are typically in a
+ * region Limine reports as ACPI reclaimable.  Handing those frames to the page
+ * allocator would corrupt the MADT while the kernel is still parsing it, and the
+ * failure would look like a random bad length rather than a use-after-free. */
+int  acpi_reserve_tables(void);
+
 /* Record how many redirection entries a programmed IOAPIC actually has. */
 void acpi_note_ioapic_entries(unsigned index, uint32_t entries);
 

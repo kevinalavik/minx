@@ -56,7 +56,9 @@ ISR_NOERR 29
 ISR_NOERR 30
 ISR_NOERR 31
 
-/* Hardware IRQs remapped to 32..47 by the PIC.  These carry no error code. */
+/* Device interrupt lines 0x20..0x2f: the remapped 8259 range, and the same
+ * vectors the IOAPIC redirects GSIs to once it owns the lines.  These carry no
+ * error code. */
 ISR_NOERR 32
 ISR_NOERR 33
 ISR_NOERR 34
@@ -73,6 +75,25 @@ ISR_NOERR 44
 ISR_NOERR 45
 ISR_NOERR 46
 ISR_NOERR 47
+
+/* Local APIC sources and inter-processor interrupts, 0x30..0x3f.  These carry
+ * no error code either. */
+ISR_NOERR 48
+ISR_NOERR 49
+ISR_NOERR 50
+ISR_NOERR 51
+ISR_NOERR 52
+ISR_NOERR 53
+ISR_NOERR 54
+ISR_NOERR 55
+ISR_NOERR 56
+ISR_NOERR 57
+ISR_NOERR 58
+ISR_NOERR 59
+ISR_NOERR 60
+ISR_NOERR 61
+ISR_NOERR 62
+ISR_NOERR 63
 
 /* Common tail: the stub has already pushed the vector (and error code).  Fill
  * in the remaining registers in exactly the order regs_t declares them, align
