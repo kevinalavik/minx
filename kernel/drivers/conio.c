@@ -27,6 +27,7 @@
 static inline uint64_t console_uptime_ms(void) { return timer_uptime_ms(); }
 static inline uint32_t cpu_lapic_id(unsigned i) { return percpu_lapic_id(i); }
 static inline uint64_t cpu_interrupt_count(unsigned i) { return percpu_interrupts(i); }
+static inline uint64_t cpu_ipi_count(unsigned i) { return percpu_ipis(i); }
 
 /* A short line of typed input, so the echo can be edited before it is acted on. */
 #define CONIO_LINE_MAX 256
@@ -104,12 +105,13 @@ static void line_submit(void) {
         kprintf("%u processor(s) known, %u online; this one is %u\n",
                 percpu_count(), percpu_online_count(), percpu_self_index());
         for (unsigned i = 0; i < percpu_count(); i++) {
-            kprintf("cpu %u: LAPIC id %u, %s%s, %llu interrupts, %llu idle "
-                    "wakeups\n",
+            kprintf("cpu %u: LAPIC id %u, %s%s, %llu interrupts, %llu IPIs, "
+                    "%llu idle wakeups\n",
                     i, cpu_lapic_id(i),
                     percpu_is_started(i) ? "started" : "not started",
                     percpu_is_online(i) ? ", online" : "",
                     (unsigned long long)cpu_interrupt_count(i),
+                    (unsigned long long)cpu_ipi_count(i),
                     (unsigned long long)percpu_idle_ticks(i));
         }
     } else if (strcmp(line, "keys") == 0) {

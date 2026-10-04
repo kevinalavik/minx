@@ -1,6 +1,6 @@
 # STATUS
 
-Current phase: 4 (SMP) — phases 1 to 3 VERIFIED, all 4 processors online
+Current phase: 4 (SMP) — phases 1 to 3 VERIFIED; all 4 processors online, contended locks and IPIs proven; scheduler is what is left
 
 ## Phases
 | # | Phase | State | Evidence / command |
@@ -8,7 +8,7 @@ Current phase: 4 (SMP) — phases 1 to 3 VERIFIED, all 4 processors online
 | 1 | Toolchain & boot, framebuffer console | VERIFIED | `make test` → 17/17 PASS, framebuffer dump captured; `make run` boots to a graphical console at 1280x800 with 160x50 text cells. Serial log shows the memory map, RSDP, `SMP: 4 CPUs`, initrd and heap. Panic path verified separately (register dump + stack trace on both consoles) while fixing bring-up bugs. |
 | 2 | CPU core, keyboard into console | VERIFIED | `phase2-acpi` (4 processors with distinct LAPIC ids, IOAPIC at 0xfec00000), `phase2-interrupts` (IOAPIC owns all 16 lines, 8259s stay masked, a mask round trip changes the chip's own bit, and both the LAPIC timer and the 8253 really fire over 120 ms with interrupts on), `phase2-keyboard` (8042 self test, scancode set 1, reachable on IRQ 1), `phase2-input` (event ring in and out in order). Typed keys reach the graphical console: `tools/type-test.sh` types `help`, `keys`, `irqs`, `uptime`, `meminfo` and all five answer. |
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
-| 4 | SMP | IN PROGRESS | **All 4 processors come up and stay up.** `phase4-percpu` (this processor's `%gs` resolves to its own slot, every known processor has a distinct slot and LAPIC id), `phase4-tss` (every processor has its own TSS, its own descriptor, a limit that covers the I/O map base and an IST 1 stack) and `phase4-smp` (the online count is possible) all pass. `cpus` on the graphical console reports all four started and online with per-CPU interrupt and idle-wakeup counters moving. Remaining in this phase: IPIs between processors, a scheduler with run queues and spinlocks, and per-CPU idle. |
+| 4 | SMP | IN PROGRESS | **All 4 processors come up and stay up, contend on locks and take each other's interrupts.** `make test` → 28/28. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs` (the MCS queue under the same contention), `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave` (no critical section ever entered while held), `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. **Left in this phase: the scheduler** — preemption, per-CPU run queues, stealing, a real idle task — which is phase 5. |
 | 5 | Scheduler & kernel threads | NOT STARTED | |
 | 6 | Userspace entry | NOT STARTED | |
 | 7 | Processes, signals, pipes | NOT STARTED | |
@@ -196,15 +196,23 @@ looked like it was working.
 - **Allocator**: first-fit free list with coalescing over regions handed to it
   explicitly. A 4 MiB static arena is attached at boot and 64 MiB more comes
   from the physical allocator once the direct map is live.
-- **SMP**: all four processors online. Per-CPU state reached through `%gs`; the
-  bootloader's own per-processor hand-off (`mp_info->goto_address`) used to start
-  the application processors, each given its own stack, IST stacks, TSS and GDT
-  descriptor; per-CPU LAPIC timer arming and per-CPU GDT/IDT/TSS reload. The
-  INIT/SIPI path is kept but not used — see above.
-- **Self tests**: twenty in-kernel checks (`minx.test=1`) plus a
+- **SMP**: all four processors online, each with its own stack, IST stacks, TSS
+  and GDT descriptor, local APIC timer and IDT/GDT/TSS reload. Started through the
+  bootloader's own per-processor hand-off (`mp_info->goto_address`) — see above.
+  IPIs are sent through the local APIC's ICR with a delivery wait, with handlers on
+  all four IPI vectors, and a per-CPU work slot that a reschedule IPI drains; that
+  is the seed of the run queues. The INIT/SIPI path is kept but not used.
+- **Locking**: `kernel/include/spinlock.h` and `kernel/lib/spinlock.c` — atomics
+  (add/sub/CAS on a `lock`-prefixed instruction), ticket locks, MCS locks, a mutex,
+  a semaphore, the interrupt-save spinlock variants, per-CPU lock flags, and the
+  three barriers. Order and rules are in `docs/LOCKING.md`.
+- **Self tests**: twenty-eight in-kernel checks (`minx.test=1`) plus a
   host-compiled allocator fuzz test (`make test-host`).
 
 ## Known bugs / gaps
+- The mutex and the semaphore spin instead of sleeping. Correct, and right for a
+  short critical section; wrong for one that can block, which is why the wait
+  queues they would need are not written yet either. Phase 5.
 - `kprintf` has no lock, so several processors announcing themselves at once
   interleave their output on the framebuffer and the serial mirror ("smp: 2x" etc).
   Spinlocks are phase 5; until then the interleaving is cosmetic and the `cpus`

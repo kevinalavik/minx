@@ -413,6 +413,11 @@ static void smp_init(void) {
         return;
     }
 
+    /* Handlers first: an application processor can take an IPI as soon as it is
+     * started, and a vector with nothing installed on it is an unreported triple
+     * fault. */
+    smp_ipi_handlers_install();
+
     int up = smp_start_all();
 
     /* Only now is nothing running on the bootloader's page tables, so only now

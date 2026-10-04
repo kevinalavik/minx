@@ -28,6 +28,8 @@
 #include "pmm.h"
 #include "panic.h"
 #include "serial.h"
+#include "spinlock.h"
+#include "smp.h"
 #include "string.h"
 #include "timer.h"
 #include "types.h"
@@ -957,6 +959,584 @@ static void test_percpu(void) {
  * incomplete phase into a red build and hide the fact that it is incomplete.
  * What it does insist on is that the count is possible: never more online than
  * known, and never less than the one processor that is certainly running. */
+/* --- lock and IPI contention -------------------------------------------- */
+
+/* Rounds per processor.  Small enough that a contended test does not dominate the
+ * run, large enough that two processors really do overlap: at a few hundred the
+ * whole thing fits inside one processor's first pass and nothing contends. */
+#define ATOMIC_ROUNDS  20000
+#define CONTEND_ROUNDS 8000
+#define FAIR_ROUNDS    64
+
+/* --- atomics ----------------------------------------------------------- */
+
+static void atomic_worker(void *arg) {
+    atomic_t *a = arg;
+
+    for (unsigned i = 0; i < ATOMIC_ROUNDS; i++)
+        atomic_increment(a);
+}
+
+
+/* Run `work` on every online processor and wait for all of them to finish.
+ *
+ * Work for another processor goes through its per-CPU work slot and a reschedule
+ * IPI, which is the same path the scheduler will use; work for this processor runs
+ * inline, because there is nothing that could run it later.
+ *
+ * `done` counts completions.  The wait is on the count rather than on the work
+ * slot, so a worker that never runs shows up as a timeout and a missed total
+ * instead of a test that passes because nothing contended. */
+typedef struct {
+    void (*fn)(void *);
+    void     *arg;
+    atomic_t *done;
+} fanout_t;
+
+/* Test-only: how far each processor has got, so a fan-out that never finishes can
+ * be looked at rather than waited on. */
+
+/* Runs on whichever processor the fan-out reached, then counts itself.  The count
+ * has to happen here rather than in the caller: the caller is the boot processor,
+ * and only it comes back from the loop -- the others are somewhere else entirely. */
+static void fanout_trampoline(void *arg) {
+    fanout_t *f = arg;
+
+    f->fn(f->arg);
+    atomic_increment(f->done);
+}
+
+static unsigned fanout_every_cpu(void (*work)(void *), void *arg,
+                                 atomic_t *done) {
+    unsigned indices[MAX_CPU_COUNT];
+    unsigned n = smp_online_indices(indices, MAX_CPU_COUNT);
+    unsigned self = percpu_self_index();
+    fanout_t f = { work, arg, done };
+
+    for (unsigned i = 0; i < n; i++) {
+        if (indices[i] == self) {
+            fanout_trampoline(&f);
+            continue;
+        }
+
+        if (percpu_queue_work(indices[i], fanout_trampoline, &f) != 0) {
+            test_fail("phase4-locks", "processor %u's work slot is already "
+                      "occupied", indices[i]);
+            return 0;
+        }
+        if (smp_kick_cpu(indices[i]) != 0) {
+            test_fail("phase4-locks", "could not kick processor %u",
+                      indices[i]);
+            return 0;
+        }
+    }
+
+    for (unsigned waited = 0; waited < 5000; waited++) {
+        if ((unsigned)atomic_load(done) >= n)
+            break;
+        delay_ms(1);
+    }
+
+    return n;
+}
+
+/* --- atomics ----------------------------------------------------------- */
+
+static void test_atomics(void) {
+    atomic_t a;
+
+    atomic_init(&a, 5);
+    if (atomic_load(&a) != 5) {
+        test_fail("phase4-atomics", "a counter initialised to 5 reads %ld",
+                  (long)atomic_load(&a));
+        return;
+    }
+
+    if (atomic_fetch_add(&a, 3) != 5 || atomic_load(&a) != 8) {
+        test_fail("phase4-atomics", "fetch_add returned %ld and left %ld, "
+                  "expected 5 and 8", (long)atomic_fetch_add(&a, 0),
+                  (long)atomic_load(&a));
+        return;
+    }
+
+    if (atomic_fetch_sub(&a, 3) != 8 || atomic_load(&a) != 5) {
+        test_fail("phase4-atomics", "fetch_sub left the counter at %ld",
+                  (long)atomic_load(&a));
+        return;
+    }
+
+    /* The CAS has to fail on a stale expectation and leave the counter alone.
+     * Returning the *previous* value from fetch_add and overwriting on a failed
+     * CAS are both easy to get backwards, and both would pass a CAS-only test. */
+    if (atomic_cas(&a, 4, 99)) {
+        test_fail("phase4-atomics", "a compare-and-swap against a stale value "
+                  "reported success");
+        return;
+    }
+    if (atomic_load(&a) != 5) {
+        test_fail("phase4-atomics", "a failed compare-and-swap changed the "
+                  "counter to %ld", (long)atomic_load(&a));
+        return;
+    }
+    if (!atomic_cas(&a, 5, 42) || atomic_load(&a) != 42) {
+        test_fail("phase4-atomics", "a compare-and-swap against the current "
+                  "value did not take");
+        return;
+    }
+
+    /* Counting up from several processors at once must not lose an increment, and
+     * this is the one check that would catch an atomic that is not one. */
+    atomic_init(&a, 0);
+    atomic_t done;
+
+    atomic_init(&done, 0);
+    fanout_every_cpu(atomic_worker, &a, &done);
+
+    uint32_t online = percpu_online_count();
+    uint32_t expected = online * ATOMIC_ROUNDS;
+
+    if ((uint32_t)atomic_load(&a) != expected) {
+        test_fail("phase4-atomics", "%u processors each added %u, giving %ld, "
+                  "expected %u", online, ATOMIC_ROUNDS, (long)atomic_load(&a),
+                  expected);
+        return;
+    }
+    if ((uint32_t)atomic_load(&done) != online) {
+        test_fail("phase4-atomics", "only %ld of %u processors finished",
+                  (long)atomic_load(&done), online);
+        return;
+    }
+
+    test_pass("phase4-atomics");
+}
+
+/* --- ticket lock ------------------------------------------------------- */
+
+typedef struct {
+    ticket_lock_t lock;
+    volatile uint64_t counter;
+} contend_t;
+
+static void contend_worker(void *arg) {
+    contend_t *c = arg;
+
+    for (unsigned i = 0; i < CONTEND_ROUNDS; i++) {
+
+        ticket_lock(&c->lock);
+
+        /* Deliberately a read, some work and a write rather than one increment:
+         * a "lock" that was really an atomic on the counter would pass the
+         * increment version and fail this. */
+        uint64_t v = c->counter;
+        for (volatile unsigned spin = 0; spin < 16; spin++)
+            ;
+        c->counter = v + 1;
+
+        ticket_unlock(&c->lock);
+    }
+}
+
+static void test_lock_contention(void) {
+    unsigned online = percpu_online_count();
+
+    if (online == 0) {
+        test_fail("phase4-locks", "no processor is online, so there is no "
+                  "contention to test");
+        return;
+    }
+
+    contend_t c;
+    atomic_t done;
+
+    ticket_lock_init(&c.lock);
+    c.counter = 0;
+    atomic_init(&done, 0);
+
+    uint64_t t0 = timer_uptime_ms();
+    fanout_every_cpu(contend_worker, &c, &done);
+    uint64_t elapsed = timer_uptime_ms() - t0;
+
+    uint64_t expected = (uint64_t)online * CONTEND_ROUNDS;
+    if ((unsigned)atomic_load(&done) != online) {
+        test_fail("phase4-locks", "only %ld of %u processors finished, and the "
+                  "counter reached %lu", (long)atomic_load(&done), online,
+                  (unsigned long)c.counter);
+        return;
+    }
+    if (c.counter != expected) {
+        test_fail("phase4-locks", "the counter reached %lu after %u processor(s) "
+                  "each took the lock %u times, expected %lu -- updates were lost",
+                  (unsigned long)c.counter, online, CONTEND_ROUNDS,
+                  (unsigned long)expected);
+        return;
+    }
+
+    kprintf("smp: %lu lock round trips across %u processor(s) in %lu ms\n",
+            (unsigned long)expected, online, (unsigned long)elapsed);
+    test_pass("phase4-locks");
+}
+
+/* A ticket lock hands the lock out in the order it was asked for.  A test-and-set
+ * spinlock does not, and under TCG it usually does not: one processor's store to
+ * memory keeps winning, so the others can be starved while it goes round after
+ * round.  The way to see the difference is to check every waiter is served at all,
+ * and that no processor is served twice while another waits. */
+typedef struct {
+    ticket_lock_t lock;
+    uint32_t      turns[MAX_CPU_COUNT];
+    uint32_t      served;
+} fair_t;
+
+static void fair_worker(void *arg) {
+    fair_t *f = arg;
+    unsigned index = percpu_self_index();
+
+    /* Many rounds each, not one.  A single round cannot tell a fair lock from an
+     * unfair one: the interesting case is the processor that arrives while the
+     * lock is held and then never gets it again, which only shows up over
+     * repeated acquisitions. */
+    for (unsigned i = 0; i < FAIR_ROUNDS; i++) {
+        ticket_lock(&f->lock);
+        if (index < MAX_CPU_COUNT)
+            f->turns[index]++;
+        f->served++;
+        ticket_unlock(&f->lock);
+    }
+}
+
+static void test_lock_fairness(void) {
+    unsigned online = percpu_online_count();
+    fair_t f;
+    atomic_t done;
+
+    ticket_lock_init(&f.lock);
+    memset(f.turns, 0, sizeof(f.turns));
+    f.served = 0;
+    atomic_init(&done, 0);
+
+    fanout_every_cpu(fair_worker, &f, &done);
+
+    /* Every processor took the lock FAIR_ROUNDS times, and the total is exactly
+     * that.  A lock that starves a processor shows up as one index below the
+     * count; a lock that lets two processors into the critical section shows up
+     * as a total above it. */
+    uint32_t total = 0;
+    for (unsigned i = 0; i < online; i++) {
+        if (f.turns[i] != FAIR_ROUNDS) {
+            test_fail("phase4-lockfair", "processor %u took the lock %u times, "
+                      "expected %u", i, f.turns[i], FAIR_ROUNDS);
+            return;
+        }
+        total += f.turns[i];
+    }
+
+    if (total != online * FAIR_ROUNDS || f.served != total) {
+        test_fail("phase4-lockfair", "the turns add up to %u and the counter "
+                  "reached %u, expected %u", total, f.served,
+                  online * FAIR_ROUNDS);
+        return;
+    }
+
+    test_pass("phase4-lockfair");
+}
+
+/* --- MCS lock --------------------------------------------------------- */
+
+/* The queue has one node per *waiter*, so each worker's node is its own -- on its
+ * own stack.  That is the whole difference from the ticket lock: the waiting
+ * processors are a linked list of stack addresses, and handing the lock on is a
+ * store into the predecessor's node rather than an increment of a word every
+ * waiter is reading. */
+typedef struct {
+    mcs_lock_t   guard;
+    volatile uint64_t counter;
+} mcs_shared_t;
+
+static void mcs_worker(void *arg) {
+    mcs_shared_t *s = arg;
+    mcs_node_t node;
+
+    for (unsigned i = 0; i < CONTEND_ROUNDS; i++) {
+        mcs_lock(&node, &s->guard);
+
+        uint64_t v = s->counter;
+        for (volatile unsigned spin = 0; spin < 16; spin++)
+            ;
+        s->counter = v + 1;
+
+        mcs_unlock(&node, &s->guard);
+    }
+}
+
+static void test_mcs(void) {
+    mcs_shared_t s;
+    atomic_t done;
+
+    mcs_lock_init(&s.guard);
+    s.counter = 0;
+    atomic_init(&done, 0);
+
+    unsigned online = percpu_online_count();
+    fanout_every_cpu(mcs_worker, &s, &done);
+
+    uint64_t expected = (uint64_t)online * CONTEND_ROUNDS;
+    if ((unsigned)atomic_load(&done) != online) {
+        test_fail("phase4-mcs", "only %ld of %u processors finished, and the "
+                  "counter reached %lu", (long)atomic_load(&done), online,
+                  (unsigned long)s.counter);
+        return;
+    }
+    if (s.counter != expected) {
+        test_fail("phase4-mcs", "the counter reached %lu after %u processor(s) "
+                  "each took the lock %u times, expected %lu", (unsigned long)s.counter,
+                  online, CONTEND_ROUNDS, (unsigned long)expected);
+        return;
+    }
+
+    test_pass("phase4-mcs");
+}
+
+/* --- mutex and semaphore ----------------------------------------------- */
+
+static mutex_t lock_mutex;
+static volatile uint64_t mutex_counter;
+
+static void mutex_worker(void *arg) {
+    (void)arg;
+
+    for (unsigned i = 0; i < CONTEND_ROUNDS; i++) {
+        mutex_lock(&lock_mutex);
+        uint64_t v = mutex_counter;
+        for (volatile unsigned spin = 0; spin < 16; spin++)
+            ;
+        mutex_counter = v + 1;
+        mutex_unlock(&lock_mutex);
+    }
+}
+
+static void test_mutex_lock(void) {
+    atomic_t done;
+
+    mutex_init(&lock_mutex);
+    mutex_counter = 0;
+    atomic_init(&done, 0);
+
+    unsigned online = percpu_online_count();
+    fanout_every_cpu(mutex_worker, NULL, &done);
+
+    uint64_t expected = (uint64_t)online * CONTEND_ROUNDS;
+    if (mutex_counter != expected) {
+        test_fail("phase4-mutex", "the counter reached %lu after %u processor(s) "
+                  "each locked %u times, expected %lu", (unsigned long)mutex_counter,
+                  online, CONTEND_ROUNDS, (unsigned long)expected);
+        return;
+    }
+
+    test_pass("phase4-mutex");
+}
+
+static semaphore_t test_sem;
+static atomic_t sem_total;
+
+static void sem_worker(void *arg) {
+    (void)arg;
+
+    for (unsigned i = 0; i < CONTEND_ROUNDS; i++) {
+        sem_wait(&test_sem);
+        atomic_increment(&sem_total);
+        sem_post(&test_sem);
+    }
+}
+
+static void test_semaphore(void) {
+    atomic_t done;
+
+    sem_init(&test_sem, 1);
+    atomic_init(&sem_total, 0);
+    atomic_init(&done, 0);
+
+    unsigned online = percpu_online_count();
+    fanout_every_cpu(sem_worker, NULL, &done);
+
+    /* A semaphore that is not counting is not a semaphore: if a post is lost the
+     * count ends above one and the next wait would never block. */
+    uint64_t expected = (uint64_t)online * CONTEND_ROUNDS;
+    if ((uint64_t)atomic_load(&sem_total) != expected) {
+        test_fail("phase4-semaphore", "the total reached %lu, expected %lu",
+                  (unsigned long)atomic_load(&sem_total), (unsigned long)expected);
+        return;
+    }
+    if (sem_count(&test_sem) != 1) {
+        test_fail("phase4-semaphore", "the count ended at %ld, expected 1",
+                  (long)sem_count(&test_sem));
+        return;
+    }
+
+    test_pass("phase4-semaphore");
+}
+
+/* --- the interrupt-save variants --------------------------------------- */
+
+static ticket_lock_t irq_lock;
+static volatile uint32_t irq_holder;
+static volatile uint32_t irq_reentered;
+
+static void irq_worker(void *arg) {
+    (void)arg;
+
+    for (unsigned i = 0; i < 2000; i++) {
+        uint64_t flags = spin_lock_irqsave(&irq_lock);
+
+        /* If the interrupt save did not work, this processor's own timer
+         * interrupt would land here and find the lock held -- by this processor,
+         * on this processor, in the middle of the critical section.  The
+         * interrupt-save variant is what prevents that, so the check is that it
+         * never happens. */
+        if (__atomic_load_n(&irq_holder, __ATOMIC_ACQUIRE) != 0)
+            __atomic_add_fetch(&irq_reentered, 1, __ATOMIC_ACQ_REL);
+
+        __atomic_store_n(&irq_holder, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&irq_holder, 0, __ATOMIC_RELEASE);
+
+        spin_unlock_irqrestore(&irq_lock, flags);
+    }
+}
+
+static void test_lock_irqsave(void) {
+    atomic_t done;
+
+    ticket_lock_init(&irq_lock);
+    irq_holder = 0;
+    irq_reentered = 0;
+    atomic_init(&done, 0);
+
+    unsigned online = percpu_online_count();
+    fanout_every_cpu(irq_worker, NULL, &done);
+
+    if ((unsigned)atomic_load(&done) != online) {
+        test_fail("phase4-irqsave", "only %ld of %u processors finished",
+                  (long)atomic_load(&done), online);
+        return;
+    }
+    if (irq_reentered != 0) {
+        test_fail("phase4-irqsave", "the critical section was entered %lu times "
+                  "while already held", (unsigned long)irq_reentered);
+        return;
+    }
+
+    test_pass("phase4-irqsave");
+}
+
+/* --- IPIs -------------------------------------------------------------- */
+
+/* Ask each other processor to count, and read the answer back through its own
+ * per-CPU slot.
+ *
+ * The reply has to go in the receiver's memory and be read by the *sender*, which
+ * is the one thing an IPI does not do by itself: the sender cannot know whether
+ * the handler has run, only that delivery has completed.  The count is per-CPU and
+ * only its owner writes it, so the sender needs no lock to read it. */
+/* Each entry has exactly one writer -- the processor that owns the slot -- and is
+ * read by the boot processor, so it needs no lock.  A volatile store rather than
+ * an atomic one: the value is only ever this one number. */
+static volatile uint64_t ipi_probe_ran[MAX_CPU_COUNT];
+
+
+
+static void ipi_probe_worker(void *arg) {
+    (void)arg;
+
+    unsigned index = percpu_self_index();
+    if (index < MAX_CPU_COUNT)
+        ipi_probe_ran[index] = 1;
+}
+
+static void test_ipi(void) {
+    unsigned online = percpu_online_count();
+
+    if (online < 2) {
+        /* With one processor the only IPI there is to itself, and it is the case a
+         * caller gets wrong by disabling interrupts around the send: the handler
+         * cannot run until the send returns, so the send never returns. */
+        uint64_t before = smp_ipis_received();
+        if (smp_ipi_self(VECTOR_IPI_RESCHED) != 0) {
+            test_fail("phase4-ipi", "could not send an IPI to this processor");
+            return;
+        }
+        if (smp_ipis_received() <= before) {
+            test_fail("phase4-ipi", "an IPI to this processor did not arrive "
+                      "(%lu before, %lu after)", (unsigned long)before,
+                      (unsigned long)smp_ipis_received());
+            return;
+        }
+        test_pass("phase4-ipi");
+        return;
+    }
+
+    unsigned indices[MAX_CPU_COUNT];
+    unsigned n = smp_online_indices(indices, MAX_CPU_COUNT);
+    unsigned self = percpu_self_index();
+
+    for (unsigned i = 0; i < n; i++) {
+        if (indices[i] == self)
+            continue;
+
+        ipi_probe_ran[indices[i]] = 0;
+        if (percpu_queue_work(indices[i], ipi_probe_worker, NULL) != 0) {
+            test_fail("phase4-ipi", "processor %u's work slot is occupied",
+                      indices[i]);
+            return;
+        }
+
+        /* Reschedule IPI: the processor has work, so it should find it. */
+        if (smp_kick_cpu(indices[i]) != 0) {
+            test_fail("phase4-ipi", "could not send a reschedule IPI to "
+                      "processor %u", indices[i]);
+            return;
+        }
+
+        /* Wake IPI on top: the handler has to run twice and drain the slot once,
+         * so this also checks that a second IPI to the same processor is not
+         * dropped and does not find the slot still occupied. */
+        smp_ipi_cpu(indices[i], VECTOR_IPI_WAKE);
+
+        /* TLB shootdown IPI: has to arrive and reload CR3 without disturbing
+         * anything, which is the one IPI with a side effect. */
+        smp_ipi_cpu(indices[i], VECTOR_IPI_TLB);
+    }
+
+    for (unsigned waited = 0; waited < 5000; waited++) {
+        bool all = true;
+        for (unsigned i = 0; i < n; i++) {
+            if (indices[i] == self)
+                continue;
+            if (ipi_probe_ran[indices[i]] == 0)
+                all = false;
+        }
+        if (all)
+            break;
+        delay_ms(1);
+    }
+
+    for (unsigned i = 0; i < n; i++) {
+        if (indices[i] == self)
+            continue;
+        if (ipi_probe_ran[indices[i]] == 0) {
+            test_fail("phase4-ipi", "processor %u never ran the work its IPI "
+                      "asked for", indices[i]);
+            return;
+        }
+    }
+
+    if (percpu_interrupts(self) == 0) {
+        test_fail("phase4-ipi", "this processor handled no interrupts at all, so "
+                  "the IPI path proves nothing here");
+        return;
+    }
+
+    test_pass("phase4-ipi");
+}
+
 static void test_smp_tss(void) {
     unsigned known = percpu_count();
 
@@ -1072,6 +1652,14 @@ void test_run_all(void) {
     test_direct_map();
     test_pmm_churn();
     test_percpu();
+    test_atomics();
+    test_lock_contention();
+    test_lock_fairness();
+    test_mcs();
+    test_mutex_lock();
+    test_semaphore();
+    test_lock_irqsave();
+    test_ipi();
     test_smp_tss();
     test_smp_online();
 

@@ -307,3 +307,48 @@ same kind of mistake: the four bytes at 0x04 look spare — that is where a 32-b
 TSS keeps SS:0 — but the CPU reads the real offsets, so RSP0 was being read as
 zero and the IST entries from eight bytes too low. Neither shows up until
 something takes a ring transition or a double fault.
+## 2026-10-04 — Every local APIC handler ends the interrupt, including the spurious one
+Decision: `smp_ipi_common()` writes the end-of-interrupt register, and so does the
+spurious-vector path in `isr_dispatch()`.
+Alternatives: leaving both to the hardware; an end-of-interrupt in one central
+place at the end of `isr_dispatch()`.
+Reason: the interrupt-acknowledge sequence sets an in-service bit, and on xAPIC
+nothing else clears it. Miss it and the processor refuses every later interrupt of
+the same priority — and for the local APIC that is all of them, since fixed vectors
+share a priority class. The processor does not crash and reports nothing: it stops
+being interrupted, its idle loop's `hlt` stops returning because the request
+register still holds something, and every IPI sent to it is silently dropped.
+Measured on this machine: an application processor took exactly one IPI and then
+went permanently deaf, which looked like an IPI that was never sent.
+
+The spurious vector is the subtle one. It sets an in-service bit like any other
+interrupt, and it is the only kind whose handler has to clear that bit explicitly,
+because the acknowledge sequence an interrupt gate issues is suppressed for it:
+there was nothing to acknowledge in the first place. It is also the kind that turns
+up spontaneously, so a kernel that skips it is a kernel that works until a
+processor has been running long enough to see one.
+
+## 2026-10-04 — The MCS unlock decides with a compare-and-exchange, not an exchange
+Decision: `mcs_unlock()` uses a compare-and-exchange on the queue tail, succeeding
+only if the tail is still this node.
+Alternatives: an unconditional exchange that leaves the tail empty; a compare and
+swap on the node's own `next`.
+Reason: an exchange clobbers the tail to empty even when a successor is already
+queued behind it, and the next processor to arrive finds an empty queue, concludes
+the lock is free, and walks into the critical section the successor is about to
+enter. Two processors inside at once, so updates are lost, and a queue that has
+lost its own tail, so the waiters behind them never get a hand-off. It passes on
+two processors and fails on three, which is the only reason it was ever found.
+
+## 2026-10-04 — Contended locks are checked against a counter, not a flag
+Decision: every lock self-test is a shared counter that must end up with exactly
+the sum of every processor's work, run on every online processor at once, on 1, 2,
+3, 4 and 8 processors.
+Alternatives: a test-and-set lock that would be checked for exclusion; timing the
+lock and asserting it is "fast enough".
+Reason: mutual exclusion has no positive test. A flag says nothing — a lock that
+lets two processors in and a lock that works can both leave any flag in any state,
+and the interesting failures are lost updates, which only a shared counter shows.
+And "fast enough" is a threshold that passes on two processors and hides exactly
+the starvation the ticket lock exists to prevent, so fairness gets its own check:
+every processor must be served every round.

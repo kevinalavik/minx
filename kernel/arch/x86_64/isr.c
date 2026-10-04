@@ -6,6 +6,7 @@
  */
 #include "cpu.h"
 
+#include "apic.h"
 #include "boot.h"
 #include "console.h"
 #include "io.h"
@@ -98,11 +99,24 @@ void isr_dispatch(regs_t *regs) {
         return;
     }
 
-    /* The spurious vector is not a real interrupt: nothing was in flight, so
-     * there is nothing to acknowledge and nothing to run.  Counting it and
-     * returning is all that is correct here. */
+    /* A spurious interrupt is not a real interrupt: nothing was in flight, so
+     * there is nothing to acknowledge and nothing to run.
+     *
+     * It still has to be acknowledged, and this is the one place in the kernel
+     * where that is easy to get wrong.  A spurious interrupt sets an in-service
+     * bit like any other, and it is the *only* kind whose handler has to clear it
+     * explicitly -- the interrupt-acknowledge sequence an interrupt gate issues
+     * suppresses it, because there was nothing to acknowledge in the first place.
+     * Leaving it set makes the local APIC refuse every further interrupt of the
+     * same priority on this processor, for ever: an application processor stops
+     * taking its timer, stops taking IPIs, and sits in its idle loop with `hlt`
+     * returning immediately because the request register still has something in
+     * it.  Nothing crashes and nothing reports it; the processor is simply busy
+     * and deaf.  So the end-of-interrupt is written here even though nothing was
+     * delivered. */
     if (vector == VECTOR_LAPIC_SPURIOUS) {
         percpu_count_interrupt();
+        lapic_eoi();
         return;
     }
 

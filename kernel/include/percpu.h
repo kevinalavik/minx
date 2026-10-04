@@ -25,12 +25,22 @@ typedef struct {
     bool     online;
     bool     started;
     uint64_t interrupts;     /* interrupts this CPU has handled */
+    uint64_t ipis;           /* IPIs this CPU has handled */
     uint64_t idle_ticks;
     uint64_t context_switches;
     uint32_t sched_runqueue;  /* run queue this CPU last stole from */
 
     uint64_t stack_top;       /* where this CPU's stack was last left */
     uint32_t gs_installed;    /* GS points here */
+
+    /* One piece of work queued for this processor by another one, drained by its
+     * own IPI handler.  One slot, not a queue: phase 4 needs a processor to be
+     * able to run something on arrival, and phase 5's scheduler replaces this
+     * with a run queue proper.  A second send while one is still pending is
+     * refused rather than queued, so the overflow is visible instead of silent. */
+    void    (*pending_fn)(void *);
+    void     *pending_arg;
+    uint32_t  pending;
 } percpu_t;
 
 typedef struct {
@@ -69,6 +79,17 @@ unsigned percpu_boot_index(void);
  * else. */
 unsigned percpu_index_for_lapic_id(uint32_t lapic_id);
 
+/* Queue `fn(arg)` for the processor in slot `index`.  The processor runs it when
+ * it next takes a reschedule IPI, or immediately if it is this one.  Returns -1
+ * if the index is unknown or the single slot is already occupied. */
+int  percpu_queue_work(unsigned index, void (*fn)(void *), void *arg);
+
+/* Run whatever is queued for this processor, until the slot is empty. */
+void percpu_run_pending(void);
+
+/* True if nothing is queued for slot `index`. */
+bool percpu_work_pending(unsigned index);
+
 unsigned percpu_count(void);          /* number of known processors      */
 unsigned percpu_online_count(void);   /* number that have been started   */
 uint32_t percpu_lapic_id(unsigned index);
@@ -77,6 +98,8 @@ uint64_t percpu_idle_ticks(unsigned index);
 bool     percpu_is_online(unsigned index);
 bool     percpu_is_started(unsigned index);
 void     percpu_count_interrupt(void);
+void     percpu_count_ipi(void);
+uint64_t percpu_ipis(unsigned index);
 void     percpu_set_online(unsigned index, bool online);
 
 /* Arm this processor's own LAPIC timer.

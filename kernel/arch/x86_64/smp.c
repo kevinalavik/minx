@@ -44,6 +44,8 @@
 #include "pmm.h"
 #include "string.h"
 #include "types.h"
+#include "pagetables.h"
+#include "vectors.h"
 #include "vmm.h"
 
 #include <limine.h>
@@ -361,6 +363,162 @@ int smp_start_cpu(uint32_t lapic_id, unsigned index, void (*entry)(void),
 
     (void)arg;
     return 0;
+}
+
+/* --- inter-processor interrupts ------------------------------------------ */
+
+/* Per processor, and only ever touched by its owner: a counter of the IPIs this
+ * one has handled, which is how the self test knows the IPI path delivered
+ * something rather than the sender just believing it did. */
+static uint64_t ipi_received;
+
+uint64_t smp_ipis_received(void) {
+    return __atomic_load_n(&ipi_received, __ATOMIC_ACQUIRE);
+}
+
+int smp_send_ipi(uint8_t vector, uint32_t lapic_id) {
+    if (!lapic_available()) {
+        kprintf("[warn] smp: cannot send an IPI with no local APIC\n");
+        return -1;
+    }
+
+    lapic_ipi((uint8_t)lapic_id, vector);
+    return 0;
+}
+
+int smp_ipi_self(uint8_t vector) {
+    if (!lapic_available())
+        return -1;
+
+    lapic_ipi((uint8_t)percpu_lapic_id(percpu_self_index()), vector);
+    return 0;
+}
+
+int smp_ipi_all_but_self(uint8_t vector) {
+    if (!lapic_available())
+        return -1;
+
+    lapic_ipi_all_but_self(vector);
+    return 0;
+}
+
+int smp_ipi_all(uint8_t vector) {
+    if (!lapic_available())
+        return -1;
+
+    lapic_ipi_all_cpus(vector);
+    return 0;
+}
+
+int smp_ipi_cpu(unsigned index, uint8_t vector) {
+    if (index >= percpu_count())
+        return -1;
+    return smp_send_ipi(vector, percpu_lapic_id(index));
+}
+
+int smp_kick_cpu(unsigned index) {
+    /* Kicking this processor would deadlock if the caller had interrupts off, and
+     * would not be an IPI at all if it had them on -- either way the work is
+     * already ours, so running it is both simpler and correct. */
+    if (index == percpu_self_index()) {
+        percpu_run_pending();
+        return 0;
+    }
+
+    return smp_ipi_cpu(index, VECTOR_IPI_RESCHED);
+}
+
+unsigned smp_online_indices(unsigned *out, unsigned max) {
+    unsigned n = 0;
+
+    for (unsigned i = 0; i < percpu_count() && n < max; i++)
+        if (percpu_is_online(i))
+            out[n++] = i;
+
+    return n;
+}
+
+/* The handler every IPI vector below is installed on.
+ *
+ * A common entry on purpose: the point of an IPI is to make the *receiving*
+ * processor do something, and the thing it does is read its own per-CPU state.  So
+ * the handler counts the arrival and then runs the work for the vector, and the
+ * work looks at `percpu_self()` -- which resolves through GS to the processor that
+ * is actually running, not to the one that sent it. */
+static void smp_ipi_common(regs_t *frame) {
+    (void)frame;
+
+    __atomic_add_fetch(&ipi_received, 1, __ATOMIC_ACQ_REL);
+    percpu_count_ipi();
+
+    /* End of interrupt, before anything else can return.
+     *
+     * This is the one thing an xAPIC handler must not forget, and forgetting it
+     * is invisible on the processor that sent the interrupt -- only the receiver
+     * goes deaf.  The interrupt-acknowledge sequence set an in-service bit, and
+     * nothing clears it but a write to the end-of-interrupt register; leave it set
+     * and this processor refuses every further interrupt of the same priority,
+     * which for the local APIC means all of the fixed vectors: its own timer, every
+     * IPI, everything.  It does not crash and it does not report anything, it just
+     * stops being interrupted, and its idle loop's `hlt` stops returning. */
+    lapic_eoi();
+}
+
+/* Reschedule: the receiving processor has work waiting for it, or the sender has
+ * decided to preempt it.  This is the vector that makes a processor useful: it is
+ * how it finds out about work it was not told about by going round itself. */
+static void smp_ipi_resched(regs_t *frame) {
+    smp_ipi_common(frame);
+    percpu_run_pending();
+}
+
+
+/* TLB shootdown: another processor changed a mapping, so this processor's cached
+ * translation for it is stale.  The mapping is a kernel one and the kernel's pages
+ * are shared, so the flush is a reloaded CR3 -- which is why it can be done from
+ * an interrupt without a lock.  `vmm_tlb_flush_local()` is where a proper invalidation
+ * goes once there is a page table to walk. */
+static void smp_ipi_tlb(regs_t *frame) {
+    smp_ipi_common(frame);
+    pt_write_cr3(pt_read_cr3());
+}
+
+/* Panic: stop every other processor.  A panic has to stop the machine, not just
+ * the processor that noticed, and a processor that keeps running will take
+ * interrupts against structures a panicked kernel is no longer maintaining.  So it
+ * parks with interrupts off, which also stops the preemption tick. */
+static void smp_ipi_halt(regs_t *frame) {
+    smp_ipi_common(frame);
+
+    cli();
+    for (;;)
+        hlt();
+}
+
+/* Leave the idle loop.  The wake is the interesting part: the receiving processor
+ * is in `hlt`, and `hlt` only wakes for an interrupt, so an IPI to a parked
+ * processor is also how it is taken out of `hlt`.  Anything queued for it runs
+ * here too, because a processor that is woken with nothing to do goes straight
+ * back to sleep. */
+static void smp_ipi_wake(regs_t *frame) {
+    smp_ipi_common(frame);
+    percpu_run_pending();
+}
+
+static isr_handler_t const ipi_handlers[] = {
+    [VECTOR_IPI_TLB - VECTOR_IPI_FIRST]      = smp_ipi_tlb,
+    [VECTOR_IPI_RESCHED - VECTOR_IPI_FIRST]  = smp_ipi_resched,
+    [VECTOR_IPI_HALT - VECTOR_IPI_FIRST]     = smp_ipi_halt,
+    [VECTOR_IPI_WAKE - VECTOR_IPI_FIRST]     = smp_ipi_wake,
+};
+
+void smp_ipi_handlers_install(void) {
+    for (unsigned v = VECTOR_IPI_FIRST; v <= VECTOR_IPI_LAST; v++) {
+        isr_handler_t handler = ipi_handlers[v - VECTOR_IPI_FIRST];
+
+        if (handler != NULL)
+            isr_install_handler((uint8_t)v, handler);
+    }
 }
 
 /* --- what every processor runs once it has its own address space ---------- */

@@ -128,6 +128,55 @@ unsigned percpu_index_for_lapic_id(uint32_t lapic_id) {
     return MAX_CPU_COUNT;
 }
 
+int percpu_queue_work(unsigned index, void (*fn)(void *), void *arg) {
+    if (index >= registered)
+        return -1;
+
+    percpu_slot_t *slot = &slots[index];
+
+    /* Claim the slot before filling it.  A second sender that finds it claimed
+     * gets -1 instead of overwriting work that has not run yet, which would be the
+     * quiet kind of wrong. */
+    uint32_t zero = 0;
+    if (!__atomic_compare_exchange_n(&slot->state.pending, &zero, 1, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return -1;
+
+    slot->state.pending_fn = fn;
+    slot->state.pending_arg = arg;
+    /* The store to `pending` above releases the two above it, so a processor that
+     * sees the flag set also sees the function and its argument. */
+    return 0;
+}
+
+void percpu_run_pending(void) {
+    percpu_t *self = percpu_self();
+
+    if (self == NULL)
+        return;
+
+    for (;;) {
+        if (__atomic_load_n(&self->pending, __ATOMIC_ACQUIRE) == 0)
+            return;
+
+        void (*fn)(void *) = self->pending_fn;
+        void *arg = self->pending_arg;
+
+        /* Clear before running, so work queued *by* this work finds a free slot
+         * rather than being refused because of the work already running. */
+        __atomic_store_n(&self->pending, 0, __ATOMIC_RELEASE);
+
+        if (fn != NULL)
+            fn(arg);
+    }
+}
+
+bool percpu_work_pending(unsigned index) {
+    if (index >= registered)
+        return false;
+    return __atomic_load_n(&slots[index].state.pending, __ATOMIC_ACQUIRE) != 0;
+}
+
 unsigned percpu_count(void) {
     return registered;
 }
@@ -156,6 +205,14 @@ void percpu_set_online(unsigned index, bool online) {
 
 void percpu_count_interrupt(void) {
     percpu_self()->interrupts++;
+}
+
+void percpu_count_ipi(void) {
+    percpu_self()->ipis++;
+}
+
+uint64_t percpu_ipis(unsigned index) {
+    return (index < registered) ? slots[index].state.ipis : 0;
 }
 
 void percpu_arm_local_timer(void) {
