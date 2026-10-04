@@ -352,3 +352,119 @@ and the interesting failures are lost updates, which only a shared counter shows
 And "fast enough" is a threshold that passes on two processors and hides exactly
 the starvation the ticket lock exists to prevent, so fairness gets its own check:
 every processor must be served every round.
+
+## 2026-10-04 — The scheduler's only lock is the run queue, and it is never held across a switch
+Decision: one run queue per processor, each with a ticket lock. `schedule()` takes
+the lock, picks a task, drops the lock, and only then switches. The context switch
+itself takes no locks at all. Nothing is ever *pushed* between processors: a
+processor whose queue is empty goes and takes a task from another's.
+Alternatives: one global run queue; a big kernel lock around the scheduler; periodic
+load balancing.
+Reason: this is the whole difference from the version with a big lock. No lock is
+held across a switch, none is held across anything that could block, and the order
+between two run queues is never a question — there is no order, because there is
+only ever one lock in hand. The cost is real and is paid knowingly: a task chosen for
+a processor can be taken by another one between dropping the queue lock and switching
+to it, so `state` is the arbiter, only one processor ever wins the
+`TASK_RUNNABLE → TASK_RUNNING` transition, and the loser gives the task back.
+
+Three things about it are not obvious and each one cost a hang:
+
+- **A guard on the switch may not be left set across it.** A per-processor
+  "already switching" flag that is cleared only after `task_switch` returns stops
+  the *next* task on that processor from ever sleeping, because it finds the
+  processor mid-switch for as long as the previous task is away. It has to be
+  cleared just before the switch, with interrupts off, which is safe precisely
+  because nothing can arrive in those few instructions.
+- **A task switched to must not inherit the switcher's interrupt state.** The
+  commonest route to `schedule()` is the timer handler, where the interrupt gate
+  has just cleared IF, and a task with no saved context inherits whatever the
+  processor happened to have. For an idle task that is fatal rather than merely
+  wrong: its first act is `hlt`, and `hlt` with interrupts disabled never wakes. The
+  processor then sits in its idle loop with its timer still running and takes no
+  further interrupts — which looks exactly like a scheduler whose timer has stopped,
+  and cost an hour to read as such.
+- **Interrupts must be off across "decide to block" *and* the switch.** With them
+  on, a tick can preempt a task between putting it on the sleep list and switching
+  away; since it is deliberately not put back on the run queue, it is then on the
+  sleep list and running nowhere, and the next wake has it linked into two lists at
+  once.
+
+## 2026-10-04 — A task that is in two lists needs two pairs of links
+Decision: `task_t` has `next`/`prev` for the transient lists (a run queue or the
+blocked list, never both) with a `list_tag` saying which, and a separate `all_next`
+for the permanent list of every task.
+Alternatives: one pair of links, with the task list rebuilt on demand; a hash or
+array indexed by task id instead of a list.
+Reason: the list of every task is permanent — a task is in it from creation until
+the machine stops — while the run-queue links are rewritten every time it is queued.
+Sharing one pair is not a shortcut that happens to work. Registering a task walks to
+the tail of that list and follows the tail's links to do it, so queueing a task
+overwrites the links the task list is threaded through, the *next* task registered
+walks into the run queue instead and is appended to it, and the queue's length stops
+matching what it holds. The symptom is not memory corruption in the usual sense: a
+queue whose length reads 4294967295 and a test that times out because a worker's
+task never ran.
+
+`list_tag` and the checks in `rq_push()`/`rq_remove()` are what turned that from a
+hang into a one-line panic naming the task and the list.
+
+## 2026-10-04 — `isr_common` may rely on `%rbp` surviving the handler, and `irq_restore` may keep its `popfq`
+Decision: `isr_common` keeps `movq %rbp, %rsp` to recover its register frame, and
+`irq_restore()` keeps restoring the whole saved RFLAGS word with `popfq`. Both are
+things that look like bugs, and both were "fixed" while chasing the phase-5
+multi-processor fault; both fixes were reverted because each one turned a merely
+intermittent fault into a deterministic hang at exactly the same place.
+Alternatives: save the frame address on the stack and restore `%rsp` from it; rebuild
+the restore as `sti`/`cli` on the interrupt-enable bit alone.
+Reason: **`%rbp` is callee-saved.** The kernel is built without
+`-fno-omit-frame-pointer`, so a function may use `%rbp` as a general register — but
+any function that modifies it must restore it, so it survives the handler chain
+exactly as the ABI says, including a handler that switches stacks. The theory that it
+does not was attractive because it explained a faulting `rip` inside the data
+segment, and it was wrong. Likewise a whole-word `popfq` can in principle restore a
+stray trap or direction flag, but replacing it with the interrupt-enable bit alone
+hung the guest reproducibly where the original did not, and an unverified change is
+worse than a documented sharp edge.
+
+Both are recorded here rather than fixed, because the fault they were invented for
+is still open (see `docs/STATUS.md`) and a fix that was not the cause is a fix
+nobody should keep.
+
+## 2026-10-05 — Each ISO stages into its own directory
+Decision: `build_iso` stages into `build/isostage/<iso-name>/`, named after the ISO
+being built, rather than into one shared `build/isodir`.
+Alternatives: `.NOTPARALLEL:` on the two ISO rules; serialise the ISO builds with an
+order-only prerequisite; build only one ISO at a time.
+Reason: `make -j8 iso iso-test` builds both at once, and both rules began by
+`rm -rf`-ing the same directory and then wrote their own `boot/limine.conf` into the
+same path. Which ISO came out right depended on the order the two `cp`s happened to
+land in.
+
+The failure is silent and it lies. The test ISO ends up carrying the *run* ISO's
+`limine.conf`, so `minx.test=1` is never passed, the guest boots to the interactive
+console instead of running the self tests, and `make test` reports "the guest never
+reached TEST-READY" until the harness times out — which reads exactly like a kernel
+that ignores its command line, and cost a long time being believed. A per-target
+staging directory is also the right thing under `-j` generally: the two builds then
+share nothing but their prerequisites.
+
+`.NOTPARALLEL:` would have hidden it rather than fixed it — the two ISOs genuinely do
+not interfere once each has its own directory.
+
+## 2026-10-05 — The one division on the preemption path is guarded
+Decision: `charge_current()` refuses to divide unless the current task's weight is in
+range, and `panic()`s naming the processor and the pointer if it is not.
+Alternatives: leave it and report "unhandled CPU exception: vector 0"; make weight a
+power of two and shift instead of dividing.
+Reason: `elapsed / weight` is the only division on the preemption path, and a
+division by zero is not a wrong answer, it is an exception. The kernel's own handler
+reported it as "unhandled CPU exception: vector 0" and pointed at `charge_current`
+with nothing indicating what was wrong, which is the least informative panic message
+the kernel can produce. With the guard the same run says
+`sched: processor 2 has 0xffff800000100030 as its current task, and that has weight 0`
+— which is the whole bug, on one line.
+
+A weight that is zero, or above `TASK_WEIGHT_MAX`, cannot come from any path that
+creates a task, so the check is not papering over a case the scheduler should allow.
+It converts a fault with no explanation into a report naming what is wrong.

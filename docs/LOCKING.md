@@ -97,3 +97,49 @@ because a lock that loses an update shows up there and nowhere else.
 
 Verified on 1, 2, 3, 4 and 8 processors. 32000 contended critical sections across
 four processors complete in single-digit milliseconds.
+## The scheduler
+
+One run queue per processor, one ticket lock each, and one idle task per processor.
+The rule that makes the whole thing work:
+
+> **The queue lock is taken, the queue is examined, and the lock is dropped before
+> anything switches. The context switch takes no locks at all.**
+
+So there is no lock held across a switch, none held across anything that can block,
+and no ordering to get wrong between two run queues — there is no ordering, because
+there is only ever one lock in hand. `steal_from()` borrows the *victim's* queue lock
+for the shortest time the operation allows and takes nothing else while holding it.
+
+What the rule costs, paid knowingly: a task chosen for a processor can be taken by
+another processor between the moment the queue lock is dropped and the moment it is
+switched to. `task_t.state` is the arbiter — only one processor ever wins the
+`TASK_RUNNABLE → TASK_RUNNING` transition, and the loser gives the task back rather
+than reporting an error.
+
+Three rules the switch itself imposes, each of which was a hang before it was a rule:
+
+- **Nothing is ever pushed between processors.** A processor that runs dry steals; it
+  never waits behind a queue that is being filled.
+- **A task switched to must not inherit the switcher's interrupt state.** With
+  interrupts off across the switch, a task with a saved context brings its own flags
+  back, and one with no saved context gets them turned on where it enters
+  (`task_enter_first` and `task_start_shim` in `switch.S`). A task entered with IF
+  clear that then calls `hlt` never wakes, and its processor stops taking interrupts
+  without reporting anything.
+- **Interrupts stay off across "decide to block" *and* the switch** (`task_sleep_ms`,
+  `task_wait`). With them on, a tick can preempt a task between the moment it is on
+  the sleep list and the moment it switches away — and since it is deliberately not
+  put back on the run queue, it is then on the sleep list and running nowhere.
+
+One task is on at most one transient list at a time, and `list_tag` says which; the
+permanent task list has its own link (`all_next`), because sharing one pair of links
+between the two silently splices one into the other the first time a task is queued
+after being registered. `rq_push()` and `rq_remove()` check both invariants and say
+which task and which list rather than failing later somewhere unrelated.
+
+`sched_get_stats()` reads the per-processor counters without their locks. That is a
+benign race for anything printed; a *self* check must not do it. `percpu_self_snapshot()`
+exists because reading `%gs` twice to check that GS is self-consistent looks like a
+consistency check and is not one — a task can be migrated between the two reads, and
+the report then says GS points at the wrong state when it pointed at the right one and
+the task simply moved.

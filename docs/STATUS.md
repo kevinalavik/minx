@@ -1,6 +1,9 @@
 # STATUS
 
-Current phase: 4 (SMP) — phases 1 to 3 VERIFIED; all 4 processors online, contended locks and IPIs proven; scheduler is what is left
+Current phase: 5 (scheduler) — phases 1 to 4 VERIFIED; the scheduler works and its
+six tests pass, but an intermittent multi-processor fault keeps the phase from
+being marked VERIFIED. See "Known bugs / gaps" for exactly what is and is not
+proven, and start there.
 
 ## Phases
 | # | Phase | State | Evidence / command |
@@ -8,8 +11,7 @@ Current phase: 4 (SMP) — phases 1 to 3 VERIFIED; all 4 processors online, cont
 | 1 | Toolchain & boot, framebuffer console | VERIFIED | `make test` → 17/17 PASS, framebuffer dump captured; `make run` boots to a graphical console at 1280x800 with 160x50 text cells. Serial log shows the memory map, RSDP, `SMP: 4 CPUs`, initrd and heap. Panic path verified separately (register dump + stack trace on both consoles) while fixing bring-up bugs. |
 | 2 | CPU core, keyboard into console | VERIFIED | `phase2-acpi` (4 processors with distinct LAPIC ids, IOAPIC at 0xfec00000), `phase2-interrupts` (IOAPIC owns all 16 lines, 8259s stay masked, a mask round trip changes the chip's own bit, and both the LAPIC timer and the 8253 really fire over 120 ms with interrupts on), `phase2-keyboard` (8042 self test, scancode set 1, reachable on IRQ 1), `phase2-input` (event ring in and out in order). Typed keys reach the graphical console: `tools/type-test.sh` types `help`, `keys`, `irqs`, `uptime`, `meminfo` and all five answer. |
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
-| 4 | SMP | IN PROGRESS | **All 4 processors come up and stay up, contend on locks and take each other's interrupts.** `make test` → 28/28. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs` (the MCS queue under the same contention), `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave` (no critical section ever entered while held), `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. **Left in this phase: the scheduler** — preemption, per-CPU run queues, stealing, a real idle task — which is phase 5. |
-| 5 | Scheduler & kernel threads | NOT STARTED | |
+| 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | IN PROGRESS | **Implemented; passes, but intermittently. Over eight `-smp 4` runs of the test ISO: five 34/34, one hang, one failed check, one panic.** `make test` needs 34/34, so the phase is not VERIFIED. The fault is localised to a corrupted per-processor `current` pointer — see "Known bugs / gaps".  `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). A good `-smp 4` run reads `sched: cpu 0: 41439 ticks, 11149 switches, 5558 steals` and `sched: 6 tasks ran on 4 processor(s)`. **NOT VERIFIED: it is intermittent.** Roughly one run in three at `-smp 4` dies instead — see "Known bugs / gaps". |
 | 6 | Userspace entry | NOT STARTED | |
 | 7 | Processes, signals, pipes | NOT STARTED | |
 | 8 | VFS + ramfs + initrd + devfs | NOT STARTED | |
@@ -206,7 +208,16 @@ looked like it was working.
   (add/sub/CAS on a `lock`-prefixed instruction), ticket locks, MCS locks, a mutex,
   a semaphore, the interrupt-save spinlock variants, per-CPU lock flags, and the
   three barriers. Order and rules are in `docs/LOCKING.md`.
-- **Self tests**: twenty-eight in-kernel checks (`minx.test=1`) plus a
+- **Scheduler**: `kernel/include/task.h`, `kernel/lib/task.c`,
+  `kernel/arch/x86_64/switch.S`. One run queue and one idle task per processor;
+  `schedule()` takes a queue lock, picks, drops the lock and only then switches, so
+  no lock is ever held across a context switch and there is no lock ordering to get
+  wrong. Fairness is by virtual runtime scaled by weight. Context switching is six
+  pushes, a store and six pops.
+- **Console commands**: `sched` (per-processor ticks, switches, steals, migrations,
+  queue depth, idle wakeups) and `ps` (every task, its state, weight, last processor,
+  switch count and milliseconds run).
+- **Self tests**: thirty-four in-kernel checks (`minx.test=1`) plus a
   host-compiled allocator fuzz test (`make test-host`).
 
 ## Known bugs / gaps
@@ -217,9 +228,48 @@ looked like it was working.
   interleave their output on the framebuffer and the serial mirror ("smp: 2x" etc).
   Spinlocks are phase 5; until then the interleaving is cosmetic and the `cpus`
   command reports the real per-CPU state.
-- Nothing schedules. Every processor except the boot one runs an idle loop of
-  `hlt`, and all device interrupts are routed to LAPIC 0, so the boot processor
-  does all the work. Phase 5.
+- **THE BLOCKER FOR PHASE 5. A corrupted per-processor `current`, intermittently,
+  at 4 or more processors.** Measured over eight `-smp 4` runs of the test ISO:
+  five passed 34/34, one hung, one failed a check, and one panicked. `-smp 1` and
+  `-smp 2` have not been seen to fail. It happens early, usually within
+  `phase1-console-scrolling`.
+  What is known, and each of these was established by experiment rather than by
+  argument:
+  - **The fault is a `current` that does not point at a task.** `charge_current()`
+    divides by `task->weight`, and a divide is the one instruction on the preemption
+    path that faults rather than returning a wrong answer. It was raising #DE and the
+    kernel reported "unhandled CPU exception: vector 0" with nothing pointing at the
+    cause. There is now a guard that names it, and a captured run says exactly what
+    is wrong:
+    `sched: processor 2 has 0xffff800000100030 as its current task, and that has weight 0`.
+    `0xffff800000100030` is `heap_base + 0x30` — the payload of the first block the
+    allocator handed out — being used as a `task_t *`. So something wrote a heap
+    address into `cpu[2].current`, or walked a list to a node that is not a task.
+  - **Not a stack overflow.** Task and application-processor stacks were raised from
+    16 KiB to 32 KiB and the fault did not change. A guard word at the bottom of every
+    task stack plus a per-tick `%rsp` check (`sched_check_stack()`) now make an
+    overflow report itself rather than corrupt a return address; it has never fired.
+  - **Not `isr_common` losing `%rbp`.** It does not lose it: `%rbp` is callee-saved
+    and survives the handler chain even when a handler switches stacks. Changing it
+    to save the frame address on the stack instead turned the intermittent fault into
+    a deterministic hang at exactly the same place, which is how the theory was
+    disproved. Reverted.
+  - **Not `irq_restore()`'s `popfq` restoring stray trap or direction flags.**
+    Replacing the whole-word `popfq` with `sti`/`cli` on the interrupt-enable bit
+    alone hung the same guest at exactly the same place, every time. Reverted.
+  Next things to try, in order:
+  1. `sched_cpu_t` is per processor and only ever touched by that processor, so a bad
+     `current` means the *task* was already bad, or a list was walked wrongly. Add the
+     same "which list" check that the run queue has to the **blocked list**:
+     `blocked_remove()` calls `list_unlink()` without verifying `t->list_tag`, so
+     removing a task that is not on it writes `NULL` into the blocked list's head and
+     tail and silently drops every other sleeper. That is the cheapest remaining hole.
+  2. Check every `t->next`/`t->prev` dereference reached from `rq_pick_fairest()` and
+     `wake_sleepers()` against the task's `list_tag`, so a walk that leaves the list
+     says which node it left by rather than returning whatever it found.
+  3. `-d int,cpu_reset -D build/q.log` on a failing run, and watch whether the bad
+     `current` is written by a steal or by a wake.
+
 - The framebuffer resolution is whatever Limine picks (1280x800 under QEMU
   here); the `resolution:` option in `boot/limine.conf` is not honoured by the
   BIOS path, so the console adapts to whatever arrives.
@@ -238,6 +288,14 @@ looked like it was working.
   cross-checks the guest's own tally rather than trusting the line count alone.
 - `make run` opens a GUI window; automated verification uses `make test`, which
   is always headless.
+- **Fixed, but worth remembering:** `make -j8 iso iso-test` used to stage both ISOs
+  through one shared directory, each rule `rm -rf`-ing the directory the other was
+  halfway through filling. The test ISO then came out carrying the *run* ISO's
+  `limine.conf`, so `minx.test=1` was never passed, the guest booted to the
+  interactive console instead of running the tests, and `make test` sat there until
+  the harness reported "the guest never reached TEST-READY". It looks exactly like a
+  kernel that ignores its command line. Each ISO now stages into its own directory;
+  verified by building both with `-j8` and booting the test ISO repeatedly.
 
 ## Needs human decision
 (none yet)
