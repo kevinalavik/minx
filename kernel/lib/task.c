@@ -1,0 +1,1173 @@
+/* minx - kernel tasks, per-processor run queues and the scheduler.
+ *
+ * The interface is kernel/include/task.h.  What is worth stating here is the
+ * locking rule, because it is the whole difference between this and the version
+ * with one lock around everything:
+ *
+ *   A run queue lock is taken, the queue is examined, and the lock is dropped
+ *   before any context switch happens.  A switch itself takes no locks at all.
+ *   So there is no lock held across a switch and none held across anything that
+ *   could block, and the ordering between two run queues is never a question --
+ *   there is no ordering because there is only ever one lock in hand.
+ *
+ * The consequence that costs something: a task chosen for a processor can be
+ * taken by another processor between the moment the queue lock is dropped and the
+ * moment it is switched to.  `state` is the arbiter -- only one processor ever
+ * wins the transition from TASK_RUNNABLE to TASK_RUNNING, and the loser simply
+ * gives the task back.
+ */
+#include "task.h"
+
+#include "apic.h"
+#include "boot.h"
+#include "cpu.h"
+#include "delay.h"
+#include "io.h"
+#include "kmalloc.h"
+#include "kprintf.h"
+#include "panic.h"
+#include "smp.h"
+#include "string.h"
+#include "timer.h"
+#include "vectors.h"
+#include "vmm.h"
+
+/* Provided by kernel/arch/x86_64/switch.S.  task_start_shim is jumped to by the
+ * `ret` at the end of a first switch onto a task; it reads the entry point and
+ * the argument off that task's stack and calls task_start(). */
+void task_switch(uint64_t *save_rsp, uint64_t new_rsp);
+void task_enter_first(uint64_t new_rsp);
+void task_start_shim(void);
+void task_start(void (*entry)(void *), void *arg);
+
+/* The idle task is a task like any other, and the scheduler reaches it through
+ * the same path. */
+static void idle_entry(void *arg);
+
+/* Every task, for the self tests and `ps`.  The walk is under the table's lock,
+ * so a task created while it is being walked cannot be missed halfway. */
+unsigned task_count(void);
+task_t  *task_by_index(unsigned i);
+
+/* ------------------------------------------------------------ per-CPU ---- */
+
+typedef struct {
+    ticket_lock_t lock;
+    task_t       *head;
+    task_t       *tail;
+    uint32_t      length;
+} run_queue_t;
+
+typedef struct {
+    run_queue_t   rq;
+    task_t       *current;
+    task_t       *idle;
+    volatile uint32_t need_resched;
+    volatile uint32_t in_schedule;   /* re-entrancy guard, per processor */
+    uint64_t      slice_start_ns;
+    uint64_t      ticks;
+    uint32_t      switches;
+    uint32_t      steals;
+    uint32_t      migrations;
+    uint32_t      idle_ticks;
+} sched_cpu_t;
+
+static sched_cpu_t cpu[MAX_CPU_COUNT];
+
+/* Tasks that are not runnable: asleep until a time, or blocked on a wait queue.
+ * One list for both, because both are woken by walking it, and its own lock for
+ * the same reason the run queues have one -- a wake from an interrupt must not
+ * have to reach into another processor's queue. */
+static struct {
+    ticket_lock_t lock;
+    task_t       *head;
+    task_t       *tail;
+    uint32_t      length;
+} blocked;
+
+/* Every task ever created, so the self tests can walk them.  Created under a
+ * lock, because a task can be created from any processor. */
+static struct {
+    ticket_lock_t lock;
+    task_t       *head;
+    task_t       *tail;
+    uint32_t      count;
+} all_tasks;
+
+static uint64_t next_task_id = 1;
+
+/* Whether sched_init() has finished.
+ *
+ * The boot processor's local APIC timer is armed before the scheduler exists --
+ * it is armed long before anything else, because it is what proves the interrupt
+ * path works.  So a tick can arrive while there are no run queues and no idle
+ * task, and a tick that tried to schedule then would have nothing to schedule.
+ * The flag is what the tick checks, and it is set once, last, in sched_init(). */
+static volatile uint32_t sched_up;
+
+
+/* How long one time slice lasts.  Short enough that a spinning task cannot hold
+ * a processor, long enough that the switch is not the interesting cost. */
+#define SCHED_SLICE_NS  2000000ull    /* 2 ms */
+
+/* A task's stack, for the same reasons and the same size as SMP_STACK_SIZE above:
+ * it carries kernel code, the scheduler, and an interrupt frame on top of whatever
+ * the task itself has on it. */
+#define TASK_STACK_SIZE 32768
+
+/* How many tasks can exist.  The per-CPU table has a room for this many, and the
+ * bound is here so that "one task linked into two lists" fails at the point of
+ * the mistake rather than as a queue that slowly stops working. */
+#define TASK_MAX 1024
+
+/* ---------------------------------------------------------- list helpers -- */
+
+static void list_link(task_t **head, task_t **tail, task_t *t) {
+    if (t->list_tag != 0)
+        panic("smp: task %lu (%s) is already linked into the list at %p and is "
+              "being linked into that same list again (state %d, entry %p)\n",
+              (unsigned long)t->id, t->name, (void *)(uintptr_t)t->list_tag,
+              t->state, (void *)(uintptr_t)t->entry);
+    t->list_tag = (uint64_t)(uintptr_t)head;
+    t->prev = *tail;
+    t->next = NULL;
+    if (*tail != NULL)
+        (*tail)->next = t;
+    else
+        *head = t;
+    *tail = t;
+}
+
+static void list_unlink(task_t **head, task_t **tail, task_t *t) {
+    if (t->prev != NULL)
+        t->prev->next = t->next;
+    else
+        *head = t->next;
+    if (t->next != NULL)
+        t->next->prev = t->prev;
+    else
+        *tail = t->prev;
+    t->next = NULL;
+    t->prev = NULL;
+    t->list_tag = 0;
+}
+
+/* ------------------------------------------------------------- run queue --- */
+
+static void rq_push(sched_cpu_t *c, task_t *t) {
+    /* Two invariants, both checked, because a run queue that is quietly wrong does
+     * not fail: it hands the same task to two processors or loses one, and both
+     * look like a scheduler that has stopped making progress. */
+    if (t->list_tag != 0)
+        panic("smp: task %lu (%s) is already linked into the list at %p, and "
+              "is being queued on processor %u as well (state %d, "
+              "queued there %u, queued here %u)\n", (unsigned long)t->id,
+              t->name, (void *)(uintptr_t)t->list_tag, percpu_self_index(),
+              t->state, (unsigned)t->list_tag,
+              (unsigned)c->rq.length);
+    if (c->rq.length >= TASK_MAX)
+        panic("smp: run queue for processor %u is full (%u tasks)\n",
+              percpu_self_index(), c->rq.length);
+
+    list_link(&c->rq.head, &c->rq.tail, t);
+    c->rq.length++;
+}
+
+static void rq_remove(sched_cpu_t *c, task_t *t) {
+    if (c->rq.length == 0)
+        panic("smp: removing task %lu (%s) from an empty run queue\n",
+              (unsigned long)t->id, t->name);
+    if (t->list_tag != (uint64_t)(uintptr_t)&c->rq.head)
+        panic("smp: task %lu (%s) is being removed from processor %u's run "
+              "queue, but it is linked into the list at %p\n",
+              (unsigned long)t->id, t->name, percpu_self_index(),
+              (void *)(uintptr_t)t->list_tag);
+
+    list_unlink(&c->rq.head, &c->rq.tail, t);
+    c->rq.length--;
+}
+
+/* The runnable task with the least virtual runtime.
+ *
+ * Called with the queue's lock held.  A tie goes to the earlier task in the
+ * queue, which is what stops two equal-weight tasks from taking turns in lock
+ * step forever: each is chosen immediately after the other and neither ever sees
+ * the other's work finish. */
+static task_t *rq_pick_fairest(sched_cpu_t *c) {
+    task_t *best = NULL;
+
+    for (task_t *t = c->rq.head; t != NULL; t = t->next) {
+        if (t->state != TASK_RUNNABLE)
+            continue;
+        if (best == NULL || t->vruntime < best->vruntime)
+            best = t;
+    }
+
+    return best;
+}
+
+static task_t *rq_pop(sched_cpu_t *c) {
+    task_t *t = rq_pick_fairest(c);
+
+    if (t != NULL)
+        rq_remove(c, t);
+    return t;
+}
+
+/* Enqueue and, if it went to another processor, wake that processor. */
+static void enqueue(unsigned index, task_t *t) {
+    if (index >= MAX_CPU_COUNT || t == NULL)
+        return;
+
+    sched_cpu_t *c = &cpu[index];
+
+    ticket_lock(&c->rq.lock);
+    rq_push(c, t);
+    ticket_unlock(&c->rq.lock);
+
+    /* A processor that is asleep does not look at its run queue, and an IPI is
+     * what wakes it.  The reschedule handler then runs what is queued.  Skipped
+     * for this processor: it is already awake and about to look. */
+    if (index != percpu_self_index())
+        smp_kick_cpu(index);
+}
+
+/* --------------------------------------------------------- blocked list --- */
+
+static void blocked_add(task_t *t) {
+    list_link(&blocked.head, &blocked.tail, t);
+    blocked.length++;
+}
+
+static void blocked_remove(task_t *t) {
+    list_unlink(&blocked.head, &blocked.tail, t);
+    blocked.length--;
+}
+
+/* Put a blocked task back on some run queue.
+ *
+ * Two things have to happen together here, and the second is the one that is easy
+ * to miss: the task has to come *off* the blocked list as well as onto a run
+ * queue.  Leaving it on the blocked list means it is in two lists, and the next
+ * unlink from either of them splices the other one -- so the run queue it was put
+ * on stops being traversable, and a task that later blocks again is linked into it
+ * a second time.  Both symptoms look like a scheduler that has stopped making
+ * progress rather than like memory corruption.
+ *
+ * The transition is done under the blocked list's lock, so a task woken twice --
+ * or woken while a timed sleep is also expiring -- is only unlinked once. */
+static void unblock(task_t *t) {
+    uint64_t flags = spin_lock_irqsave(&blocked.lock);
+
+    int32_t expected = TASK_WAITING;
+    bool was_waiting = __atomic_compare_exchange_n(&t->state, &expected,
+                                                   TASK_RUNNABLE, false,
+                                                   __ATOMIC_ACQ_REL,
+                                                   __ATOMIC_ACQUIRE);
+    if (was_waiting)
+        blocked_remove(t);
+
+    spin_unlock_irqrestore(&blocked.lock, flags);
+
+    /* Already runnable, or already queued: a second wake, or a timed sleep that
+     * fired first.  Either way there is nothing left to do. */
+    if (!was_waiting)
+        return;
+
+    t->wake_at_ns = 0;
+    enqueue(percpu_self_index(), t);
+}
+
+/* ------------------------------------------------------------- creation --- */
+
+static task_t *task_alloc(void) {
+    uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+
+    if (all_tasks.count >= TASK_MAX) {
+        spin_unlock_irqrestore(&all_tasks.lock, flags);
+        return NULL;
+    }
+
+    task_t *t = (task_t *)kmalloc(sizeof(task_t));
+    spin_unlock_irqrestore(&all_tasks.lock, flags);
+
+    if (t == NULL)
+        return NULL;
+
+    memset(t, 0, sizeof(*t));
+    t->state = TASK_UNUSED;
+    t->weight = TASK_WEIGHT_DEFAULT;
+    t->last_cpu = MAX_CPU_COUNT;
+    return t;
+}
+
+/* The list of every task, in creation order.  Singly linked through `all_next`,
+ * because a task stays in it for ever and the transient links are needed for the
+ * run queues. */
+static void task_register(task_t *t) {
+    uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+
+    t->id = next_task_id++;
+
+    task_t **tailp = &all_tasks.head;
+    while (*tailp != NULL)
+        tailp = &(*tailp)->all_next;
+    *tailp = t;
+    t->all_next = NULL;
+    all_tasks.tail = t;
+    all_tasks.count++;
+
+    spin_unlock_irqrestore(&all_tasks.lock, flags);
+}
+
+/* Lay a fresh kernel stack out for task_switch's pops, and for the `ret` at the
+ * end of them to land somewhere useful.
+ *
+ * The pops take six quadwords -- r15 down to rbp -- and the `ret` takes the
+ * seventh, which has to be an address to jump to.  Above that are the entry point
+ * and its argument, which the shim at that address picks up.
+ *
+ *   frame[0..5]  r15 r14 r13 r12 rbx rbp
+ *   frame[6]     where `ret` goes: the bootstrap shim
+ *   frame[7]     the task's entry point
+ *   frame[8]     its argument
+ */
+static bool task_stack_init(task_t *t, void (*entry)(void *), void *arg) {
+    uint8_t *stack = (uint8_t *)kmalloc(TASK_STACK_SIZE);
+
+    if (stack == NULL)
+        return false;
+
+    uint64_t *frame = (uint64_t *)(((uint64_t)stack + TASK_STACK_SIZE) & ~15ull);
+
+    frame -= 9;
+    for (unsigned i = 0; i <= 5; i++)
+        frame[i] = 0;
+    frame[6] = (uint64_t)(uintptr_t)task_start_shim;
+    frame[7] = (uint64_t)(uintptr_t)entry;
+    frame[8] = (uint64_t)(uintptr_t)arg;
+
+    /* The guard goes at the very bottom, so the first byte written past the stack
+     * is the one that reports it. */
+    *(volatile uint64_t *)stack = TASK_STACK_GUARD;
+    t->stack_guard = (volatile uint64_t *)stack;
+    t->stack_low = (uint64_t)stack;
+
+    t->stack = stack;
+    t->stack_top = (uint64_t)stack + TASK_STACK_SIZE;
+    t->saved_rsp = (uint64_t)frame;
+    t->entry = entry;
+    t->arg = arg;
+    return true;
+}
+
+task_t *task_create(const char *name, void (*entry)(void *), void *arg,
+                    uint32_t weight) {
+    task_t *t = task_alloc();
+
+    if (t == NULL)
+        return NULL;
+
+    strlcpy(t->name, name, sizeof(t->name));
+    t->weight = weight < TASK_WEIGHT_MIN ? TASK_WEIGHT_MIN
+           : (weight > TASK_WEIGHT_MAX ? TASK_WEIGHT_MAX : weight);
+    t->state = TASK_NEW;
+
+    if (!task_stack_init(t, entry, arg)) {
+        kfree(t);
+        return NULL;
+    }
+
+    task_register(t);
+    return t;
+}
+
+/* The idle task: what a processor runs when it has nothing else.  It halts rather
+ * than spins, so an idle processor costs nothing and an incoming IPI is what
+ * wakes it.  It never returns. */
+static void idle_entry(void *arg) {
+    (void)arg;
+
+    for (;;) {
+        cpu[percpu_self_index()].idle_ticks++;
+
+        /* Sleep until something happens.  `hlt` is woken by an interrupt, and the
+         * only interrupts an idle processor gets are IPIs -- the 8253's line and
+         * every device line are routed to the boot processor's local APIC. */
+        hlt();
+
+        /* Woken, so look again: an IPI means something was queued for us.  If it
+         * was not real work, schedule() picks this task again and returns, and we
+         * come back to `hlt`. */
+        schedule();
+    }
+}
+
+/* The task this processor is running.  One load through %gs, which is the whole
+ * reason per-processor state is reached that way. */
+task_t *sched_current(void) {
+    percpu_t *self = percpu_self();
+
+    if (self == NULL)
+        return NULL;
+    return (task_t *)self->current;
+}
+
+/* ---------------------------------------------------------------- walking -- */
+
+unsigned task_count(void) {
+    uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+    unsigned n = all_tasks.count;
+    spin_unlock_irqrestore(&all_tasks.lock, flags);
+    return n;
+}
+
+task_t *task_by_index(unsigned i) {
+    task_t *t;
+
+    ticket_lock(&all_tasks.lock);
+    t = all_tasks.head;
+    for (unsigned n = 0; t != NULL && n < i; n++)
+        t = t->all_next;
+    ticket_unlock(&all_tasks.lock);
+
+    return t;
+}
+
+/* A task's entry point, reached for the first time.  When it returns, the task is
+ * finished: it is marked dead and never scheduled again. */
+void task_start(void (*entry)(void *), void *arg) {
+    task_t *t = sched_current();
+
+    if (t != NULL) {
+        t->started = true;
+        t->last_cpu = percpu_self_index();
+        t->ran_on_cpu = t->last_cpu;
+    }
+
+    entry(arg);
+
+    task_exit();
+}
+
+task_t *task_create_idle(unsigned index) {
+    task_t *t = task_create("idle", idle_entry, NULL, TASK_WEIGHT_MIN);
+
+    if (t == NULL)
+        return NULL;
+
+    t->is_idle = true;
+
+    /* Runnable from the start, because it is the fallback a processor runs when
+     * its run queue is empty and schedule() claims it through the same
+     * TASK_RUNNABLE -> TASK_RUNNING transition as anything else.
+     *
+     * It is never *on* a run queue: schedule() puts a task back only if it is not
+     * the idle one, and rq_pick_fairest() only ever walks a queue.  That is what
+     * keeps it out of the fairness comparison -- an idle task that has never run
+     * has the least virtual time of anything and would otherwise win every
+     * comparison and be scheduled constantly. */
+    __atomic_store_n(&t->state, TASK_RUNNABLE, __ATOMIC_RELEASE);
+    if (index < MAX_CPU_COUNT)
+        cpu[index].idle = t;
+    return t;
+}
+
+/* ---------------------------------------------------------------- wake-up -- */
+
+int task_wakeup_on(unsigned index, task_t *t) {
+    if (index >= MAX_CPU_COUNT || t == NULL)
+        return -1;
+
+    __atomic_store_n(&t->state, TASK_RUNNABLE, __ATOMIC_RELEASE);
+    t->wake_at_ns = 0;
+    enqueue(index, t);
+    return 0;
+}
+
+int task_wakeup(task_t *t) {
+    if (t == NULL)
+        return -1;
+
+    /* Hand it to the processor with the shortest queue, so waking something does
+     * not pile everything onto one. */
+    unsigned best = percpu_self_index();
+    uint32_t best_len = MAX_CPU_COUNT;
+
+    for (unsigned i = 0; i < percpu_count(); i++) {
+        if (!percpu_is_online(i))
+            continue;
+        if (cpu[i].rq.length < best_len) {
+            best_len = cpu[i].rq.length;
+            best = i;
+        }
+    }
+
+    return task_wakeup_on(best, t);
+}
+
+/* ------------------------------------------------------------- stealing --- */
+
+/* Take one task from another processor's queue.
+ *
+ * Nothing is ever *pushed* between processors, so a processor that runs dry does
+ * not wait behind a queue that is being filled: it goes and takes.  The victim's
+ * lock is the only thing the two processors share, and it is held for as short a
+ * time as the operation allows. */
+static task_t *steal_from(unsigned victim) {
+    sched_cpu_t *c = &cpu[victim];
+    task_t *t = NULL;
+
+    ticket_lock(&c->rq.lock);
+    t = rq_pick_fairest(c);
+    if (t != NULL)
+        rq_remove(c, t);
+    ticket_unlock(&c->rq.lock);
+
+    if (t != NULL)
+        cpu[percpu_self_index()].steals++;
+
+    return t;
+}
+
+static task_t *steal_any(void) {
+    unsigned self = percpu_self_index();
+    unsigned n = percpu_count();
+
+    /* Start somewhere that is not this processor, and not always the same one: a
+     * fixed victim means the first processor in line hoards every queue. */
+    for (unsigned k = 1; k <= n; k++) {
+        unsigned victim = (self + k) % n;
+
+        if (victim == self || victim >= n || !percpu_is_online(victim))
+            continue;
+
+        task_t *t = steal_from(victim);
+        if (t != NULL)
+            return t;
+    }
+
+    return NULL;
+}
+
+/* ------------------------------------------------------------ scheduling --- */
+
+/* Account for the time the current task has had.
+ *
+ * The weight is checked rather than assumed.  `elapsed / weight` is the one
+ * division on the preemption path, and a division whose divisor is zero is not a
+ * wrong answer, it is an exception: the processor raises #DE, the kernel's own
+ * handler reports "unhandled CPU exception: vector 0", and the register dump
+ * points at this function with no indication of what was wrong.
+ *
+ * Every path that creates a task sets a non-zero weight, so a zero one means this
+ * processor's `current` does not point at a task -- the pointer itself has been
+ * overwritten, or points into memory that has since been reused.  That is the bug
+ * this is standing in front of; saying so by name is worth more than the divide.
+ */
+static void charge_current(sched_cpu_t *c) {
+    task_t *t = c->current;
+    uint64_t now = monotonic_ns();
+
+    if (t == NULL || now <= c->slice_start_ns)
+        return;
+
+    if (t->weight == 0 || t->weight > TASK_WEIGHT_MAX) {
+        panic("sched: processor %u has %p as its current task, and that has "
+              "weight %u\n", percpu_self_index(), (void *)t, t->weight);
+        return;
+    }
+
+    uint64_t elapsed = now - c->slice_start_ns;
+    t->exec_ns += elapsed;
+    /* Scaled by weight, so a task with four times the weight accumulates a
+     * quarter of the virtual time and therefore runs four times as often. */
+    t->vruntime += elapsed / t->weight;
+    c->slice_start_ns = now;
+}
+
+void schedule(void) {
+    unsigned index = percpu_self_index();
+
+    if (index >= MAX_CPU_COUNT || !sched_up)
+        return;
+
+    sched_cpu_t *c = &cpu[index];
+
+    /* Interrupts off across the whole selection-and-switch, and restored on the
+     * way back in.  That is what makes the switch atomic against the one thing
+     * that could interrupt it. */
+    uint64_t flags = irq_save();
+
+    /* Re-entering here would mean switching stacks in the middle of a switch.  The
+     * flag is cleared again *before* the switch itself, which sounds contradictory
+     * and is the whole trick: while it is set nothing can arrive anyway, because
+     * interrupts are off, and once it is clear the task about to run must be able
+     * to schedule -- a guard left set across the switch would stop the next task on
+     * this processor from ever sleeping, because it would find the processor
+     * "already switching" for as long as this task was away. */
+    if (c->in_schedule) {
+        irq_restore(flags);
+        return;
+    }
+    c->in_schedule = 1;
+    c->need_resched = 0;
+
+    charge_current(c);
+
+    task_t *prev = c->current;
+    task_t *next = NULL;
+
+    ticket_lock(&c->rq.lock);
+    next = rq_pop(c);
+    ticket_unlock(&c->rq.lock);
+
+    /* Nothing of its own: take someone else's, then fall back to idle. */
+    if (next == NULL)
+        next = steal_any();
+    if (next == NULL)
+        next = c->idle;
+
+    if (next == NULL) {
+        c->in_schedule = 0;
+        irq_restore(flags);
+        panic("schedule: processor %u has neither work nor an idle task\n",
+              index);
+        return;
+    }
+
+    if (next == prev) {
+        c->in_schedule = 0;
+        irq_restore(flags);
+        return;
+    }
+
+    /* Claiming the task is an atomic transition: if another processor got there
+     * first it is not ours to run, and putting it back is the correct answer
+     * rather than an error. */
+    int32_t runnable = TASK_RUNNABLE;
+    if (!__atomic_compare_exchange_n(&next->state, &runnable, TASK_RUNNING,
+                                     false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        c->in_schedule = 0;
+        irq_restore(flags);
+        return;
+    }
+
+    percpu_t *self = percpu_self();
+    uint32_t last = prev != NULL ? prev->last_cpu : MAX_CPU_COUNT;
+
+    c->current = next;
+    self->current = next;
+    next->last_cpu = index;
+    next->ran_on_cpu = index;
+    next->switch_count++;
+    next->started = true;
+
+    /* Put the old task back, but only if it is still runnable.
+     *
+     * The commonest reason it is not: it called schedule() itself in order to
+     * sleep or block, and it is already on the blocked list.  Re-queueing it would
+     * put one task on a list twice, and the second link corrupts the whole list --
+     * which is a hang rather than a wrong answer, because the entries after the
+     * spliced point are then unreachable and the tasks on them never run. */
+    if (prev != NULL) {
+        if (!prev->is_idle) {
+            /* Only if it is still runnable.  The commonest reason it is not: it
+             * called schedule() itself in order to sleep or block, and it is
+             * already on the blocked list.  Re-queueing it would put one task on a
+             * list twice, and the second link splices the whole list. */
+            if (__atomic_load_n(&prev->state, __ATOMIC_ACQUIRE) ==
+                TASK_RUNNING) {
+                __atomic_store_n(&prev->state, TASK_RUNNABLE, __ATOMIC_RELEASE);
+                ticket_lock(&c->rq.lock);
+                rq_push(c, prev);
+                ticket_unlock(&c->rq.lock);
+            }
+        } else {
+            /* The idle task goes back to runnable without going on a queue: it is
+             * the fallback schedule() falls back to, and it is claimed through the
+             * same TASK_RUNNABLE -> TASK_RUNNING transition as anything else.
+             *
+             * Leaving it TASK_RUNNING after switching away from it means the next
+             * time the run queue is empty the claim fails, and a schedule() that
+             * fails to claim anything returns *without switching*.  A task that
+             * called schedule() in order to sleep then returns from its sleep
+             * still marked asleep, and the caller loops forever putting it back on
+             * the blocked list. */
+            __atomic_store_n(&prev->state, TASK_RUNNABLE, __ATOMIC_RELEASE);
+        }
+    }
+
+    if (last != MAX_CPU_COUNT && last != index)
+        c->migrations++;
+
+    c->slice_start_ns = monotonic_ns();
+    c->switches++;
+
+    /* Clear the guard before switching, not after.  A task that is switched to has
+     * to be able to schedule immediately -- to sleep, to yield -- and this
+     * processor is now running *it*.  Nothing can arrive in the three
+     * instructions between here and the switch because interrupts are off.
+     *
+     * The task being switched to does not inherit the switcher's interrupt state:
+     * a task with a saved context brings its own flags back with it, and a task
+     * that has never run gets them turned on where it enters, which is
+     * task_enter_first() and task_start_shim() in switch.S.  That is the piece that
+     * matters most here -- an idle task entered with interrupts off executes one
+     * `hlt` and is never woken again, which looks exactly like a scheduler whose
+     * timer has stopped. */
+    c->in_schedule = 0;
+
+    if (prev == NULL)
+        task_enter_first(next->saved_rsp);
+    else
+        task_switch(&prev->saved_rsp, next->saved_rsp);
+
+    /* Only reached when this task is switched back into. */
+    irq_restore(flags);
+}
+
+void sched_yield(void) {
+    unsigned index = percpu_self_index();
+
+    if (index < MAX_CPU_COUNT)
+        cpu[index].need_resched = 1;
+}
+
+/* -------------------------------------------------------------- the tick -- */
+
+/* Wake anything whose sleep has expired, and hand it to a processor with room. */
+static void wake_sleepers(void) {
+    uint64_t now = monotonic_ns();
+    task_t *wake[16];
+    unsigned n = 0;
+
+    ticket_lock(&blocked.lock);
+    for (task_t *t = blocked.head; t != NULL && n < 16; ) {
+        /* The link to follow has to be taken *before* the removal, because
+         * removing clears exactly that link -- reading it afterwards ends the walk
+         * after one task, so a burst of sleepers would wake one per tick and the
+         * rest would sit there until the machine happened to be quiet. */
+        task_t *next = t->next;
+
+        if (t->wake_at_ns != 0 && t->wake_at_ns <= now) {
+            blocked_remove(t);
+            wake[n++] = t;
+        }
+        t = next;
+    }
+    ticket_unlock(&blocked.lock);
+
+    for (unsigned i = 0; i < n; i++) {
+        int32_t sleeping = TASK_SLEEPING;
+        if (__atomic_compare_exchange_n(&wake[i]->state, &sleeping,
+                                        TASK_RUNNABLE, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            enqueue(percpu_self_index(), wake[i]);
+        }
+    }
+}
+
+void sched_tick(void) {
+    unsigned index = percpu_self_index();
+
+    /* Before the run queues exist there is nothing to preempt onto, and a tick
+     * still has to arrive and be acknowledged for the interrupt path to be worth
+     * anything. */
+    if (index >= MAX_CPU_COUNT || !sched_up)
+        return;
+
+    sched_cpu_t *c = &cpu[index];
+    c->ticks++;
+
+    sched_check_stack();
+    wake_sleepers();
+
+    /* Preempt when the slice is used up or when something asked for it.  The
+     * idle task is the exception: it has no slice to lose, and switching it out
+     * and straight back in on every tick would be pure overhead. */
+    task_t *t = c->current;
+    if (t != NULL && t->is_idle) {
+        /* An idle processor still has to notice work arriving on another
+         * processor's queue, so it looks, but it does not switch on its own. */
+        if (cpu[index].rq.length > 0)
+            schedule();
+        return;
+    }
+
+    uint64_t now = monotonic_ns();
+    if (now - c->slice_start_ns >= SCHED_SLICE_NS || c->need_resched)
+        schedule();
+}
+
+void task_exit(void) {
+    unsigned index = percpu_self_index();
+    task_t *t = sched_current();
+
+    if (t != NULL)
+        __atomic_store_n(&t->state, TASK_DEAD, __ATOMIC_RELEASE);
+
+    /* Nothing will ever run this processor again unless it has an idle task, and
+     * an idle task that exits would leave the processor with nothing. */
+    if (index >= MAX_CPU_COUNT || t == NULL || t->is_idle) {
+        for (;;)
+            hlt();
+    }
+
+    cpu[index].current = NULL;
+    percpu_self()->current = NULL;
+    schedule();
+
+    for (;;)
+        hlt();
+}
+
+/* ------------------------------------------------------------- sleeping --- */
+
+void task_sleep_ms(uint64_t ms) {
+    task_t *t = sched_current();
+
+    if (t == NULL)
+        return;
+
+    /* Interrupts off across the whole of "decide to block" *and* the switch.
+     *
+     * Leaving them on leaves a window that nothing can recover from.  Between
+     * putting the task on the sleep list and switching away, a tick can preempt
+     * this task -- and since it is already TASK_SLEEPING it is deliberately not
+     * put back on the run queue, so it is on the sleep list and running nowhere.
+     * Another processor's tick then wakes it, queues it and runs it; when it gets
+     * back here it is running somewhere it never switched to, and its call to
+     * schedule() resumes inside a scheduler that has since moved on.  The visible
+     * symptom is a task linked into two lists at once, which corrupts the run
+     * queue it was queued on. */
+    uint64_t flags = irq_save();
+
+    uint64_t lflags = spin_lock_irqsave(&blocked.lock);
+
+    __atomic_store_n(&t->state, TASK_SLEEPING, __ATOMIC_RELEASE);
+    t->wake_at_ns = monotonic_ns() + ms * 1000000ull;
+    blocked_add(t);
+
+    spin_unlock_irqrestore(&blocked.lock, lflags);
+    schedule();
+
+    irq_restore(flags);
+}
+
+void task_wait(void) {
+    task_t *t = sched_current();
+
+    if (t == NULL)
+        return;
+
+    /* Interrupts off for the same reason as in task_sleep_ms(): the window
+     * between blocking and switching away must not be interruptible. */
+    uint64_t flags = irq_save();
+
+    uint64_t lflags = spin_lock_irqsave(&blocked.lock);
+
+    __atomic_store_n(&t->state, TASK_WAITING, __ATOMIC_RELEASE);
+    t->wake_at_ns = 0;          /* nothing but a named wake will end this */
+    blocked_add(t);
+
+    spin_unlock_irqrestore(&blocked.lock, lflags);
+    schedule();
+
+    irq_restore(flags);
+}
+
+/* ---------------------------------------------------------- wait queues --- */
+
+void wait_queue_init(wait_queue_t *q) {
+    ticket_lock_init(&q->lock);
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    for (unsigned i = 0; i < WAIT_QUEUE_ENTRIES; i++) {
+        q->slots[i].tag = 0;
+        q->slots[i].task = NULL;
+    }
+}
+
+uint32_t wait_queue_count(const wait_queue_t *q) { return q->count; }
+
+/* Block until this queue is woken with `tag`.
+ *
+ * The check for a wake and the act of sleeping cannot be one operation, so a
+ * wake can arrive in between.  The loop is what makes that safe: the slot is
+ * marked under the queue's lock, and the task only blocks if the mark is not
+ * already there.  Losing that race means returning immediately, not a missed
+ * wake-up. */
+void wait_queue_sleep(wait_queue_t *q, unsigned tag) {
+    task_t *self = sched_current();
+    uint32_t slot;
+
+    if (self == NULL)
+        return;
+
+    ticket_lock(&q->lock);
+    if (q->count == WAIT_QUEUE_ENTRIES) {
+        ticket_unlock(&q->lock);
+        /* Full is a bug in the caller, and a dropped waiter is a task that never
+         * wakes, so it is said rather than worked around. */
+        panic("wait_queue: %u waiters, more than the %u slots\n", q->count,
+              (unsigned)WAIT_QUEUE_ENTRIES);
+        return;
+    }
+    slot = q->tail;
+    q->tail = (q->tail + 1) % WAIT_QUEUE_ENTRIES;
+    q->slots[slot].tag = tag;
+    q->slots[slot].task = self;
+    q->count++;
+    ticket_unlock(&q->lock);
+
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&q->lock);
+        bool woken = q->slots[slot].tag == 0;
+        spin_unlock_irqrestore(&q->lock, flags);
+
+        if (woken) {
+            uint64_t f2 = spin_lock_irqsave(&q->lock);
+            q->slots[slot].task = NULL;
+            q->slots[slot].tag = 0;
+            q->count--;
+            spin_unlock_irqrestore(&q->lock, f2);
+            return;
+        }
+
+        task_wait();
+    }
+}
+
+/* Wake the first waiter whose tag matches; tag 0 means "any". */
+void wait_queue_wake(wait_queue_t *q, unsigned tag) {
+    task_t *woken[WAIT_QUEUE_ENTRIES];
+    unsigned n = 0;
+
+    ticket_lock(&q->lock);
+    for (unsigned i = 0; i < q->count && n < 4; i++) {
+        uint32_t slot = (q->head + i) % WAIT_QUEUE_ENTRIES;
+
+        if (q->slots[slot].task == NULL)
+            continue;
+        if (tag != 0 && q->slots[slot].tag != tag)
+            continue;
+
+        /* Zero is the woken marker; the waiter clears it before returning. */
+        if (q->slots[slot].tag == 0)
+            continue;
+        q->slots[slot].tag = 0;
+        woken[n++] = q->slots[slot].task;
+        if (tag != 0)
+            break;
+    }
+    ticket_unlock(&q->lock);
+
+    for (unsigned i = 0; i < n; i++)
+        unblock(woken[i]);
+}
+
+void wait_queue_wake_all(wait_queue_t *q) {
+    task_t *woken[WAIT_QUEUE_ENTRIES];
+    unsigned n = 0;
+
+    ticket_lock(&q->lock);
+    for (unsigned i = 0; i < q->count && n < 8; i++) {
+        uint32_t slot = (q->head + i) % WAIT_QUEUE_ENTRIES;
+
+        if (q->slots[slot].task != NULL && q->slots[slot].tag != 0) {
+            q->slots[slot].tag = 0;
+            woken[n++] = q->slots[slot].task;
+        }
+    }
+    ticket_unlock(&q->lock);
+
+    for (unsigned i = 0; i < n; i++)
+        unblock(woken[i]);
+}
+
+/* ------------------------------------------------------------ diagnostics -- */
+
+void sched_get_stats(unsigned index, sched_stats_t *out) {
+    if (out == NULL)
+        return;
+    memset(out, 0, sizeof(*out));
+
+    if (index >= MAX_CPU_COUNT)
+        return;
+
+    sched_cpu_t *c = &cpu[index];
+
+    out->ticks = c->ticks;
+    out->switches = c->switches;
+    out->steals = c->steals;
+    out->migrations = c->migrations;
+    out->idle_ticks = c->idle_ticks;
+    out->queued = c->rq.length;
+
+    uint64_t flags = spin_lock_irqsave(&blocked.lock);
+    out->sleeping = blocked.length;
+    spin_unlock_irqrestore(&blocked.lock, flags);
+
+    out->online = percpu_online_count();
+}
+
+/* --------------------------------------------------------------- console -- */
+
+const char *task_state_name(int state) {
+    switch (state) {
+    case TASK_UNUSED:   return "unused";
+    case TASK_NEW:      return "new";
+    case TASK_RUNNABLE: return "runnable";
+    case TASK_RUNNING:  return "running";
+    case TASK_SLEEPING: return "asleep";
+    case TASK_WAITING:  return "blocked";
+    case TASK_BLOCKED:  return "blocked";
+    case TASK_DEAD:     return "dead";
+    default:            return "?";
+    }
+}
+
+/* The per-processor view, for `sched`.
+ *
+ * Printed per processor rather than summed: the interesting question about a
+ * scheduler is not "how much did it do" but "is any processor not doing any",
+ * and a sum hides that completely.  An idle processor with no switches is not a
+ * fault -- it has nothing to switch to -- which is why its idle count is the
+ * number worth reading. */
+void sched_report(void) {
+    unsigned n = percpu_online_count();
+
+    kprintf("scheduler: %u processor(s) online, %u task(s), slice %lu us\n",
+            n, task_count(), (unsigned long)(SCHED_SLICE_NS / 1000));
+
+    for (unsigned i = 0; i < n; i++) {
+        sched_stats_t st;
+
+        sched_get_stats(i, &st);
+        kprintf("  cpu %u: %lu ticks, %u switches, %u steals, %u migrations, "
+                "%u queued, %u idle wakeups%s\n",
+                i, (unsigned long)st.ticks, st.switches, st.steals,
+                st.migrations, st.queued, st.idle_ticks,
+                st.switches == 0 ? "  (idle)" : "");
+    }
+
+    uint64_t flags = spin_lock_irqsave(&blocked.lock);
+    unsigned sleeping = blocked.length;
+    spin_unlock_irqrestore(&blocked.lock, flags);
+    kprintf("  %u task(s) asleep or blocked\n", sleeping);
+}
+
+/* A stack overflow that is allowed to happen quietly takes the machine down a
+ * long way from its cause, so the tick checks. */
+void sched_check_stack(void) {
+    task_t *t = sched_current();
+    uint64_t rsp;
+
+    __asm__ volatile("movq %%rsp, %0" : "=r"(rsp));
+
+    if (t == NULL || t->stack_guard == NULL)
+        return;               /* the boot processor's own stack has no guard */
+
+    if (rsp < t->stack_low)
+        panic("sched: task %lu (%s) has overflowed its stack: rsp %#lx is below "
+              "the bottom at %#lx\n", (unsigned long)t->id, t->name,
+              (unsigned long)rsp, (unsigned long)t->stack_low);
+
+    if (*t->stack_guard != TASK_STACK_GUARD)
+        panic("sched: task %lu (%s) has overwritten its stack guard at %#lx "
+              "(found %#lx)\n", (unsigned long)t->id, t->name,
+              (unsigned long)(uintptr_t)t->stack_guard,
+              (unsigned long)*t->stack_guard);
+}
+
+/* ------------------------------------------------------------------ init -- */
+
+void sched_init(void) {
+    percpu_t *self = percpu_self();
+
+    ticket_lock_init(&blocked.lock);
+    ticket_lock_init(&all_tasks.lock);
+
+    /* Every processor the firmware described gets a queue and an idle task now,
+     * even the ones that have not come online yet: an application processor's
+     * first act on arrival is to be put on a queue that already exists, and a
+     * queue created at that moment would be a queue nobody else knows about.
+     *
+     * Queues exist for every slot, because a queue costs one lock, but an idle
+     * task costs a 16 KiB stack and there are exactly as many of those as there
+     * are processors that can ever run. */
+    for (unsigned i = 0; i < MAX_CPU_COUNT; i++) {
+        ticket_lock_init(&cpu[i].rq.lock);
+        cpu[i].slice_start_ns = monotonic_ns();
+    }
+
+    /* The boot processor's own context becomes a task, so it can be preempted and
+     * resumed exactly where it was -- which is the only way the console and
+     * everything hanging off it keep working across a time slice. */
+    task_t *boot = task_alloc();
+    if (boot == NULL)
+        panic("sched_init: no memory for the boot task\n");
+
+    strlcpy(boot->name, "boot", sizeof(boot->name));
+    __atomic_store_n(&boot->state, TASK_RUNNING, __ATOMIC_RELEASE);
+    boot->weight = TASK_WEIGHT_MAX;    /* the console must not be starved */
+    boot->stack = NULL;                 /* it keeps the boot stack it is on */
+    boot->stack_top = 0;
+    boot->saved_rsp = 0;                /* filled in by the first switch out */
+    boot->last_cpu = percpu_self_index();
+    boot->ran_on_cpu = percpu_self_index();
+    boot->started = true;
+
+    task_register(boot);
+
+    for (unsigned i = 0; i < percpu_count(); i++)
+        task_create_idle(i);
+
+    unsigned index = percpu_self_index();
+    cpu[index].current = boot;
+    self->current = boot;
+
+    /* Last, so no tick can find half a scheduler. */
+    __atomic_store_n(&sched_up, 1, __ATOMIC_RELEASE);
+
+    kprintf("sched: run queues for %u processor(s), boot task %lu, idle tasks "
+            "%lu, slice %lu us\n", percpu_count(), (unsigned long)boot->id,
+            (unsigned long)cpu[0].idle->id, (unsigned long)(SCHED_SLICE_NS / 1000));
+}
+
+/* An application processor's first act.  It has no task of its own, so it starts
+ * as the idle task of its own queue -- which is what it was doing before -- and
+ * is switched off it the moment there is real work.  Never returns. */
+void sched_task_enter(unsigned index) {
+    percpu_t *self = percpu_self();
+
+    if (index >= MAX_CPU_COUNT || cpu[index].idle == NULL) {
+        kprintf("[warn] sched: processor %u has no idle task; spinning\n",
+                index);
+        for (;;)
+            hlt();
+    }
+
+    sched_cpu_t *c = &cpu[index];
+    task_t *idle = c->idle;
+
+    __atomic_store_n(&idle->state, TASK_RUNNING, __ATOMIC_RELEASE);
+    idle->last_cpu = index;
+    idle->ran_on_cpu = index;
+    idle->started = true;
+    c->current = idle;
+    self->current = idle;
+    c->slice_start_ns = monotonic_ns();
+
+    kprintf("sched: processor %u entering the scheduler as idle task %lu\n",
+            index, (unsigned long)idle->id);
+
+    /* Jump straight onto the idle task's prepared stack: it has never run, so
+     * there is nothing to save here. */
+    task_enter_first(idle->saved_rsp);
+
+    for (;;)
+        hlt();
+}

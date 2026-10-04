@@ -10,8 +10,15 @@
 
 /* Stack for an application processor.  Every processor needs its own: two of them
  * sharing the boot processor's stack corrupt it the first time both take an
- * interrupt. */
-#define SMP_STACK_SIZE 16384
+ * interrupt.
+ *
+ * 32 KiB, and not 16, because an application processor's stack is now a task's
+ * stack: it runs whatever the scheduler hands it, including the kernel's own tests
+ * with their buffers on it, and it carries an interrupt frame on top of all that.
+ * Overflowing it does not fault cleanly -- the stack grows into the heap block
+ * below it, and the first thing overwritten is somebody's return address, so the
+ * symptom is an instruction fetch from the middle of the data segment. */
+#define SMP_STACK_SIZE 32768
 
 /* Start every processor the firmware described except the boot one, and leave
  * them in their idle loops.  Returns how many came up, or -1 if none did. */

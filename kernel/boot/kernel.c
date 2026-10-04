@@ -27,6 +27,7 @@
 #include "power.h"
 #include "serial.h"
 #include "smp.h"
+#include "task.h"
 #include "string.h"
 #include "test.h"
 #include "timer.h"
@@ -399,9 +400,26 @@ static void cpu_interrupts_init(void) {
  *
  * Each processor that comes up installs its own GDT, IDT and task register,
  * points GS at its own per-CPU area, arms its own local APIC timer -- the 8253's
- * line is routed to the boot processor -- and then halts in its idle loop until
- * phase 5 gives it something to do. */
+ * line is routed to the boot processor -- and then enters the scheduler as the
+ * idle task of its own run queue.
+ *
+ * The scheduler is initialised first, and on the boot processor, because its run
+ * queues and idle tasks have to exist before any processor can be put on one.  The
+ * boot processor's own context becomes a task at that point, which is what makes
+ * everything above this a time slice rather than a straight line. */
 static void smp_init(void) {
+    /* Handlers before anything else, and before any of the early returns below.
+     *
+     * A vector with nothing installed on it is an unreported triple fault, and a
+     * processor can take an IPI whether or not there are any other processors --
+     * on a one-processor machine the only IPI there is to itself.  Putting this
+     * after the single-processor check left exactly that case with an unhandled
+     * vector 0x34, which the kernel reported as "unexpected interrupt vector
+     * ignored" and then counted the IPI as never having arrived. */
+    smp_ipi_handlers_install();
+
+    sched_init();
+
     if (percpu_count() <= 1) {
         kprintf("smp: only one processor; nothing to start\n");
         return;
@@ -412,11 +430,6 @@ static void smp_init(void) {
               "mapped; staying on one processor");
         return;
     }
-
-    /* Handlers first: an application processor can take an IPI as soon as it is
-     * started, and a vector with nothing installed on it is an unreported triple
-     * fault. */
-    smp_ipi_handlers_install();
 
     int up = smp_start_all();
 
@@ -475,6 +488,18 @@ static void heartbeat(uint64_t now_ms, uint64_t *last_ms) {
     serial_puts(interrupts_enabled() ? "1" : "0");
     serial_puts(" picmask=");
     serial_puts(utoa_to_buf(pic_irq_mask()));
+
+    /* The scheduler's own view of this processor: how many preemption ticks it
+     * has taken and how many times it has switched.  Without these a processor
+     * that has stopped ticking looks identical to one that is merely idle. */
+    sched_stats_t st;
+    sched_get_stats(percpu_self_index(), &st);
+    serial_puts(" sched ");
+    serial_puts(utoa_to_buf(st.ticks));
+    serial_puts("t/");
+    serial_puts(utoa_to_buf((uint64_t)st.switches));
+    serial_puts("s q");
+    serial_puts(utoa_to_buf((uint64_t)st.queued));
     serial_puts("\n");
 }
 
@@ -553,6 +578,16 @@ static void kmain_stage2(void) {
     if (keyboard_init() != 0)
         kwarn("no keyboard: the graphical console will not accept typing");
 
+    /* Interrupts on, before anything that can wait for one.
+     *
+     * The application processors already have theirs on -- each enables its own
+     * as it comes up -- and until this point the boot processor does not, so a
+     * tick that would preempt it never arrives and its half of the scheduler
+     * never ticks.  It is here rather than in interactive_console() because the
+     * self tests need it too: they sleep, and a sleep with interrupts off never
+     * ends. */
+    sti();
+
     if (boot_cmdline.test) {
         test_run_all();
         test_linger_and_exit();
@@ -578,11 +613,14 @@ static void interactive_console(void) {
             boot_info.have_timer ? "armed" : "absent");
 
     conio_banner();
-    sti();
 
-    /* Spin rather than halt: until a time source is known to wake the CPU, a
-     * halt here would park the machine in the first interrupt gap.  Phase 5
-     * replaces this loop with the scheduler's idle path. */
+    /* Halve between events rather than halt.
+     *
+     * The scheduler's idle path is where a halt belongs, but this is the boot
+     * task: it is never descheduled while it is in this loop unless something is
+     * queued, and a halt here would park the processor in the first interrupt gap
+     * if the console were ever the only thing left.  The cost of the pause is a
+     * few hundred cycles; the cost of a halt that never wakes is a machine. */
     uint64_t last = timer_uptime_ms();
     for (;;) {
         if (conio_pump() == 0) {

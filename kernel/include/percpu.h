@@ -30,6 +30,11 @@ typedef struct {
     uint64_t context_switches;
     uint32_t sched_runqueue;  /* run queue this CPU last stole from */
 
+    /* The task this processor is running, for the scheduler.  A `struct task *`
+     * rather than the type itself, so the scheduler's header does not have to be
+     * included by everything that keeps per-processor state. */
+    struct task *current;
+
     uint64_t stack_top;       /* where this CPU's stack was last left */
     uint32_t gs_installed;    /* GS points here */
 
@@ -69,6 +74,21 @@ void percpu_gs_install_index(unsigned index);
 /* The index GS currently resolves to, found by reading back %gs:0.  This is the
  * one accessor that cannot use GS to find its own answer. */
 unsigned percpu_self_index(void);
+
+/* The slot index a `percpu_t *` belongs to, or MAX_CPU_COUNT if it is not one of
+ * ours.
+ *
+ * This exists because a self check has to take *one* snapshot.  Reading %gs twice
+ * and comparing the two results looks like it is checking that GS is consistent --
+ * and on a preemptive scheduler it is not, because the task can be switched to
+ * another processor in between, with a different slot, and the check then reports
+ * a corruption that never happened.  So: read %gs once, and derive everything else
+ * from that one value. */
+unsigned percpu_index_of(const percpu_t *state);
+
+/* %gs:0 and the index it names, read together.  One assembly-level read, so the
+ * pair is consistent even if the task is preempted the moment after. */
+percpu_t  *percpu_self_snapshot(unsigned *index);
 
 /* The index the boot processor registered as 0. */
 unsigned percpu_boot_index(void);

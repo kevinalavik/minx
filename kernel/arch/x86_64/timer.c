@@ -1,3 +1,4 @@
+#include "task.h"
 #include "timer.h"
 
 #include "apic.h"
@@ -624,18 +625,22 @@ int timer_init(void) {
  * that actually drives preemption. */
 static volatile uint64_t lapic_ticks;
 
+/* The preemption tick.
+ *
+ * This is the only place a task is taken off a processor without asking.  The EOI
+ * has to be written *before* the switch, not after: the switch leaves this frame
+ * on the task's stack and does not come back until the task is resumed, and an
+ * unacknowledged in-service bit at priority zero blocks every further interrupt of
+ * that priority -- including the timer that would bring the task back.  So the
+ * order is acknowledge, then switch. */
 static void lapic_timer_interrupt(struct regs *regs) {
     (void)regs;
     lapic_ticks++;
     percpu_count_interrupt();
 
-    /* Phase 5 turns this into the scheduler tick.  Until then the counter is
-     * still the proof that the timer interrupt path works at all. */
-    if (lapic_ticks == 1)
-        kprintf("timer: LAPIC timer interrupt arrived (vector %u)\n",
-                (unsigned)VECTOR_LAPIC_TIMER);
-
     lapic_eoi();
+
+    sched_tick();
 }
 
 int lapic_timer_interrupt_init(void) {

@@ -56,6 +56,22 @@ void percpu_gs_install_self(void) {
     percpu_gs_install_index(percpu_self_index());
 }
 
+unsigned percpu_index_of(const percpu_t *state) {
+    for (unsigned i = 0; i < MAX_CPU_COUNT; i++)
+        if (&slots[i].state == state)
+            return i;
+    return MAX_CPU_COUNT;
+}
+
+percpu_t *percpu_self_snapshot(unsigned *index) {
+    percpu_t *state;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(state) :: "memory");
+
+    if (index != NULL)
+        *index = percpu_index_of(state);
+    return state;
+}
+
 unsigned percpu_self_index(void) {
     /* The one accessor that cannot use GS to find its own answer: it is what
      * reads GS.  What GS:0 holds is the slot's *state* pointer, so the answer is
@@ -128,24 +144,38 @@ unsigned percpu_index_for_lapic_id(uint32_t lapic_id) {
     return MAX_CPU_COUNT;
 }
 
+/* The state a work slot is in while its function and argument are being written.
+ * Not 0 (free) and not 1 (runnable), so a receiver can tell "nothing here" from
+ * "half written". */
+#define WORK_BUSY ((uint32_t)-1)
+
 int percpu_queue_work(unsigned index, void (*fn)(void *), void *arg) {
     if (index >= registered)
         return -1;
 
     percpu_slot_t *slot = &slots[index];
 
-    /* Claim the slot before filling it.  A second sender that finds it claimed
-     * gets -1 instead of overwriting work that has not run yet, which would be the
-     * quiet kind of wrong. */
+    /* Claim the slot, then fill it, then publish it.
+     *
+     * The order is the whole point.  Claiming the slot by setting "runnable" first
+     * and writing the function afterwards means a processor that is already in
+     * percpu_run_pending() -- which, with IPIs going to every processor on every
+     * wake-up, it very often is -- can see "there is work" and run whatever the
+     * *last* function happened to be.  That is not a lost update; it is the wrong
+     * function being called with the wrong argument, on another processor, and it
+     * looks like nothing at all until a task runs twice.
+     *
+     * So the slot is claimed as a distinct "being written" state, and the publish
+     * is a release store that the receiver's acquire load pairs with. */
     uint32_t zero = 0;
-    if (!__atomic_compare_exchange_n(&slot->state.pending, &zero, 1, false,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    if (!__atomic_compare_exchange_n(&slot->state.pending, &zero,
+                                     WORK_BUSY, false, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
         return -1;
 
     slot->state.pending_fn = fn;
     slot->state.pending_arg = arg;
-    /* The store to `pending` above releases the two above it, so a processor that
-     * sees the flag set also sees the function and its argument. */
+    __atomic_store_n(&slot->state.pending, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -156,7 +186,12 @@ void percpu_run_pending(void) {
         return;
 
     for (;;) {
-        if (__atomic_load_n(&self->pending, __ATOMIC_ACQUIRE) == 0)
+        uint32_t state = __atomic_load_n(&self->pending, __ATOMIC_ACQUIRE);
+
+        /* Free, or being written: either way there is nothing to run *yet*.  A slot
+         * caught mid-write is fine to skip, because its sender publishes it and then
+         * sends the interrupt that will run it. */
+        if (state != 1)
             return;
 
         void (*fn)(void *) = self->pending_fn;
@@ -174,7 +209,7 @@ void percpu_run_pending(void) {
 bool percpu_work_pending(unsigned index) {
     if (index >= registered)
         return false;
-    return __atomic_load_n(&slots[index].state.pending, __ATOMIC_ACQUIRE) != 0;
+    return __atomic_load_n(&slots[index].state.pending, __ATOMIC_ACQUIRE) == 1;
 }
 
 unsigned percpu_count(void) {

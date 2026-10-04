@@ -43,6 +43,7 @@
 #include "percpu.h"
 #include "pmm.h"
 #include "string.h"
+#include "task.h"
 #include "types.h"
 #include "pagetables.h"
 #include "vectors.h"
@@ -560,11 +561,10 @@ static void smp_cpu_entry(unsigned index) {
     percpu_arm_local_timer();
     sti();
 
-    for (;;) {
-        if (self != NULL)
-            self->idle_ticks++;
-        hlt();
-    }
+    /* From here this processor is a scheduler: it runs its own idle task until
+     * something is put on its run queue, and is switched off that task the moment
+     * something is.  Never returns. */
+    sched_task_enter(index);
 }
 
 /* --- the hand-off a parked processor takes -------------------------------- */
