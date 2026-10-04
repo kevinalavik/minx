@@ -321,24 +321,41 @@ $(LIMINE_TOOL): $(LIMINE_TAR)
 	$(MAKE) --no-print-directory -C $(LIMINE_DIR) CC="cc"
 
 # $(1) = iso path, $(2) = config file to install as /boot/limine.conf
+# Stage into a directory named after the ISO being built.
+#
+# This used to be one shared directory for both ISOs, and `make -j8 iso iso-test`
+# builds both at once, so each rule began by `rm -rf`-ing the directory the other
+# was halfway through populating and each copied its own `boot/limine.conf` into the
+# same path. Which ISO came out right depended on the order the two `cp`s landed in.
+#
+# The failure is silent and looks like the kernel ignoring its command line: the
+# test ISO comes out carrying the *run* ISO's `limine.conf`, so `minx.test=1` is
+# never passed, the guest boots to the interactive console instead of running the
+# self tests, and `make test` sits there until the harness times out reporting
+# "the guest never reached TEST-READY". A per-target staging directory makes the two
+# builds share nothing but their prerequisites, which is what `-j` requires.
+# The staging directory for the ISO named by $(1).  A make function rather than a
+# shell variable because every recipe line runs in its own shell.
+iso_stage = $(BUILD)/isostage/$(basename $(notdir $(1)))
+
 define build_iso
-	@rm -rf $(ISO_DIR)
-	@mkdir -p $(ISO_DIR)/boot $(ISO_DIR)/EFI/BOOT
-	@cp $(KERNEL_BIN) $(ISO_DIR)/boot/minx.bin
-	@cp $(KERNEL_ELF) $(ISO_DIR)/boot/minx.elf
-	@cp $(INITRD) $(ISO_DIR)/boot/minx-initrd.cpio
-	@cp $(2) $(ISO_DIR)/boot/limine.conf
-	@cp $(2) $(ISO_DIR)/boot/limine-orig.conf
-	@cp $(LIMINE_DIR)/limine-bios.sys $(ISO_DIR)/limine-bios.sys
-	@cp $(LIMINE_DIR)/limine-bios-cd.bin $(ISO_DIR)/boot/limine-bios-cd.bin
-	@cp $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_DIR)/boot/limine-uefi-cd.bin
-	@cp $(LIMINE_DIR)/BOOTX64.EFI $(ISO_DIR)/EFI/BOOT/BOOTX64.EFI
-	@cp $(LIMINE_DIR)/LICENSE $(ISO_DIR)/limine-LICENSE
+	@rm -rf $(call iso_stage,$@)
+	@mkdir -p $(call iso_stage,$@)/boot $(call iso_stage,$@)/EFI/BOOT
+	@cp $(KERNEL_BIN) $(call iso_stage,$@)/boot/minx.bin
+	@cp $(KERNEL_ELF) $(call iso_stage,$@)/boot/minx.elf
+	@cp $(INITRD) $(call iso_stage,$@)/boot/minx-initrd.cpio
+	@cp $(2) $(call iso_stage,$@)/boot/limine.conf
+	@cp $(2) $(call iso_stage,$@)/boot/limine-orig.conf
+	@cp $(LIMINE_DIR)/limine-bios.sys $(call iso_stage,$@)/limine-bios.sys
+	@cp $(LIMINE_DIR)/limine-bios-cd.bin $(call iso_stage,$@)/boot/limine-bios-cd.bin
+	@cp $(LIMINE_DIR)/limine-uefi-cd.bin $(call iso_stage,$@)/boot/limine-uefi-cd.bin
+	@cp $(LIMINE_DIR)/BOOTX64.EFI $(call iso_stage,$@)/EFI/BOOT/BOOTX64.EFI
+	@cp $(LIMINE_DIR)/LICENSE $(call iso_stage,$@)/limine-LICENSE
 	$(XORRISO) -as mkisofs -R -r -J -b boot/limine-bios-cd.bin \
 	    -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
 	    -apm-block-size 2048 --efi-boot boot/limine-uefi-cd.bin \
 	    -efi-boot-part --efi-boot-image --protective-msdos-label \
-	    $(ISO_DIR) -o $@
+	    $(call iso_stage,$@) -o $@
 	$(LIMINE_TOOL) bios-install $@
 	@echo "built $@"
 endef
