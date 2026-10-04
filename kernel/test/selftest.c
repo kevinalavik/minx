@@ -29,6 +29,7 @@
 #include "panic.h"
 #include "serial.h"
 #include "spinlock.h"
+#include "task.h"
 #include "smp.h"
 #include "string.h"
 #include "timer.h"
@@ -898,54 +899,61 @@ static void test_pmm_churn(void) {
  * the difference between "no processor came up" and "a processor came up and
  * corrupted everything". */
 static void test_percpu(void) {
-    unsigned self = percpu_self_index();
-    percpu_t *me = percpu_self();
+    /* One snapshot, and everything below is derived from it.
+     *
+     * Reading %gs twice to check that GS is self-consistent works right up until
+     * there is a preemptive scheduler, and then it fails for a reason that has
+     * nothing to do with per-CPU state: the task is switched to another processor
+     * between the two reads and comes back with a different processor's slot.  The
+     * report then says GS points at the wrong state when in fact it pointed at the
+     * right one and the task simply moved. */
+    unsigned self = MAX_CPU_COUNT;
+    percpu_t *me = percpu_self_snapshot(&self);
 
-    if (self >= percpu_count()) {
-        test_fail("phase4-percpu", "%%gs resolves to processor %u, but only "
-                  "%u are known", self, percpu_count());
+    if (me == NULL || self >= percpu_count()) {
+        test_fail("phase4-percpu", "%%gs:0 is %p, which is not one of the %u "
+                  "known processors' slots", (void *)me, percpu_count());
         return;
     }
 
-    if (me != percpu_by_index(self)) {
+    if (percpu_by_index(self) != me) {
         test_fail("phase4-percpu", "processor %u's %%gs slot holds %p, but "
                   "slot %u is %p", self, (void *)me, self,
                   (void *)percpu_by_index(self));
         return;
     }
 
-    /* %gs:0 has to be the slot's own state pointer, which is what makes the
-     * accessor one instruction instead of an indexed load. */
-    percpu_t *from_gs;
-    __asm__ volatile("movq %%gs:0, %0" : "=r"(from_gs));
-    if (from_gs != me) {
-        test_fail("phase4-percpu", "%%gs:0 is %p, not this processor's own "
-                  "state at %p", (void *)from_gs, (void *)me);
-        return;
+    if (self != percpu_self_index() || me != percpu_self()) {
+        /* Not a failure on its own -- it is what a migration looks like -- but it
+         * means this task moved between the snapshot and now, so the checks below
+         * are about a processor that may no longer be running. */
+        kprintf("percpu: this task moved between two reads; checking the "
+                "table instead\n");
     }
 
-    /* Every known processor has a distinct slot, and no two of them claim the
-     * same LAPIC id -- ACPI listed them, so a duplicate would mean two
-     * processors are being started from one entry. */
     for (unsigned i = 0; i < percpu_count(); i++) {
-        if (percpu_by_index(i) == NULL) {
+        percpu_t *t = percpu_by_index(i);
+
+        if (t == NULL) {
             test_fail("phase4-percpu", "processor %u has no slot", i);
             return;
         }
+
         for (unsigned j = i + 1; j < percpu_count(); j++) {
-            if (percpu_lapic_id(i) == percpu_lapic_id(j)) {
+            percpu_t *o = percpu_by_index(j);
+
+            if (t->lapic_id == o->lapic_id) {
                 test_fail("phase4-percpu", "processors %u and %u share LAPIC "
-                          "id %u", i, j, percpu_lapic_id(i));
+                          "id %u", i, j, t->lapic_id);
                 return;
             }
         }
-    }
 
-    if (percpu_by_index(self)->lapic_id != lapic_id()) {
-        test_fail("phase4-percpu", "slot %u says LAPIC id %u, the hardware "
-                  "says %u", self, percpu_by_index(self)->lapic_id,
-                  lapic_id());
-        return;
+        if (t->lapic_id != percpu_lapic_id(i)) {
+            test_fail("phase4-percpu", "slot %u says LAPIC id %u, the hardware "
+                      "says %u", i, t->lapic_id, percpu_lapic_id(i));
+            return;
+        }
     }
 
     test_pass("phase4-percpu");
@@ -978,28 +986,28 @@ static void atomic_worker(void *arg) {
 }
 
 
-/* Run `work` on every online processor and wait for all of them to finish.
+/* Run `work` on every online processor and wait for all of them.
  *
- * Work for another processor goes through its per-CPU work slot and a reschedule
- * IPI, which is the same path the scheduler will use; work for this processor runs
- * inline, because there is nothing that could run it later.
+ * One task per processor, each on that processor's own stack.
  *
- * `done` counts completions.  The wait is on the count rather than on the work
- * slot, so a worker that never runs shows up as a timeout and a missed total
- * instead of a test that passes because nothing contended. */
+ * A per-CPU work slot would be the alternative, and it is what the reschedule IPI
+ * drains, but a slot holds exactly one item -- so anything that wants to run on
+ * every processor at once has to overwrite something, and with the scheduler up a
+ * processor is being kicked constantly, so an overwrite becomes the wrong function
+ * being called on the wrong processor.  That is not hypothetical: it is what
+ * `phase4-atomics` did on eight processors before this change, and it showed up as
+ * a lost task rather than as anything that looked like a queue.
+ *
+ * The wait is on a completion count rather than on the tasks, so a worker that
+ * never runs is a timeout and a short total -- not a test that passes because
+ * nothing contended. */
 typedef struct {
     void (*fn)(void *);
-    void     *arg;
+    void  *arg;
     atomic_t *done;
 } fanout_t;
 
-/* Test-only: how far each processor has got, so a fan-out that never finishes can
- * be looked at rather than waited on. */
-
-/* Runs on whichever processor the fan-out reached, then counts itself.  The count
- * has to happen here rather than in the caller: the caller is the boot processor,
- * and only it comes back from the loop -- the others are somewhere else entirely. */
-static void fanout_trampoline(void *arg) {
+static void fanout_worker(void *arg) {
     fanout_t *f = arg;
 
     f->fn(f->arg);
@@ -1010,31 +1018,35 @@ static unsigned fanout_every_cpu(void (*work)(void *), void *arg,
                                  atomic_t *done) {
     unsigned indices[MAX_CPU_COUNT];
     unsigned n = smp_online_indices(indices, MAX_CPU_COUNT);
-    unsigned self = percpu_self_index();
     fanout_t f = { work, arg, done };
 
+    /* A task for every processor, this one included.
+     *
+     * Running this processor's share inline and skipping its task is the obvious
+     * shortcut and it is wrong under a scheduler: the share can be preempted and
+     * migrated partway through, so the processor that started it is not the one
+     * that finished it, and the task skipped on the strength of a stale index is
+     * created anyway.  Then that processor runs the work twice, which is how a
+     * fairness check ends up counting 128 turns where it asked for 64. */
     for (unsigned i = 0; i < n; i++) {
-        if (indices[i] == self) {
-            fanout_trampoline(&f);
-            continue;
-        }
+        task_t *t = task_create("fanout", fanout_worker, &f, TASK_WEIGHT_MAX);
 
-        if (percpu_queue_work(indices[i], fanout_trampoline, &f) != 0) {
-            test_fail("phase4-locks", "processor %u's work slot is already "
-                      "occupied", indices[i]);
+        if (t == NULL) {
+            test_fail("phase4-locks", "could not create a task for processor %u",
+                      indices[i]);
             return 0;
         }
-        if (smp_kick_cpu(indices[i]) != 0) {
-            test_fail("phase4-locks", "could not kick processor %u",
+        if (task_wakeup_on(indices[i], t) != 0) {
+            test_fail("phase4-locks", "could not queue work for processor %u",
                       indices[i]);
             return 0;
         }
     }
 
-    for (unsigned waited = 0; waited < 5000; waited++) {
+    for (unsigned waited = 0; waited < 20000; waited++) {
         if ((unsigned)atomic_load(done) >= n)
             break;
-        delay_ms(1);
+        task_sleep_ms(1);
     }
 
     return n;
@@ -1537,6 +1549,395 @@ static void test_ipi(void) {
     test_pass("phase4-ipi");
 }
 
+/* --- the scheduler ------------------------------------------------------ */
+
+/* Give every processor something to do and wait for it to finish.
+ *
+ * The waiting is the point: this runs as an ordinary task, so it can be preempted
+ * while it waits, which is also what proves the scheduler can put it back. */
+static bool wait_until(volatile uint64_t *counter, uint64_t target,
+                       unsigned timeout_ms) {
+    for (unsigned waited = 0; waited < timeout_ms; waited++) {
+        if (*counter >= target)
+            return true;
+        task_sleep_ms(1);
+    }
+    return *counter >= target;
+}
+
+typedef struct {
+    volatile uint64_t count;
+    volatile uint64_t slices;     /* observed time slices taken */
+    uint64_t          iters;
+    uint32_t          weight;
+    unsigned          last_cpu;
+} worker_t;
+
+static volatile uint64_t workers_done;
+
+static void sched_worker(void *arg) {
+    worker_t *w = (worker_t *)arg;
+
+    for (uint64_t i = 0; i < w->iters; i++) {
+        __atomic_add_fetch(&w->count, 1, __ATOMIC_ACQ_REL);
+        /* Enough work between the increments that a task this size really does
+         * get preempted rather than running to the end in one slice. */
+        for (volatile unsigned spin = 0; spin < 64; spin++)
+            ;
+        w->last_cpu = percpu_self_index();
+    }
+
+    __atomic_add_fetch(&workers_done, 1, __ATOMIC_ACQ_REL);
+}
+
+/* Every task runs to completion, and between them they used more than one
+ * processor.  "More than one" is the whole claim: a scheduler that ran every task
+ * on the boot processor would pass any test that only checked the totals. */
+static void test_sched_parallel(void) {
+    enum { WORKERS = 6 };
+    static worker_t w[WORKERS];
+    task_t *t[WORKERS];
+
+    workers_done = 0;
+    for (unsigned i = 0; i < WORKERS; i++) {
+        w[i].count = 0;
+        w[i].slices = 0;
+        w[i].iters = 4000;
+        w[i].weight = TASK_WEIGHT_DEFAULT;
+        w[i].last_cpu = MAX_CPU_COUNT;
+
+        t[i] = task_create("worker", sched_worker, &w[i], TASK_WEIGHT_DEFAULT);
+        if (t[i] == NULL) {
+            test_fail("phase5-parallel", "could not create task %u", i);
+            return;
+        }
+        if (task_wakeup(t[i]) != 0) {
+            test_fail("phase5-parallel", "could not queue task %u", i);
+            return;
+        }
+    }
+
+    if (!wait_until((volatile uint64_t *)&workers_done, WORKERS, 20000)) {
+        test_fail("phase5-parallel", "only %lu of %u tasks finished in 20 s",
+                  (unsigned long)workers_done, WORKERS);
+        return;
+    }
+
+    unsigned cpus_seen = 0;
+    for (unsigned i = 0; i < WORKERS; i++) {
+        if (w[i].count != w[i].iters) {
+            test_fail("phase5-parallel", "task %u completed %lu of %lu rounds",
+                      i, (unsigned long)w[i].count, (unsigned long)w[i].iters);
+            return;
+        }
+        if (w[i].last_cpu < percpu_online_count())
+            cpus_seen |= 1u << w[i].last_cpu;
+    }
+
+    unsigned distinct = 0;
+    for (unsigned b = cpus_seen; b != 0; b >>= 1)
+        distinct += (b & 1);
+
+    unsigned switches = 0;
+    for (unsigned i = 0; i < WORKERS; i++)
+        switches += t[i]->switch_count != 0 ? 1 : 0;
+
+    if (percpu_online_count() > 1) {
+        /* More than one processor has to have run them, or nothing was actually
+         * concurrent.  A scheduler that ran every task on the boot processor
+         * passes any test that only checks the totals. */
+        if (distinct < 2) {
+            test_fail("phase5-parallel", "the %u tasks all ran on one of the "
+                      "%u processors, so nothing was actually concurrent",
+                      WORKERS, percpu_online_count());
+            return;
+        }
+        kprintf("sched: %u tasks ran on %u processor(s)\n", WORKERS, distinct);
+    } else {
+        /* One processor: there is no second one to be concurrent with, so the
+         * claim has to be that the tasks shared this one rather than running one
+         * after another to completion.  Each of them was switched into more than
+         * once, which only happens if they were interleaved. */
+        if (switches < 2) {
+            test_fail("phase5-parallel", "only %u of the %u tasks were switched "
+                      "into more than once, so they ran one after another rather "
+                      "than sharing the processor", switches, WORKERS);
+            return;
+        }
+        kprintf("sched: %u tasks shared one processor, %u of them interleaved\n",
+                WORKERS, switches);
+    }
+
+    test_pass("phase5-parallel");
+}
+
+/* A task that never yields must still be taken off its processor.  This is
+ * preemption, and it is the difference between a scheduler and a queue: without
+ * it the first task to run runs to completion whatever the others want. */
+static volatile uint64_t spinner_switches;
+static volatile uint64_t spinner_done;
+
+static void spinner(void *arg) {
+    (void)arg;
+    for (volatile unsigned spin = 0; spin < 4000000; spin++)
+        ;
+
+    __atomic_store_n(&spinner_switches,
+                     sched_current() != NULL ? sched_current()->switch_count : 0,
+                     __ATOMIC_RELEASE);
+    __atomic_add_fetch(&spinner_done, 1, __ATOMIC_ACQ_REL);
+}
+
+static void test_sched_preempt(void) {
+    task_t *t = task_create("spinner", spinner, NULL, TASK_WEIGHT_DEFAULT);
+
+    spinner_switches = 0;
+    spinner_done = 0;
+
+    if (t == NULL || task_wakeup(t) != 0) {
+        test_fail("phase5-preempt", "could not start the spinner");
+        return;
+    }
+
+    if (!wait_until((volatile uint64_t *)&spinner_done, 1, 20000)) {
+        test_fail("phase5-preempt", "the spinner never finished, so it was "
+                  "never taken off its processor");
+        return;
+    }
+
+    /* It ran for a long time without yielding, so it can only have finished if it
+     * was switched out and back in at least once while it ran. */
+    if (spinner_switches < 2) {
+        test_fail("phase5-preempt", "the spinner was switched into only %lu "
+                  "time(s); a task that never yields must be preempted",
+                  (unsigned long)spinner_switches);
+        return;
+    }
+
+    test_pass("phase5-preempt");
+}
+
+/* Two tasks of equal weight that both run flat out must both get processor time.
+ * A scheduler that always picks the first runnable task, or one that migrates
+ * everything onto one processor, gives one of them everything and the other
+ * nothing -- and the one that gets nothing never finishes, so this fails as a
+ * timeout rather than as a number. */
+static volatile uint64_t fair_progress[2];
+static volatile uint64_t fair_done;
+
+static void fair_spinner(void *arg) {
+    unsigned which = (unsigned)(uintptr_t)arg;
+
+    for (unsigned i = 0; i < 300000; i++)
+        __atomic_add_fetch(&fair_progress[which], 1, __ATOMIC_ACQ_REL);
+
+    __atomic_add_fetch(&fair_done, 1, __ATOMIC_ACQ_REL);
+}
+
+static void test_sched_fair(void) {
+    task_t *a, *b;
+
+    fair_progress[0] = 0;
+    fair_progress[1] = 0;
+    fair_done = 0;
+
+    a = task_create("fair0", fair_spinner, (void *)(uintptr_t)0,
+                    TASK_WEIGHT_DEFAULT);
+    b = task_create("fair1", fair_spinner, (void *)(uintptr_t)1,
+                    TASK_WEIGHT_DEFAULT);
+
+    if (a == NULL || b == NULL) {
+        test_fail("phase5-fair", "could not create the two tasks");
+        return;
+    }
+    task_wakeup(a);
+    task_wakeup(b);
+
+    if (!wait_until((volatile uint64_t *)&fair_done, 2, 20000)) {
+        test_fail("phase5-fair", "only %lu of the two tasks finished in 20 s, so "
+                  "one of them was starved", (unsigned long)fair_done);
+        return;
+    }
+
+    uint64_t p0 = fair_progress[0];
+    uint64_t p1 = fair_progress[1];
+
+    /* A factor of four is slack, not a target: the point is that neither is
+     * anywhere near zero while the other is done. */
+    if (p0 == 0 || p1 == 0 || p0 > p1 * 4 || p1 > p0 * 4) {
+        test_fail("phase5-fair", "the two equal-weight tasks got %lu and %lu "
+                  "rounds, which is not even", (unsigned long)p0,
+                  (unsigned long)p1);
+        return;
+    }
+
+    test_pass("phase5-fair");
+}
+
+/* Sleep really waits.  A sleep that returned immediately would pass any test that
+ * only checked the task finished, which is why this measures. */
+static volatile uint64_t sleeper_done;
+static volatile uint64_t sleeper_elapsed_ms;
+static volatile uint64_t sleeper_woke_early;
+
+static void timed_sleeper(void *arg) {
+    (void)arg;
+    uint64_t start = monotonic_ns();
+
+    task_sleep_ms(60);
+    uint64_t elapsed = monotonic_ns() - start;
+
+    sleeper_elapsed_ms = elapsed / 1000000ull;
+    if (elapsed < 60000000ull)
+        sleeper_woke_early = 1;
+    __atomic_add_fetch(&sleeper_done, 1, __ATOMIC_ACQ_REL);
+}
+
+static void test_sched_sleep(void) {
+    task_t *t = task_create("sleeper", timed_sleeper, NULL,
+                            TASK_WEIGHT_DEFAULT);
+
+    sleeper_done = 0;
+    sleeper_elapsed_ms = 0;
+    sleeper_woke_early = 0;
+
+    if (t == NULL || task_wakeup(t) != 0) {
+        test_fail("phase5-sleep", "could not start the sleeper");
+        return;
+    }
+
+    if (!wait_until((volatile uint64_t *)&sleeper_done, 1, 20000)) {
+        test_fail("phase5-sleep", "the task never woke from a 60 ms sleep");
+        return;
+    }
+    if (sleeper_woke_early) {
+        test_fail("phase5-sleep", "a 60 ms sleep returned after %lu ms",
+                  (unsigned long)sleeper_elapsed_ms);
+        return;
+    }
+    /* And it must not have waited absurdly long either: a sleep that overshoots
+     * by a factor of fifty is a tick that is not firing. */
+    if (sleeper_elapsed_ms > 3000) {
+        test_fail("phase5-sleep", "a 60 ms sleep took %lu ms",
+                  (unsigned long)sleeper_elapsed_ms);
+        return;
+    }
+
+    kprintf("sched: a 60 ms sleep measured %lu ms\n",
+            (unsigned long)sleeper_elapsed_ms);
+    test_pass("phase5-sleep");
+}
+
+/* A wait queue blocks one task and a different task wakes exactly that one.
+ * The wrong answer here is either "woke everybody", which a count cannot see, or
+ * "never woke", which hangs -- so the test checks both the wake and the count. */
+static wait_queue_t test_wq;
+static volatile uint64_t wq_waiter_woke;
+static volatile uint64_t wq_others_woke;
+static volatile uint64_t wq_wake_ran;
+
+static void wq_waiter(void *arg) {
+    unsigned tag = (unsigned)(uintptr_t)arg;
+
+    wait_queue_sleep(&test_wq, tag);
+    /* The point of the test is which of the two was woken, so the two outcomes go
+     * to two different counters rather than one. */
+    __atomic_add_fetch(tag == 42 ? &wq_waiter_woke : &wq_others_woke, 1,
+                       __ATOMIC_ACQ_REL);
+}
+
+static void wq_waker(void *arg) {
+    (void)arg;
+    /* Let both waiters get as far as the queue before naming one of them. */
+    task_sleep_ms(40);
+    wait_queue_wake(&test_wq, 42);
+    __atomic_add_fetch(&wq_wake_ran, 1, __ATOMIC_ACQ_REL);
+}
+
+static void test_sched_waitq(void) {
+    task_t *w1, *w2, *wk;
+
+    test_wq.count = 0;
+    wq_waiter_woke = 0;
+    wq_others_woke = 0;
+    wq_wake_ran = 0;
+    wait_queue_init(&test_wq);
+
+    w1 = task_create("wq42", wq_waiter, (void *)(uintptr_t)42,
+                     TASK_WEIGHT_DEFAULT);
+    w2 = task_create("wq7", wq_waiter, (void *)(uintptr_t)7,
+                     TASK_WEIGHT_DEFAULT);
+    wk = task_create("waker", wq_waker, NULL, TASK_WEIGHT_DEFAULT);
+
+    if (w1 == NULL || w2 == NULL || wk == NULL) {
+        test_fail("phase5-waitq", "could not create the three tasks");
+        return;
+    }
+
+    task_wakeup(w1);
+    task_wakeup(w2);
+    task_wakeup(wk);
+
+    if (!wait_until((volatile uint64_t *)&wq_wake_ran, 1, 20000)) {
+        test_fail("phase5-waitq", "the waker never ran");
+        return;
+    }
+    if (!wait_until((volatile uint64_t *)&wq_waiter_woke, 1, 5000)) {
+        test_fail("phase5-waitq", "the named waiter was never woken");
+        return;
+    }
+
+    if (wq_others_woke != 0) {
+        test_fail("phase5-waitq", "waking tag 42 also woke %lu other waiter(s)",
+                  (unsigned long)wq_others_woke);
+        return;
+    }
+    if (wait_queue_count(&test_wq) != 1) {
+        test_fail("phase5-waitq", "the queue still holds %u waiter(s), expected 1",
+                  wait_queue_count(&test_wq));
+        return;
+    }
+
+    /* Leave nothing blocked, so the next test starts from a clean queue. */
+    wait_queue_wake_all(&test_wq);
+    (void)wait_until((volatile uint64_t *)&wq_others_woke, 1, 5000);
+
+    test_pass("phase5-waitq");
+}
+
+/* The per-processor view has to add up: every processor has an idle task, and the
+ * scheduler's counters for each are live rather than zero. */
+static void test_sched_queues(void) {
+    unsigned online = percpu_online_count();
+    uint32_t total_switches = 0;
+
+    for (unsigned i = 0; i < online; i++) {
+        sched_stats_t st;
+
+        sched_get_stats(i, &st);
+        if (st.ticks == 0) {
+            test_fail("phase5-queues", "processor %u has taken no scheduler "
+                      "ticks at all, which means its local APIC timer stopped "
+                      "firing rather than that it had nothing to do", i);
+            return;
+        }
+        total_switches += st.switches;
+        kprintf("sched: cpu %u: %lu ticks, %u switches, %u steals, %u queued, "
+                "%u idle\n", i, (unsigned long)st.ticks, st.switches,
+                st.steals, st.queued, st.idle_ticks);
+    }
+
+    /* An idle processor legitimately makes no switches -- it has nothing to switch
+     * to -- so the claim is about the machine as a whole.  A scheduler where
+     * *nobody* ever switched would pass every per-processor check above. */
+    if (total_switches == 0) {
+        test_fail("phase5-queues", "no processor made a single context switch");
+        return;
+    }
+
+    test_pass("phase5-queues");
+}
+
 static void test_smp_tss(void) {
     unsigned known = percpu_count();
 
@@ -1662,6 +2063,12 @@ void test_run_all(void) {
     test_ipi();
     test_smp_tss();
     test_smp_online();
+    test_sched_queues();
+    test_sched_parallel();
+    test_sched_preempt();
+    test_sched_fair();
+    test_sched_sleep();
+    test_sched_waitq();
 
     kprintf("\n%u passed, %u failed\n", passed, failed);
     kprintf("TEST-READY\n");

@@ -19,6 +19,7 @@
 #include "power.h"
 #include "serial.h"
 #include "string.h"
+#include "task.h"
 #include "timer.h"
 #include "types.h"
 
@@ -82,7 +83,7 @@ static void line_submit(void) {
      * phase 9, and this file then shrinks to nothing but the read loop. */
     if (strcmp(line, "help") == 0) {
         console_puts("console commands: help, clear, uptime, meminfo, "
-                     "cpus, keys, irqs, reboot\n");
+                     "cpus, sched, ps, keys, irqs, reboot\n");
     } else if (strcmp(line, "clear") == 0) {
         console_clear();
     } else if (strcmp(line, "uptime") == 0) {
@@ -113,6 +114,24 @@ static void line_submit(void) {
                     (unsigned long long)cpu_interrupt_count(i),
                     (unsigned long long)cpu_ipi_count(i),
                     (unsigned long long)percpu_idle_ticks(i));
+        }
+    } else if (strcmp(line, "sched") == 0) {
+        sched_report();
+    } else if (strcmp(line, "ps") == 0) {
+        unsigned n = task_count();
+
+        kprintf("%u task(s):\n", n);
+        for (unsigned i = 0; i < n; i++) {
+            task_t *t = task_by_index(i);
+            if (t == NULL)
+                break;
+            kprintf("  %-4lu %-10s %-8s w%-3u cpu %-2u %6lu switches, "
+                    "%lu ms run\n",
+                    (unsigned long)t->id, t->name, task_state_name(t->state),
+                    t->weight,
+                    t->last_cpu < MAX_CPU_COUNT ? t->last_cpu : 0,
+                    (unsigned long)t->switch_count,
+                    (unsigned long)(t->exec_ns / 1000000ull));
         }
     } else if (strcmp(line, "keys") == 0) {
         kprintf("keyboard: present=%d ready=%d, %s, %llu scancodes, "
@@ -227,7 +246,7 @@ unsigned conio_pump(void) {
 void conio_banner(void) {
     line_len = 0;
     console_puts("\n");
-    kprintf("minx console commands: help clear uptime meminfo cpus keys irqs "
-            "reboot\n");
+    kprintf("minx console commands: help clear uptime meminfo cpus sched ps "
+            "keys irqs reboot\n");
     kprintf("type help and press enter.\n");
 }
