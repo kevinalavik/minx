@@ -11,7 +11,7 @@ proven, and start there.
 | 1 | Toolchain & boot, framebuffer console | VERIFIED | `make test` → 17/17 PASS, framebuffer dump captured; `make run` boots to a graphical console at 1280x800 with 160x50 text cells. Serial log shows the memory map, RSDP, `SMP: 4 CPUs`, initrd and heap. Panic path verified separately (register dump + stack trace on both consoles) while fixing bring-up bugs. |
 | 2 | CPU core, keyboard into console | VERIFIED | `phase2-acpi` (4 processors with distinct LAPIC ids, IOAPIC at 0xfec00000), `phase2-interrupts` (IOAPIC owns all 16 lines, 8259s stay masked, a mask round trip changes the chip's own bit, and both the LAPIC timer and the 8253 really fire over 120 ms with interrupts on), `phase2-keyboard` (8042 self test, scancode set 1, reachable on IRQ 1), `phase2-input` (event ring in and out in order). Typed keys reach the graphical console: `tools/type-test.sh` types `help`, `keys`, `irqs`, `uptime`, `meminfo` and all five answer. |
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
-| 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | IN PROGRESS | **Implemented; passes, but intermittently. Over eight `-smp 4` runs of the test ISO: five 34/34, one hang, one failed check, one panic.** `make test` needs 34/34, so the phase is not VERIFIED. The fault is localised to a corrupted per-processor `current` pointer — see "Known bugs / gaps".  `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). A good `-smp 4` run reads `sched: cpu 0: 41439 ticks, 11149 switches, 5558 steals` and `sched: 6 tasks ran on 4 processor(s)`. **NOT VERIFIED: it is intermittent.** Roughly one run in three at `-smp 4` dies instead — see "Known bugs / gaps". |
+| 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | IN PROGRESS | **Implemented; passes, but intermittently. Over fourteen `-smp 4` runs of the test ISO: eleven 34/34 and three failures.** `make test` needs 34/34, so the phase is not VERIFIED. The fault is localised to a corrupted per-processor `current` pointer — see "Known bugs / gaps".  `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). A good `-smp 4` run reads `sched: cpu 0: 41439 ticks, 11149 switches, 5558 steals` and `sched: 6 tasks ran on 4 processor(s)`. **NOT VERIFIED: it is intermittent.** Roughly one run in three at `-smp 4` dies instead — see "Known bugs / gaps". |
 | 6 | Userspace entry | NOT STARTED | |
 | 7 | Processes, signals, pipes | NOT STARTED | |
 | 8 | VFS + ramfs + initrd + devfs | NOT STARTED | |
@@ -234,41 +234,51 @@ looked like it was working.
   `-smp 2` have not been seen to fail. It happens early, usually within
   `phase1-console-scrolling`.
   What is known, and each of these was established by experiment rather than by
-  argument:
-  - **The fault is a `current` that does not point at a task.** `charge_current()`
-    divides by `task->weight`, and a divide is the one instruction on the preemption
-    path that faults rather than returning a wrong answer. It was raising #DE and the
-    kernel reported "unhandled CPU exception: vector 0" with nothing pointing at the
-    cause. There is now a guard that names it, and a captured run says exactly what
-    is wrong:
-    `sched: processor 2 has 0xffff800000100030 as its current task, and that has weight 0`.
-    `0xffff800000100030` is `heap_base + 0x30` — the payload of the first block the
-    allocator handed out — being used as a `task_t *`. So something wrote a heap
-    address into `cpu[2].current`, or walked a list to a node that is not a task.
-  - **Not a stack overflow.** Task and application-processor stacks were raised from
+  argument. **Both symptoms have been reduced to one cause, and it is now a guard
+  that names it rather than a fault that does not:**
+  `smp: task 1 (boot) is already linked into the blocked list and is being linked
+  into that same list again (state 4)`.
+  `state 4` is `TASK_SLEEPING`, and the call chain is
+  `test_run_all` → `task_sleep_ms` → the list check. So `task_sleep_ms()` is being
+  called on a task that is *already asleep and already on the blocked list*, which
+  happens only if the `schedule()` inside it **returned without switching away**.
+  `schedule()` has exactly four ways to return without switching, and three of them
+  are correct; this is the remaining question:
+  1. `!sched_up` — ruled out, the tests run.
+  2. `c->in_schedule` — the guard is set and cleared inside `schedule()` with
+     interrupts off, so nothing should find it set.
+  3. `next == prev` — correct, and only reachable by the idle task re-picking itself.
+  4. **the `TASK_RUNNABLE → TASK_RUNNING` compare-exchange on the chosen task
+     fails**, and `schedule()` returns. This is the one to instrument next: log
+     `next`, its `state`, and `next->id` on that path and see what state it was in.
+     A plausible route is a task stolen by `steal_any()` that another processor
+     claims first — the steal removed it from the victim's queue, and if the
+     compare-exchange then fails the task is on nobody's queue and the processor that
+     stole it stays on its own task.
+  The other symptom, `sched: processor 2 has 0xffff800000100030 as its current task`,
+  is a heap payload being used as a `task_t *`, and is very likely the *same* bug
+  arriving from the other side: a walk that left a list, or a task lost by (4), leaves
+  a processor's `current` pointing at whatever the memory had become.
+
+  Also ruled out, each by experiment:
+  - **A stack overflow.** Task and application-processor stacks were raised from
     16 KiB to 32 KiB and the fault did not change. A guard word at the bottom of every
     task stack plus a per-tick `%rsp` check (`sched_check_stack()`) now make an
     overflow report itself rather than corrupt a return address; it has never fired.
-  - **Not `isr_common` losing `%rbp`.** It does not lose it: `%rbp` is callee-saved
-    and survives the handler chain even when a handler switches stacks. Changing it
-    to save the frame address on the stack instead turned the intermittent fault into
-    a deterministic hang at exactly the same place, which is how the theory was
+  - **`isr_common` losing `%rbp`.** It does not lose it: `%rbp` is callee-saved and
+    survives the handler chain even when a handler switches stacks. Changing it to
+    save the frame address on the stack instead turned the intermittent fault into a
+    deterministic hang at exactly the same place, which is how the theory was
     disproved. Reverted.
-  - **Not `irq_restore()`'s `popfq` restoring stray trap or direction flags.**
-    Replacing the whole-word `popfq` with `sti`/`cli` on the interrupt-enable bit
-    alone hung the same guest at exactly the same place, every time. Reverted.
+  - **`irq_restore()`'s `popfq` restoring stray trap or direction flags.** Replacing
+    the whole-word `popfq` with `sti`/`cli` on the interrupt-enable bit alone hung the
+    same guest at exactly the same place, every time. Reverted.
   Next things to try, in order:
-  1. `sched_cpu_t` is per processor and only ever touched by that processor, so a bad
-     `current` means the *task* was already bad, or a list was walked wrongly. Add the
-     same "which list" check that the run queue has to the **blocked list**:
-     `blocked_remove()` calls `list_unlink()` without verifying `t->list_tag`, so
-     removing a task that is not on it writes `NULL` into the blocked list's head and
-     tail and silently drops every other sleeper. That is the cheapest remaining hole.
-  2. Check every `t->next`/`t->prev` dereference reached from `rq_pick_fairest()` and
-     `wake_sleepers()` against the task's `list_tag`, so a walk that leaves the list
-     says which node it left by rather than returning whatever it found.
-  3. `-d int,cpu_reset -D build/q.log` on a failing run, and watch whether the bad
-     `current` is written by a steal or by a wake.
+  1. Instrument the failed compare-exchange in `schedule()` as above.
+  2. `-d int,cpu_reset -D build/q.log` on a failing run, and check whether the
+     compare-exchange fails in a steal or after a pop from the processor's own queue.
+  3. If it is a steal, make `steal_from()` re-queue the task on the *victim* when the
+     claim fails rather than dropping it.
 
 - The framebuffer resolution is whatever Limine picks (1280x800 under QEMU
   here); the `resolution:` option in `boot/limine.conf` is not honoured by the

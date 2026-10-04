@@ -193,14 +193,32 @@ static void rq_remove(sched_cpu_t *c, task_t *t) {
  * queue, which is what stops two equal-weight tasks from taking turns in lock
  * step forever: each is chosen immediately after the other and neither ever sees
  * the other's work finish. */
+/* Walking a list of tasks is trusting every link in it.  The check costs a compare
+ * against a value already in the cache and turns "followed a link into a node that is
+ * not a task" into a report naming the node, which is the only way to tell a heap
+ * pointer that found its way into `current` from any other corruption. */
+static task_t *list_next_checked(task_t *t, task_t **head, const char *what) {
+    task_t *next = t->next;
+
+    if (next != NULL && next->list_tag != (uint64_t)(uintptr_t)head)
+        panic("smp: walking the %s, task %lu (%s) points at task %p, which is on "
+              "the list at %p\n", what, (unsigned long)t->id, t->name,
+              (void *)next, (void *)(uintptr_t)next->list_tag);
+
+    return next;
+}
+
 static task_t *rq_pick_fairest(sched_cpu_t *c) {
     task_t *best = NULL;
+    task_t *t = c->rq.head;
 
-    for (task_t *t = c->rq.head; t != NULL; t = t->next) {
-        if (t->state != TASK_RUNNABLE)
-            continue;
-        if (best == NULL || t->vruntime < best->vruntime)
+    while (t != NULL) {
+        task_t *next = list_next_checked(t, &c->rq.head, "run queue");
+
+        if (t->state == TASK_RUNNABLE &&
+            (best == NULL || t->vruntime < best->vruntime))
             best = t;
+        t = next;
     }
 
     return best;
@@ -239,7 +257,24 @@ static void blocked_add(task_t *t) {
     blocked.length++;
 }
 
+/* Removing a task that is not on this list is the quiet kind of wrong.
+ *
+ * `list_unlink()` trusts its arguments: it patches the node's neighbours and writes
+ * the node's own `next`/`prev` back as the list's new head and tail.  Handed a task
+ * whose links are already clear, it therefore sets *both* of them to NULL -- which
+ * does not fail, it throws the entire list away, and every sleeper still on it is
+ * now unreachable and will never be woken.  The visible result is a task that slept
+ * and never came back, which reads like a lost timer rather than like a lost list.
+ *
+ * So the node is asked which list it is on first.  This was the one unlinked list
+ * without the check, and it is what a corrupted `current` most plausibly follows
+ * from. */
 static void blocked_remove(task_t *t) {
+    if (t->list_tag != (uint64_t)(uintptr_t)&blocked.head)
+        panic("smp: task %lu (%s) is being taken off the blocked list, but it is "
+              "on the list at %p, not this one\n", (unsigned long)t->id, t->name,
+              (void *)(uintptr_t)t->list_tag);
+
     list_unlink(&blocked.head, &blocked.tail, t);
     blocked.length--;
 }
@@ -748,7 +783,7 @@ static void wake_sleepers(void) {
          * removing clears exactly that link -- reading it afterwards ends the walk
          * after one task, so a burst of sleepers would wake one per tick and the
          * rest would sit there until the machine happened to be quiet. */
-        task_t *next = t->next;
+        task_t *next = list_next_checked(t, &blocked.head, "blocked list");
 
         if (t->wake_at_ns != 0 && t->wake_at_ns <= now) {
             blocked_remove(t);
