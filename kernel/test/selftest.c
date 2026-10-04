@@ -791,6 +791,14 @@ static void test_direct_map(void) {
         { 0x100000, "1 MiB" },
         { 0x10000000, "256 MiB" },
         { highest - page_size, "the last usable frame" },
+        /* Not page-aligned, deliberately.  A translation that returns the frame
+         * rather than the address is right for every page-aligned address and
+         * wrong for all the others, so a probe that only used aligned ones would
+         * never notice -- and the address a caller has is rarely aligned. */
+        { 0x1234, "an unaligned address near the bottom" },
+        { 0x10000 + 0xabc, "an unaligned address inside 1 MiB" },
+        { 0x400000 + 0x7d0, "an unaligned address inside 1 GiB" },
+        { highest - 0x40, "an unaligned address in the last frame" },
     };
 
     for (unsigned i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
@@ -949,6 +957,77 @@ static void test_percpu(void) {
  * incomplete phase into a red build and hide the fact that it is incomplete.
  * What it does insist on is that the count is possible: never more online than
  * known, and never less than the one processor that is certainly running. */
+static void test_smp_tss(void) {
+    unsigned known = percpu_count();
+
+    for (unsigned i = 0; i < known; i++) {
+        uint64_t base = 0;
+        uint32_t limit = 0;
+        uint8_t type = 0;
+
+        if (!gdt_tss_descriptor_for(i, &base, &limit, &type)) {
+            test_fail("phase4-tss", "processor %u has no 64-bit TSS descriptor "
+                      "at selector %#x", i, gdt_tss_selector(i));
+            return;
+        }
+
+        if (base != (uint64_t)&kernel_tss[i]) {
+            test_fail("phase4-tss", "processor %u's descriptor points at %#lx, "
+                      "not at its own TSS at %p", i, (unsigned long)base,
+                      (void *)&kernel_tss[i]);
+            return;
+        }
+
+        /* Two processors sharing one descriptor would find the second `ltr`
+         * refused, because loading the task register marks it busy in place. */
+        for (unsigned j = 0; j < i; j++) {
+            uint64_t other = 0;
+            if (gdt_tss_descriptor_for(j, &other, NULL, NULL) &&
+                other == base) {
+                test_fail("phase4-tss", "processors %u and %u share the TSS "
+                          "descriptor at %#lx", j, i, (unsigned long)base);
+                return;
+            }
+        }
+
+        /* The limit has to reach the I/O map base at 0x6a, or `ltr` is refused
+         * with #TS. */
+        if (limit < 0x6a) {
+            test_fail("phase4-tss", "processor %u's TSS limit is %#x, which does "
+                      "not cover the I/O map base at 0x6a", i, limit);
+            return;
+        }
+
+        if (kernel_tss[i].iomap_base != sizeof(tss_t)) {
+            test_fail("phase4-tss", "processor %u's TSS says its I/O map starts "
+                      "at %#x, expected %#x", i, kernel_tss[i].iomap_base,
+                      (unsigned)sizeof(tss_t));
+            return;
+        }
+
+        /* Two more field offsets the CPU reads and nothing checks.  RSP0 lives
+         * at 0x08, not 0x04 -- the 32-bit TSS's SS:0 slot is there -- and IST 1
+         * at 0x28, not 0x24.  Both wrong just means a fault finds no stack. */
+        if (kernel_tss[i].reserved1 != 0 || kernel_tss[i].reserved2 != 0) {
+            test_fail("phase4-tss", "processor %u's TSS reserved words are "
+                      "not zero (%#lx, %#lx)", i,
+                      (unsigned long)kernel_tss[i].reserved1,
+                      (unsigned long)kernel_tss[i].reserved2);
+            return;
+        }
+
+        if (percpu_is_online(i)) {
+            if (kernel_tss[i].ist[0] == 0) {
+                test_fail("phase4-tss", "processor %u is online with no IST 1 "
+                          "stack, so a double fault has nowhere to go", i);
+                return;
+            }
+        }
+    }
+
+    test_pass("phase4-tss");
+}
+
 static void test_smp_online(void) {
     unsigned known = percpu_count();
     unsigned online = percpu_online_count();
@@ -993,6 +1072,7 @@ void test_run_all(void) {
     test_direct_map();
     test_pmm_churn();
     test_percpu();
+    test_smp_tss();
     test_smp_online();
 
     kprintf("\n%u passed, %u failed\n", passed, failed);

@@ -29,7 +29,13 @@ uint64_t vmm_walk_translate(uint64_t virt, bool *writable) {
         *writable = false;
 
     uint64_t table = read_cr3() & ~0xfffull;
-    uint64_t addr = virt & ADDR_MASK;
+
+    /* The in-page offset is kept.  Masking it off here looks harmless -- the walk
+     * only ever shifts whole units -- but the answer has to be an *address*, not
+     * a frame, and the offset is part of it.  A walk that drops it translates
+     * every address in a page to that page's base, which is right for one address
+     * in 4096 and for none of the ones anyone asks about. */
+    uint64_t addr = virt & 0x0000ffffffffffffull;
 
     for (int level = 4; level >= 1; level--) {
         uint64_t shift = (uint64_t)(level - 1) * 9 + ADDR_SHIFT;
@@ -43,7 +49,7 @@ uint64_t vmm_walk_translate(uint64_t virt, bool *writable) {
         if (writable)
             *writable = (value & PTE_WRITE) != 0;
 
-        /* A huge page ends the walk early. */
+        /* A large page ends the walk early, and its base is a whole page. */
         if ((value & PTE_HUGE) != 0 && level <= 3) {
             uint64_t base = value & 0x000fffffffe00000ull;
             uint64_t mask = level == 3 ? 0x1fffffull : 0x3fffffull;
@@ -53,7 +59,11 @@ uint64_t vmm_walk_translate(uint64_t virt, bool *writable) {
         table = value & 0x000ffffffffff000ull;
     }
 
-    return table;   /* the leaf's physical frame */
+    /* A 4 KiB leaf.  Its address field is the frame, so the offset inside the
+     * page is still missing and has to be put back: every address in the first
+     * page of a mapping would otherwise translate to that page's base, which is
+     * right for one address in 4096. */
+    return table | (addr & 0xfffull);
 }
 
 bool vmm_is_mapped(uint64_t virt) {

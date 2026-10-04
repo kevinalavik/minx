@@ -59,6 +59,14 @@ int  vmm_map_kernel_virt(uint64_t virt, uint64_t phys, size_t bytes,
 int  vmm_unmap_kernel_virt(uint64_t virt, size_t bytes);
 int  vmm_set_nx_range(uint64_t virt, size_t bytes, bool nx);
 
+/* Release the bootloader's memory.
+ *
+ * Not done by vmm_init(), because the bootloader starts the application
+ * processors itself and leaves them running on its own page tables: its frames
+ * stay in use until each of them has been handed an entry point and switched to
+ * the kernel's address space. */
+int  vmm_release_boot_tables(void);
+
 /* User-space mappings.  Phase 6 fills these in; they exist now so the layout
  * and the page fault handler's user/kernel split can be tested. */
 int  vmm_map_user(uint64_t virt, uint64_t phys, size_t bytes, bool writable);

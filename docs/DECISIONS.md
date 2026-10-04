@@ -242,3 +242,68 @@ with no IDT of its own, and triple-faults the machine. An incomplete phase that
 still boots and says what it could not do is more useful than a red build that
 says nothing about why.
 
+## 2026-10-04 — The bootloader starts the application processors; the kernel only hands them an entry point
+Decision: `smp_start_all()` does not send INIT or a startup IPI. It writes
+`mp_info->reserved` (the stack), `mp_info->extra_argument` (a direct-map address
+holding the CR3, CR4, slot index and IST stacks) and `mp_info->goto_address` (the
+entry point), and the processor jumps there. `smp_start_cpu()` and
+`smp_trampoline.S` are kept for a bootloader that does not do this, and are not
+called.
+Alternatives: INIT/SIPI by hand; writing a wait-for-startup loop into the physical
+page at `0xfffffff0`; mapping `0xfffff000` in the kernel's own tables.
+Reason: the bootloader starts every application processor itself, out of its own
+INIT/SIPI sequence, and parks each one spinning on `mp_info->goto_address` — that
+is what it does with them, and the measurement that settled it was reading its
+source, not more guessing at the machine. INIT by hand cannot work here: INIT is a
+level interrupt whose destination field is ignored, so it resets the sender too,
+and the released processor fetches from the reset vector, where this machine holds
+the bootloader's code rather than firmware's wait loop. It executes that, faults
+with no IDT of its own and triple-faults. Mapping `0xfffff000` changes nothing for
+the same reason the other option fails: a released processor is in real mode with
+paging off and never consults page tables.
+
+The hand-off has a consequence worth stating separately: a parked processor is
+running on the *bootloader's* page tables, so the frames behind them are still in
+use after the kernel has switched CR3. `vmm_release_boot_tables()` therefore waits
+for the hand-off to complete before the allocator gets them back. Releasing at the
+CR3 switch, as before, would hand three processors' page tables to the heap.
+
+## 2026-10-04 — One TSS, one descriptor and one IST stack per processor
+Decision: `kernel_tss` is an array indexed by processor index, each processor has
+its own TSS descriptor slot at `GDT_TSS + index * 16`, and its own IST 1 and IST 2
+stacks from the heap.
+Alternatives: one shared TSS and one shared descriptor (what it was); a per-CPU copy
+of the whole GDT.
+Reason: loading a task register sets the descriptor's *busy* bit in the table it
+came from, so the first processor to run `ltr` marks the entry and every later
+processor is refused with #GP and the selector as the error code. This was the
+last thing standing between the hand-off and four live processors, and it looks
+exactly like a corrupt descriptor if read without knowing about the busy bit. The
+IST stacks cannot be shared either: an IST pointer is an absolute address the CPU
+puts on the stack without involving the fault handler, so a shared stack means one
+processor's double fault landing in the middle of another's.
+
+## 2026-10-04 — The descriptor table is reloaded, not just the segments
+Decision: `gdt_reload()` does the `lgdt` as well as the segment and task-register
+reloads, and `gdt_reload_for(index)` additionally loads that processor's TSS.
+Alternatives: leaving `lgdt` out and relying on the boot processor having loaded
+the table, which is all that was needed before phase 4.
+Reason: a processor arriving from the bootloader's hand-off is still using the
+bootloader's descriptor table. Its far return to selector 0x08 finds whatever the
+bootloader's table has at that index, which here is a 32-bit code segment, so the
+processor drops into compatibility mode on the first instruction after the reload
+and faults on the next fetch — with no IDT loaded yet, which turns one bad fetch
+into a triple fault. Reloading the table is the only part that cannot be skipped.
+
+## 2026-10-04 — LTR needs an explicit operand-size prefix, and the TSS offsets are not optional
+Decision: `ltr` is written as `.byte 0x66, 0x0f, 0x00, 0xd8`, and the TSS struct
+declares the reserved word at 0x04 so RSP0 lands at 0x08 and IST 1 at 0x28.
+Alternatives: `ltr %ax`; leaving the TSS four bytes shorter.
+Reason: neither assembler honours an operand-size suffix on LTR, so `ltr %ax`
+assembles to the 32-bit form, which is undefined and raises #GP with the selector
+as the error code. The boot processor never noticed because the compiler folded
+the constant there and emitted the right encoding by hand. The TSS layout was the
+same kind of mistake: the four bytes at 0x04 look spare — that is where a 32-bit
+TSS keeps SS:0 — but the CPU reads the real offsets, so RSP0 was being read as
+zero and the IST entries from eight bytes too low. Neither shows up until
+something takes a ring transition or a double fault.

@@ -50,6 +50,12 @@ uint64_t percpu_gs_base(unsigned index);
  * can call it too and end up with exactly what an application processor has. */
 void percpu_gs_install_self(void);
 
+/* Point GS at slot `index` without reading GS first.  A processor that has just
+ * reloaded its segment registers cannot use `percpu_gs_install_self()`: loading a
+ * segment selector in 64-bit mode zeroes that segment's base, so %gs:0 no longer
+ * names the slot. */
+void percpu_gs_install_index(unsigned index);
+
 /* The index GS currently resolves to, found by reading back %gs:0.  This is the
  * one accessor that cannot use GS to find its own answer. */
 unsigned percpu_self_index(void);
@@ -57,10 +63,19 @@ unsigned percpu_self_index(void);
 /* The index the boot processor registered as 0. */
 unsigned percpu_boot_index(void);
 
+/* The slot whose LAPIC id is `lapic_id`, or MAX_CPU_COUNT if there is none.
+ * This is how a processor that arrives without being told which slot is for it
+ * finds out -- the bootloader's hand-off passes the local APIC id and nothing
+ * else. */
+unsigned percpu_index_for_lapic_id(uint32_t lapic_id);
+
 unsigned percpu_count(void);          /* number of known processors      */
 unsigned percpu_online_count(void);   /* number that have been started   */
 uint32_t percpu_lapic_id(unsigned index);
 uint64_t percpu_interrupts(unsigned index);
+uint64_t percpu_idle_ticks(unsigned index);
+bool     percpu_is_online(unsigned index);
+bool     percpu_is_started(unsigned index);
 void     percpu_count_interrupt(void);
 void     percpu_set_online(unsigned index, bool online);
 

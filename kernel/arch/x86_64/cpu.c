@@ -20,12 +20,16 @@ typedef struct __attribute__((packed)) {
     uint8_t  base_high;
 } gdt_entry_t;
 
-/* Seven descriptors are needed: null, 32-bit kernel code, 32/64-bit kernel
- * data, 32/64-bit user data, 64-bit user code, and the two slots a 64-bit TSS
- * occupies.  Rounded up to eight so the TSS high half is inside the limit. */
-static gdt_entry_t gdt[8];
+/* The table has to hold one TSS descriptor per processor, each 16 bytes, so it is
+ * sized from MAX_CPU_COUNT rather than from the five descriptors the base table
+ * needs.  A single shared TSS descriptor is not enough: loading a task register
+ * marks its descriptor busy, and the second processor to try gets #GP. */
+#define GDT_ENTRIES ((GDT_TSS >> 3) + 2 * MAX_CPU_COUNT)
+
+static gdt_entry_t gdt[GDT_ENTRIES];
 
 static dt_ptr_t gdt_ptr;
+
 
 idt_table_t idt;
 
@@ -176,28 +180,44 @@ static struct {
 
 /* --- TSS ---------------------------------------------------------------- */
 
-tss_t kernel_tss;
+/* One TSS per processor.  Index 0 is the boot processor's; the rest are filled
+ * in as each application processor is handed its entry point, because the IST
+ * stacks have to be somewhere its fault handler can use before it has an address
+ * space of its own. */
+tss_t kernel_tss[MAX_CPU_COUNT];
 
-/* Stacks for the IST entries, allocated once at boot. */
-#define IST_STACK_SIZE 8192
+/* Stacks for the boot processor's IST entries.  Application processors get their
+ * own from the heap at hand-off -- see smp_start_all() -- because these are
+ * static and there is only one of everything here. */
 static uint8_t ist_stack_1[IST_STACK_SIZE] __attribute__((aligned(16)));
 static uint8_t ist_stack_2[IST_STACK_SIZE] __attribute__((aligned(16)));
 
+void tss_init_for(unsigned index, uint64_t ist1, uint64_t ist2) {
+    if (index >= MAX_CPU_COUNT)
+        return;
+
+    tss_t *tss = &kernel_tss[index];
+    memzero(tss, sizeof(*tss));
+    /* iomap_base past the TSS limit means "no I/O permission bitmap". */
+    tss->iomap_base = sizeof(tss_t);
+    if (ist1 != 0)
+        tss->ist[0] = ist1;    /* ist1 */
+    if (ist2 != 0)
+        tss->ist[1] = ist2;    /* ist2 */
+}
+
 void tss_init(void) {
-    memzero(&kernel_tss, sizeof(kernel_tss));
-    /* iomap_base past our GDT limit means "no I/O permission bitmap". */
-    kernel_tss.iomap_base = sizeof(tss_t);
-    kernel_tss.ist[0] = (uint64_t)ist_stack_1 + IST_STACK_SIZE; /* ist1 */
-    kernel_tss.ist[1] = (uint64_t)ist_stack_2 + IST_STACK_SIZE; /* ist2 */
+    tss_init_for(0, (uint64_t)ist_stack_1 + IST_STACK_SIZE,
+                 (uint64_t)ist_stack_2 + IST_STACK_SIZE);
 }
 
 void tss_set_rsp0(uint64_t rsp) {
-    kernel_tss.rsp[0] = rsp;
+    kernel_tss[0].rsp[0] = rsp;
 }
 
 void tss_set_ist(int ist, uint64_t rsp) {
     if (ist >= 1 && ist <= 7)
-        kernel_tss.ist[ist - 1] = rsp;
+        kernel_tss[0].ist[ist - 1] = rsp;
 }
 
 /* The 16-byte form of a 64-bit TSS descriptor.
@@ -220,7 +240,16 @@ typedef struct __attribute__((packed)) {
 
 static tss_desc_t tss_desc;
 
-static void write_tss_descriptor(uint64_t base, uint32_t limit) {
+/* Publish processor `index`'s TSS in the table.
+ *
+ * Every processor gets a slot of its own, and `access` starts out at 0x89 --
+ * available, not busy.  The CPU flips bit 0 of the type field to 1 in the table
+ * itself when it loads the register, so writing 0x89 for a second processor that
+ * wants the same entry would be refused with #GP. */
+void gdt_write_tss_descriptor(unsigned index, uint64_t base, uint32_t limit) {
+    if (index >= MAX_CPU_COUNT)
+        return;
+
     tss_desc.limit_low   = (uint16_t)(limit & 0xffff);
     tss_desc.base_low    = (uint16_t)(base & 0xffff);
     tss_desc.base_mid    = (uint8_t)((base >> 16) & 0xff);
@@ -230,14 +259,23 @@ static void write_tss_descriptor(uint64_t base, uint32_t limit) {
     tss_desc.base_upper  = (uint32_t)(base >> 32);
     tss_desc.reserved    = 0;
 
-    memcpy(&gdt[GDT_TSS >> 3], &tss_desc, sizeof(tss_desc));
+    memcpy(&gdt[gdt_tss_selector(index) >> 3], &tss_desc, sizeof(tss_desc));
 }
 
 /* Load the task register, which points at the TSS descriptor's 16-bit
  * (limit, base) form held in the GDT.  The instruction only accepts a 16-bit
  * register or a memory operand, so the selector goes in through AX. */
 static inline void ltr(uint16_t selector) {
-    __asm__ volatile("ltr %%ax" :: "a"(selector) : "memory");
+    /* LTR takes a 16-bit register operand and nothing else.  Writing it as
+     * `ltr %ax` looks right and is not: neither assembler honours an operand-size
+     * suffix on this instruction, and both emit the 32-bit form, which is
+     * undefined and raises #GP with the selector as the error code.  The prefix
+     * has to be written out.
+     *
+     * 0x0f 0x00 /3 with mod=11 and r/m=EAX; the /3 is the important part of the
+     * last byte, since /2 in the same place is LGDT. */
+    __asm__ volatile(".byte 0x66, 0x0f, 0x00, 0xd8"
+                     :: "a"((uint64_t)selector) : "memory");
 }
 
 void gdt_init(void) {
@@ -269,10 +307,11 @@ void gdt_init(void) {
     boot_trace('|');
     /* The TSS descriptor spills into two GDT slots; both must be written
      * before the reload below refreshes the CPU's cache of the table. */
-    write_tss_descriptor((uint64_t)&kernel_tss, sizeof(kernel_tss) - 1);
+    gdt_write_tss_descriptor(0, (uint64_t)&kernel_tss[0],
+                             sizeof(kernel_tss[0]) - 1);
     gdt_set_kernel_table();
     boot_trace('|');
-    ltr(GDT_TSS);
+    ltr(gdt_tss_selector(0));
     boot_trace(']');
 }
 
@@ -308,11 +347,63 @@ void gdt_set_user_table(void) {
         ::: "rax", "memory");
 }
 
-/* Refresh the TSS descriptors after the descriptor table is reloaded (for
- * example when an AP installs its own copy). */
+/* Refresh the descriptor tables after they have been changed (for example when
+ * the TSS descriptor is rewritten), and reload this processor's view of them.
+ *
+ * The LGDT has to be part of this, not just the segment reload.  A processor that
+ * starts from the bootloader's handoff is still using the *bootloader's*
+ * descriptor table, and a far return to a selector that only exists in ours finds
+ * whatever the bootloader's table has at that index instead -- which on this
+ * machine is a 32-bit code segment, so the processor drops into compatibility mode
+ * on the first instruction after the reload and faults on the next fetch.  The
+ * segments and the task register both come after the table, not instead of it. */
 void gdt_reload(void) {
+    lgdt(&gdt_ptr);
     gdt_set_kernel_table();
-    ltr(GDT_TSS);
+}
+
+/* The table, the segments, and processor `index`'s task register.
+ *
+ * Each processor needs a TSS descriptor of its own: loading a task register marks
+ * the descriptor busy *in the table*, so a second processor that runs `ltr` on the
+ * same entry is refused with #GP and the selector as the error code. */
+void gdt_reload_for(unsigned index) {
+    gdt_reload();
+    ltr(gdt_tss_selector(index));
+}
+
+/* Decode the task state segment descriptor published for processor `index`.
+ *
+ * Returns false if the index is out of range, or if the entry in the table is
+ * not a 64-bit TSS descriptor at all -- which is what the table looks like
+ * before `gdt_write_tss_descriptor()` has run for it, and what it stops looking
+ * like if a processor's descriptor is written at the wrong slot. */
+bool gdt_tss_descriptor_for(unsigned index, uint64_t *base, uint32_t *limit,
+                            uint8_t *type) {
+    if (index >= MAX_CPU_COUNT)
+        return false;
+
+    const tss_desc_t *d = (const tss_desc_t *)&gdt[gdt_tss_selector(index) >> 3];
+    uint8_t access = d->access;
+
+    /* Present, ring 0, and a system segment of type 9 (available 64-bit TSS) or
+     * 11 (busy 64-bit TSS).  11 is what the entry becomes once a processor has
+     * loaded it, which is normal; anything else is not a TSS. */
+    if ((access & 0xf) != 0x9 && (access & 0xf) != 0xb)
+        return false;
+    if ((access & 0xf0) != 0x80)
+        return false;
+
+    if (base != NULL)
+        *base = (uint64_t)d->base_low | ((uint64_t)d->base_mid << 16) |
+                ((uint64_t)d->base_high << 24) |
+                ((uint64_t)d->base_upper << 32);
+    if (limit != NULL)
+        *limit = (uint32_t)d->limit_low | ((uint32_t)d->limit_high << 16);
+    if (type != NULL)
+        *type = access & 0xf;
+
+    return true;
 }
 
 void idt_init(void) {

@@ -25,7 +25,6 @@
 /* The console talks about the PIT-based uptime rather than the TSC, because the
  * PIT is the time base that is known to be right. */
 static inline uint64_t console_uptime_ms(void) { return timer_uptime_ms(); }
-static inline unsigned cpu_online_count(void) { return percpu_online_count(); }
 static inline uint32_t cpu_lapic_id(unsigned i) { return percpu_lapic_id(i); }
 static inline uint64_t cpu_interrupt_count(unsigned i) { return percpu_interrupts(i); }
 
@@ -98,9 +97,21 @@ static void line_submit(void) {
                 (unsigned long)(kmalloc_used_bytes() / 1024),
                 (unsigned long)kmalloc_largest_free());
     } else if (strcmp(line, "cpus") == 0) {
-        for (unsigned i = 0; i < cpu_online_count(); i++)
-            kprintf("cpu %u: online, LAPIC id %u, %llu interrupts\n", i,
-                    cpu_lapic_id(i), (unsigned long long)cpu_interrupt_count(i));
+        /* Over every processor the kernel knows about, not over the first N
+         * where N is how many are up: the two only agree when the ones that came
+         * up happen to be the first ones, and a list that silently drops the
+         * processors that failed is the opposite of useful. */
+        kprintf("%u processor(s) known, %u online; this one is %u\n",
+                percpu_count(), percpu_online_count(), percpu_self_index());
+        for (unsigned i = 0; i < percpu_count(); i++) {
+            kprintf("cpu %u: LAPIC id %u, %s%s, %llu interrupts, %llu idle "
+                    "wakeups\n",
+                    i, cpu_lapic_id(i),
+                    percpu_is_started(i) ? "started" : "not started",
+                    percpu_is_online(i) ? ", online" : "",
+                    (unsigned long long)cpu_interrupt_count(i),
+                    (unsigned long long)percpu_idle_ticks(i));
+        }
     } else if (strcmp(line, "keys") == 0) {
         kprintf("keyboard: present=%d ready=%d, %s, %llu scancodes, "
                 "%llu events, %lu overruns (caps %d, num %d)\n",

@@ -29,6 +29,10 @@ static struct {
     page_table_t tables;
     uint64_t    kernel_pml4_phys;
 
+    /* The bootloader's tables are released only once nothing is running on them,
+     * which is after the application processors have been handed off. */
+    bool        boot_tables_released;
+
     mmio_window_t mmio[MAX_MMIO_WINDOWS];
     unsigned      mmio_count;
 
@@ -53,16 +57,17 @@ uint64_t vmm_translate(uint64_t virt) {
     if (leaf == 0)
         return 0;
 
-    /* A large page's address field is only where the mapping starts, so the
-     * offset inside the page has to be put back.  Without this every address
-     * in the first half of a 2 MiB page translates to the page's own base --
-     * which is not a wrong answer for the first address and a wrong answer for
-     * every other one, and the addresses being asked about are never the first
-     * one. */
+    /* A leaf entry's address field is the start of whatever it maps, so the
+     * offset inside the mapping has to be put back -- and the size of that
+     * mapping is what the offset is measured against: a 4 KiB page has 12 bits of
+     * it, a 2 MiB page has 21.  Without this every address in the first page of a
+     * mapping translates to that page's base, which is right for exactly one
+     * address out of every 4096, and the addresses being asked about are never
+     * that one. */
     if (pte_huge(leaf))
         return pte_phys(leaf) + (virt & (HUGE_2MIB - 1));
 
-    return pte_phys(leaf);
+    return pte_phys(leaf) + (virt & (page_size - 1));
 }
 
 /* --- MMIO requests ------------------------------------------------------ */
@@ -413,7 +418,32 @@ int vmm_init(void) {
      *    data page from ever running code. */
     pt_write_cr4(pt_read_cr4() | CR4_SMEP);
 
+    /* The bootloader's page tables are *not* released here.  The bootloader
+     * starts the application processors itself and parks them on its own page
+     * tables, so those tables stay live — and read — until every processor has
+     * been handed its entry point and switched to the kernel's.  Releasing them
+     * at the CR3 switch would hand the allocator frames three processors are still
+     * walking.  vmm_release_boot_tables() is called after the hand-off. */
+    kprintf("vmm: the bootloader's tables at %#lx stay live until every "
+            "processor has been handed off\n",
+            (unsigned long)boot_old_cr3());
+    return 0;
+}
+
+/* Release the bootloader's memory now that nothing is running on its tables.
+ *
+ * Only safe once every processor the bootloader started is executing on the
+ * kernel's own address space: the frames behind its tables were marked used, so
+ * nothing else can have taken them, but a processor that is still walking them
+ * would be reading frames the allocator now believes are free. */
+int vmm_release_boot_tables(void) {
+    if (!vmm.active)
+        return -1;
+    if (vmm.boot_tables_released)
+        return 0;
+
     pmm_release_boot_tables();
+    vmm.boot_tables_released = true;
     return 0;
 }
 

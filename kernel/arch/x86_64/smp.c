@@ -1,41 +1,52 @@
 /* minx - starting application processors.
  *
- * An application processor cannot be started by writing to anything the kernel
- * already controls: it is held in reset with nothing running, and the only way
- * out is a pair of inter-processor interrupts through the local APIC of the CPU
- * doing the starting.  This is that sequence, plus the per-CPU state each
- * processor needs before it is allowed to run anything.
+ * There are two ways to start an application processor and only one of them is
+ * used here.
  *
- * The order of operations matters at every step and each one is a place where a
- * mistake produces a machine that hangs rather than an error:
+ * The portable way is INIT/SIPI: reset the processor with an INIT interrupt,
+ * release it, then send it a startup interrupt whose eight-bit vector names the
+ * entry point in the first megabyte.  That needs a trampoline of our own, because
+ * a released processor is in real mode with paging off and nothing above 1 MiB is
+ * reachable.  `smp_start_cpu()` and `kernel/arch/x86_64/smp_trampoline.S` are that
+ * path, and it is kept -- it is what a bootloader that does *not* start the
+ * application processors would need -- but it is not the one used, because a
+ * processor that has been released and not yet sent a startup interrupt runs
+ * whatever is at the reset vector, and on this machine that is the bootloader's
+ * code.  It faults with no IDT of its own and takes the machine down, and the
+ * kernel cannot redirect that address from its own page tables because a released
+ * processor never consults them.  `smp_start_cpu()` documents this at the point
+ * the sequence is issued.
  *
- *   1. The trampoline is copied to a page below 1 MiB, because the startup IPI
- *      carries only eight bits and the CPU derives the entry point by
- *      multiplying them by sixteen.
- *   2. That page is identity-mapped in the kernel's own tables, because the
- *      trampoline carries a PDPTE built from the kernel's first four PML4
- *      entries and keeps fetching from itself after CR3 is loaded.
- *   3. INIT is sent, which resets the target processor.
- *   4. Two startup IPIs follow, with a wait in between.  One is the documented
- *      minimum; two is what the SDM recommends and what Limine sends, because a
- *      startup IPI delivered while the target is still leaving reset is lost.
- *   5. The boot processor spins on a flag the trampoline sets, with a bound, so
- *      a processor that never arrives is reported rather than hanging the boot.
+ * The path actually used is the one the bootloader already provides.  Limine
+ * starts every application processor itself -- each one runs Limine's own
+ * trampoline out of the INIT/SIPI sequence -- and then parks it, spinning on one
+ * field: `mp_info->goto_address`.  The kernel's job is to write its entry point
+ * there and the processor jumps to it.  `smp_start_all()` does that.
+ *
+ * That matters for more than convenience.  A processor handed over this way is
+ * running on the *bootloader's* page tables, so it also means the bootloader is
+ * still in use by three processors after the kernel has switched CR3 -- and
+ * `vmm_release_boot_tables()` therefore waits for the hand-off to finish before
+ * it hands the bootloader's memory back to the allocator.
  */
 #include "smp.h"
 
 #include "apic.h"
+#include "boot.h"
 #include "cpu.h"
 #include "delay.h"
 #include "io.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "pagemap.h"
 #include "percpu.h"
 #include "pmm.h"
 #include "string.h"
 #include "types.h"
 #include "vmm.h"
+
+#include <limine.h>
 
 /* Layout of the trampoline's info block, repeated from
  * kernel/arch/x86_64/smp_trampoline.S.  Both files have to agree and there is no
@@ -77,16 +88,40 @@ extern const uint8_t  smp_trampoline_gdt16_base[];
 extern const uint8_t  smp_trampoline_wait[];   /* where the reset vector lands */
 extern const uint64_t smp_trampoline_size;
 
-/* The 32-bit IDT pseudo-descriptor, for the trampoline to load.  Kept here
- * because only cpu.c knows the IDT's address and limit. */
-extern void idt_descriptor(dt_ptr_t *out);
-
 static uint64_t tpl_phys;
-static uint8_t *smp_info_for(unsigned index, uint64_t gs_base,
-                             uint64_t stack_top, uint64_t entry);
-static bool smp_wait_for_boot(unsigned timeout_ms);
 
-/* --- the trampoline page ------------------------------------------------ */
+/* --- the per-processor hand-off state ------------------------------------ */
+
+/* What a parked processor needs before it can join the kernel: the address space
+ * to switch to, the CR4 to adopt, which slot is its own, and where its IST
+ * stacks are.
+ *
+ * The bootloader hands over three fields, and all three are live:
+ *
+ *   mp_info->reserved       the stack the processor switches to
+ *   mp_info->goto_address   the entry point, polled until it becomes non-zero
+ *   mp_info->extra_argument free for the kernel
+ *
+ * Only `extra_argument` is actually free, so it carries this slot's address --
+ * as a *direct map* address, because the processor is still on the bootloader's
+ * page tables and the only thing it has been shown to reach in this kernel is
+ * the direct map.  `reserved` has to be a stack the processor can use before it
+ * has changed anything, which the direct map is. */
+typedef struct {
+    uint64_t pml4;
+    uint64_t cr4;
+    uint64_t index;
+    uint64_t ist1_top;
+    uint64_t ist2_top;
+} smp_ap_slot_t;
+
+static smp_ap_slot_t ap_slot[MAX_CPU_COUNT];
+
+/* The kernel entry point every processor ends up in: in long mode, on a stack the
+ * bootloader already switched it to, with GS not yet pointing anywhere useful. */
+static void smp_cpu_entry(unsigned index);
+
+/* --- the INIT/SIPI path, not used on this bootloader ---------------------- */
 
 static void trampoline_patches(uint64_t base) {
     /* The far jump's selector is this page's number in real mode: CS becomes
@@ -157,9 +192,9 @@ static int trampoline_install(void) {
     return 0;
 }
 
-/* --- the PDPTE the trampoline needs ------------------------------------ */
-
-/* With PAE enabled CR3 names four PDPTE entries, not 512 PML4 entries, so the
+/* The PDPTE the trampoline needs.
+ *
+ * With PAE enabled CR3 names four PDPTE entries, not 512 PML4 entries, so the
  * kernel's PML4 cannot be loaded directly.  Copying its first four entries gives
  * a CR3 that maps the low four gigabytes exactly as the kernel's own tables do,
  * which is what the trampoline needs: it is running from low memory at the
@@ -188,8 +223,6 @@ static uint64_t pdpte_prepare(void) {
 
     return virt_to_phys(page);
 }
-
-/* --- the per-CPU block -------------------------------------------------- */
 
 static uint8_t *smp_info_for(unsigned index, uint64_t gs_base,
                              uint64_t stack_top, uint64_t entry) {
@@ -246,8 +279,17 @@ static bool smp_wait_for_boot(unsigned timeout_ms) {
     return *smp_booted_flag() == 1;
 }
 
-/* --- starting one processor -------------------------------------------- */
-
+/* Start one application processor through INIT/SIPI.
+ *
+ * Not called on this bootloader, which starts the application processors itself
+ * and hands them over through `mp_info->goto_address` -- see smp_start_all() and
+ * the note at the top of this file.  It stays because it is the path a bootloader
+ * that leaves them to the kernel would need, and it is the only implementation
+ * that does not depend on the bootloader's cooperation.
+ *
+ * It is not called automatically on purpose: the INIT sequence it issues is what
+ * `smp_start_all()` would otherwise have to undo, and on this machine it takes the
+ * machine down (see the comment on the sequence below). */
 int smp_start_cpu(uint32_t lapic_id, unsigned index, void (*entry)(void),
                   void *arg) {
     if (!lapic_available())
@@ -277,19 +319,33 @@ int smp_start_cpu(uint32_t lapic_id, unsigned index, void (*entry)(void),
      * The startup IPI carries an eight-bit vector and the CPU turns it into a
      * real-mode entry address, so only the low bits of the trampoline's physical
      * address survive the trip and the page has to be low enough for the whole
-     * of it to fit.  That is what limits the search below to the first megabyte,
-     * and it is also why the search starts at frame 1 rather than frame 0: a
-     * physical address of zero is indistinguishable from "no frame". */
+     * of it to fit. */
     uint8_t vector = (uint8_t)((tpl_phys >> 12) & 0xff);
 
-    /* Two startup IPIs, with a wait in between: one is the documented minimum
-     * and two is what the SDM recommends, because a startup IPI that arrives
-     * while the processor is still on its way out of reset is dropped.
+    /* Reset, release, then wake.
      *
-     * There is no INIT here, and that is a deliberate gap rather than an
-     * oversight -- see smp_start_all(). */
+     * INIT is a level interrupt whose destination field is ignored, so a
+     * *targeted* one resets this processor too and the machine restarts in the
+     * middle of bring-up.  The shorthand 10, "all excluding self", is the one
+     * encoding INIT honours, and that is what goes out.
+     *
+     * The release is a second write with the assert bit clear: while the line is
+     * asserted the processors stay reset and accept no startup IPI.  What a
+     * released processor runs next is the reset vector at 0xfffffff0, where
+     * hardware holds the firmware's wait-for-startup loop and this machine holds
+     * the bootloader's code -- so a processor that gets that far executes
+     * bootloader code, faults with no IDT of its own and takes the machine down.
+     * The kernel cannot redirect that address from its own page tables either: a
+     * released processor is in real mode with paging off and never consults
+     * them.  That is why this path is not the one used. */
+    lapic_ipi_init_all_but_self();
+    lapic_ipi_init_deassert_all_but_self();
+
+    /* Two startup IPIs: one is the documented minimum and two is what the SDM
+     * recommends, because a startup IPI that arrives while the processor is
+     * still on its way out of reset is dropped. */
     lapic_ipi_startup((uint8_t)lapic_id, vector);
-    delay_ms(1);
+    pause_cpu();
     lapic_ipi_startup((uint8_t)lapic_id, vector);
 
     if (!smp_wait_for_boot(2000)) {
@@ -307,37 +363,106 @@ int smp_start_cpu(uint32_t lapic_id, unsigned index, void (*entry)(void),
     return 0;
 }
 
-/* --- the idle loop every processor runs once it is up ------------------- */
+/* --- what every processor runs once it has its own address space ---------- */
 
-static void smp_cpu_entry(void) {
-    unsigned index = percpu_boot_index();
-    percpu_t *self = percpu_self();
+static void smp_cpu_entry(unsigned index) {
+    percpu_t *self = percpu_by_index(index);
 
-    self->online = true;
-    self->started = true;
+    /* The IDT first, before anything that can fault.  This processor has just
+     * changed address space out from under itself and is still running on the
+     * bootloader's descriptors, so the next few instructions are the most likely
+     * place for something to go wrong -- and with no IDT at all, any fault is a
+     * triple fault, which takes the machine down instead of reporting itself. */
+    idt_reload();
+    /* This processor's own TSS, with its own IST stacks and its own descriptor.
+     * A shared descriptor would already be busy: loading a task register sets
+     * that bit in the table, so the boot processor's `ltr` leaves the entry
+     * marked and this one is refused with #GP. */
+    tss_init_for(index, ap_slot[index].ist1_top, ap_slot[index].ist2_top);
+    gdt_write_tss_descriptor(index, (uint64_t)&kernel_tss[index],
+                             sizeof(kernel_tss[0]) - 1);
+    gdt_reload_for(index);
+
+    /* After the segment reload, not before: loading a segment selector in 64-bit
+     * mode zeroes that segment's hidden base, so the `mov` that installs our
+     * data selector also clears whatever GS was pointing at. */
+    percpu_gs_install_index(index);
+
+    if (self != NULL) {
+        self->online = true;
+        self->started = true;
+    }
     percpu_set_online(index, true);
 
-    /* Every CPU loads its own copies of the tables.  LGDT, LIDT and LTR are
-     * per-processor state: the boot processor's copies are not inherited, so
-     * without this the first interrupt on this CPU finds no IDT at all. */
-    gdt_reload();
-    idt_reload();
+    kprintf("cpu: %u online (LAPIC %u)\n", index,
+            self != NULL ? self->lapic_id : 0);
 
-    kprintf("cpu: %u online (LAPIC %u)\n", index, self->lapic_id);
-
-    /* Timers and the 8253 are routed to the boot processor's local APIC, so
-     * this processor's LAPIC timer is armed separately rather than inherited.
-     * Until the scheduler exists there is nothing to reschedule, so the loop is
-     * halt-and-check: it has to exist and be per-CPU so phase 5 can replace it,
-     * and halting keeps a machine with four processors from burning four cores
-     * spinning. */
+    /* Timers and the 8253 are routed to the boot processor's local APIC, so this
+     * processor has to arm its own or nothing on it ever ticks. */
     percpu_arm_local_timer();
     sti();
 
     for (;;) {
-        self->idle_ticks++;
+        if (self != NULL)
+            self->idle_ticks++;
         hlt();
     }
+}
+
+/* --- the hand-off a parked processor takes -------------------------------- */
+
+/* Adopt the kernel's CR4 and CR3, then call smp_cpu_entry().
+ *
+ * This cannot be ordinary C.  Between replacing CR3 and reaching the kernel's
+ * entry there must be no compiler-generated access to memory the new tables do
+ * not map, and nothing may be touched that assumes the descriptors are ours --
+ * the bootloader's table is still loaded.  So the whole sequence is written out,
+ * and the call is made from the assembly for the same reason.
+ *
+ * The stack and the descriptors are not dealt with here: the bootloader has
+ * already switched this processor onto a stack, and that stack lives in the direct
+ * map, which both sets of page tables map.  The entry point installs the IDT, the
+ * table and the task register before it touches anything that needs them.
+ *
+ * GS is deliberately left alone.  Setting it from here would be undone two
+ * instructions later by the `mov` that loads our data selector, because loading a
+ * segment selector in 64-bit mode zeroes that segment's hidden base. */
+__attribute__((noreturn))
+static void smp_ap_switch(uint64_t pml4_phys, uint64_t cr4, unsigned index) {
+    uint64_t entry = (uint64_t)(uintptr_t)smp_cpu_entry;
+    uint32_t idx = (uint32_t)index;
+
+    __asm__ volatile(
+        "movq %[cr4], %%rcx\n\t"
+        "movq %%rcx, %%cr4\n\t"
+        "movq %[pml4], %%rcx\n\t"
+        "movq %%rcx, %%cr3\n\t"
+        "movl %[idx], %%edi\n\t"
+        "movq %[entry], %%r11\n\t"
+        "call *%%r11\n\t"
+        "ud2\n\t"
+        :
+        : [pml4] "r"(pml4_phys), [cr4] "r"(cr4), [idx] "r"(idx),
+          [entry] "r"(entry)
+        : "rax", "rcx", "rdx", "rdi", "r11", "memory");
+
+    /* The assembly never comes back: it jumps straight into the kernel's entry
+     * and that never returns either.  This is here only so the compiler does not
+     * treat the fall-through as reachable. */
+    __builtin_unreachable();
+}
+
+/* Where the bootloader parks an application processor, and where it arrives once
+ * the kernel writes its entry point.
+ *
+ * It is running on the bootloader's page tables with the bootloader's GDT, on a
+ * stack the bootloader chose, so kernel data is reachable only through the direct
+ * map and the descriptors have to be replaced before anything compiled against
+ * them runs. */
+static void smp_ap_entry(struct limine_mp_info *info) {
+    smp_ap_slot_t *slot = (smp_ap_slot_t *)info->extra_argument;
+
+    smp_ap_switch(slot->pml4, slot->cr4, (unsigned)slot->index);
 }
 
 /* --- bringing the machine's processors up ------------------------------- */
@@ -348,48 +473,110 @@ int smp_start_all(void) {
         return -1;
     }
 
-    /* The reset half of the INIT/SIPI sequence is deliberately not sent.
-     *
-     * INIT is a level interrupt, and its destination field is ignored: it resets
-     * every processor including the one that sends it, which is why even the
-     * "all but self" shorthand exists.  A released processor then fetches from
-     * the reset vector at 0xfffffff0.  On hardware that address holds the
-     * firmware's own wait-for-startup loop, which is exactly what the sequence
-     * assumes.  On this machine it holds the *bootloader's* code instead, because
-     * the firmware that would have been there was never loaded in the first
-     * place, so a released application processor executes bootloader code, faults
-     * with no IDT of its own, and takes the machine down before the startup IPI
-     * can be sent.
-     *
-     * The kernel cannot fix that from its own page tables: a released processor
-     * is in real mode with paging off, so the reset vector is a *physical* address
-     * and page tables are not consulted at all.  Pointing it at this kernel's own
-     * wait stub would mean writing to a page of BIOS memory that the firmware
-     * still owns.
-     *
-     * So the startup IPIs go out without the reset.  A processor that was already
-     * parked waiting for a startup IPI comes up; one that is not stays where it
-     * is, and the boot processor says so instead of guessing. */
+    if (percpu_count() <= 1) {
+        kprintf("smp: only one processor; nothing to start\n");
+        return 0;
+    }
+
+    const struct limine_mp_response *mp = boot_mp_response();
+    if (mp == NULL || mp->cpus == NULL) {
+        kwarn("smp: the bootloader reported no per-processor table, so there is "
+              "nothing to hand off to");
+        return -1;
+    }
+
+    page_table_t *tables = vmm_tables();
+    if (tables == NULL || tables->pml4 == 0) {
+        kwarn("smp: no kernel page tables, so a processor cannot be switched "
+              "onto the kernel's address space");
+        return -1;
+    }
+
     unsigned started = 0;
 
     for (unsigned i = 1; i < percpu_count(); i++) {
-        uint32_t lapic_id = percpu_lapic_id(i);
+        struct limine_mp_info *info = NULL;
 
-        if (smp_start_cpu(lapic_id, i, smp_cpu_entry, NULL) == 0)
-            started++;
+        for (uint64_t n = 0; n < mp->cpu_count; n++) {
+            if (mp->cpus[n] != NULL &&
+                mp->cpus[n]->lapic_id == percpu_lapic_id(i)) {
+                info = mp->cpus[n];
+                break;
+            }
+        }
+
+        if (info == NULL) {
+            kprintf("[warn] smp: the bootloader has no slot for LAPIC %u, so "
+                    "processor %u is not started\n", percpu_lapic_id(i), i);
+            continue;
+        }
+
+        /* Its own stack, and its own per-CPU area, before it is told to arrive.
+         * Two processors sharing either would corrupt the other the first time
+         * both took an interrupt.
+         *
+         * The stack is handed over as a *direct map* address: the processor is
+         * switched onto it before it has changed address space, so it has to be
+         * valid on the bootloader's tables as well as ours.  The direct map is
+         * mapped by both. */
+        uint8_t *stack = kmalloc(SMP_STACK_SIZE);
+        if (stack == NULL) {
+            kprintf("[warn] smp: no stack for processor %u\n", i);
+            continue;
+        }
+
+        /* Its own IST stacks as well: the IST pointer in a TSS is an absolute
+         * address the CPU puts on the stack without going through the fault
+         * handler, so a shared stack would mean one processor's double fault
+         * landing in the middle of another's.  These come from the heap, which
+         * hands out direct map addresses -- valid on the bootloader's tables
+         * before the switch and on the kernel's after it. */
+        uint8_t *ist1 = kmalloc(IST_STACK_SIZE);
+        uint8_t *ist2 = kmalloc(IST_STACK_SIZE);
+        if (ist1 == NULL || ist2 == NULL) {
+            kprintf("[warn] smp: no IST stacks for processor %u\n", i);
+            kfree(ist1);
+            kfree(ist2);
+            continue;
+        }
+
+        ap_slot[i].pml4 = tables->pml4;
+        ap_slot[i].cr4 = pt_read_cr4();
+        ap_slot[i].index = i;
+        ap_slot[i].ist1_top = (uint64_t)ist1 + IST_STACK_SIZE;
+        ap_slot[i].ist2_top = (uint64_t)ist2 + IST_STACK_SIZE;
+
+        uint64_t slot_addr = phys_to_virt(
+            vmm_walk_translate((uint64_t)(void *)&ap_slot[i], NULL));
+
+        /* `goto_address` has to be written last and on its own.  The processor
+         * polls that one field and jumps the instant it sees a non-zero address,
+         * so everything its entry point reads has to be visible before it -- and
+         * the compiler is free to reorder stores across a normal assignment. */
+        __asm__ volatile("" ::: "memory");
+        info->reserved = phys_to_virt(virt_to_phys(stack)) + SMP_STACK_SIZE;
+        info->extra_argument = slot_addr;
+        __asm__ volatile("" ::: "memory");
+        info->goto_address = (limine_goto_address)smp_ap_entry;
+
+        started++;
+        kprintf("smp: handed LAPIC %u its entry point (processor %u)\n",
+                percpu_lapic_id(i), i);
     }
 
-    /* Point the boot processor's per-CPU area at itself through GS as well, so
-     * that %gs:0 means the same thing here as it does on every other CPU. */
-    percpu_gs_install_self();
-
-    if (started == 0) {
-        kprintf("[warn] smp: no application processor came up; "
-                "%u online\n", percpu_online_count());
+    if (started == 0)
         return -1;
+
+    /* Wait for them, with a bound: a processor that never arrives has to be
+     * reported rather than waited for. */
+    for (unsigned waited = 0; waited < 2000; waited++) {
+        if (percpu_online_count() >= percpu_count())
+            break;
+        delay_ms(1);
     }
 
     kprintf("smp: %u of %u processor(s) online\n", percpu_online_count(),
             percpu_count());
-    return (int)started;
+
+    return (int)(percpu_online_count() - 1);
 }

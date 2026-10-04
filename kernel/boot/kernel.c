@@ -135,6 +135,12 @@ struct limine_memmap_response *boot_memmap(void) {
     return memmap_request.response;
 }
 
+/* The per-processor table.  The kernel writes each processor's entry point into
+ * it rather than starting the processors itself: the bootloader has already
+ * started them and parked each one on its own slot's goto_address. */
+const struct limine_mp_response *boot_mp_response(void) {
+    return mp_request.response;
+}
 /* CR3 as it was handed over by the bootloader, so the tables behind it can be
  * released once the kernel's own are in place. */
 static uint64_t old_cr3;
@@ -408,6 +414,11 @@ static void smp_init(void) {
     }
 
     int up = smp_start_all();
+
+    /* Only now is nothing running on the bootloader's page tables, so only now
+     * can its frames go back to the allocator. */
+    vmm_release_boot_tables();
+
     if (up < 0)
         kwarn("smp: no application processor came up; the kernel is "
               "single-CPU\n");

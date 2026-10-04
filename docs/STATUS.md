@@ -1,6 +1,6 @@
 # STATUS
 
-Current phase: 4 (SMP) — phases 1 to 3 VERIFIED, phase 4 half done
+Current phase: 4 (SMP) — phases 1 to 3 VERIFIED, all 4 processors online
 
 ## Phases
 | # | Phase | State | Evidence / command |
@@ -8,7 +8,7 @@ Current phase: 4 (SMP) — phases 1 to 3 VERIFIED, phase 4 half done
 | 1 | Toolchain & boot, framebuffer console | VERIFIED | `make test` → 17/17 PASS, framebuffer dump captured; `make run` boots to a graphical console at 1280x800 with 160x50 text cells. Serial log shows the memory map, RSDP, `SMP: 4 CPUs`, initrd and heap. Panic path verified separately (register dump + stack trace on both consoles) while fixing bring-up bugs. |
 | 2 | CPU core, keyboard into console | VERIFIED | `phase2-acpi` (4 processors with distinct LAPIC ids, IOAPIC at 0xfec00000), `phase2-interrupts` (IOAPIC owns all 16 lines, 8259s stay masked, a mask round trip changes the chip's own bit, and both the LAPIC timer and the 8253 really fire over 120 ms with interrupts on), `phase2-keyboard` (8042 self test, scancode set 1, reachable on IRQ 1), `phase2-input` (event ring in and out in order). Typed keys reach the graphical console: `tools/type-test.sh` types `help`, `keys`, `irqs`, `uptime`, `meminfo` and all five answer. |
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
-| 4 | SMP | IN PROGRESS | `phase4-percpu` (this processor's `%gs` resolves to its own slot, every known processor has a distinct slot and LAPIC id) and `phase4-smp` (the online count is possible) both pass. The AP trampoline, per-CPU LAPIC timer arming and per-CPU GDT/IDT/TSS reload are written and in the build. **Blocked: the application processors do not come up** — see below. |
+| 4 | SMP | IN PROGRESS | **All 4 processors come up and stay up.** `phase4-percpu` (this processor's `%gs` resolves to its own slot, every known processor has a distinct slot and LAPIC id), `phase4-tss` (every processor has its own TSS, its own descriptor, a limit that covers the I/O map base and an IST 1 stack) and `phase4-smp` (the online count is possible) all pass. `cpus` on the graphical console reports all four started and online with per-CPU interrupt and idle-wakeup counters moving. Remaining in this phase: IPIs between processors, a scheduler with run queues and spinlocks, and per-CPU idle. |
 | 5 | Scheduler & kernel threads | NOT STARTED | |
 | 6 | Userspace entry | NOT STARTED | |
 | 7 | Processes, signals, pipes | NOT STARTED | |
@@ -18,52 +18,79 @@ Current phase: 4 (SMP) — phases 1 to 3 VERIFIED, phase 4 half done
 | 11 | Hardening / stress | NOT STARTED | |
 | 12 | Polish | NOT STARTED | |
 
-## The blocker on phase 4, in detail
-Everything up to the interrupt sequence is in place and checked: the trampoline
-takes an application processor from real mode to the kernel (throwaway GDT, PAE,
-a PDPTE built from the kernel's first four PML4 entries, EFER.LME, then the
-kernel's own GDT, IDT and TSS, GS, stack and real PML4), it is copied to a page
-below 1 MiB and identity-mapped, and the boot processor sends two startup IPIs and
-waits. The processor never reaches the first instruction of the 32-bit stub — the
-trampoline's progress marker stays at 0.
+## What it took to bring the application processors up
+The blocker, and what actually unblocked it.
 
-Two facts, established by measurement:
+**The approach was wrong, not the machine.** Everything was written to do INIT/SIPI
+by hand: a trampoline taking an application processor from real mode to the kernel,
+copied to a page below 1 MiB, and two startup IPIs. It never worked, and the
+measurements said why:
 
-- **A startup IPI alone does not wake these processors.** Without an INIT they
-  sit where Limine left them and the SIPI is ignored. `apic_reset()` sets
-  `wait_for_sipi = !bsp`, so the flag is right; what is missing is the wakeup.
-- **An INIT wakes them, and it kills the machine.** INIT is a level interrupt and
-  its destination field is ignored, so it resets the sender as well as the
-  targets — hence the "all excluding self" shorthand, which is the one encoding it
-  honours. A released processor then fetches from the reset vector at
-  `0xfffffff0`. On hardware that address holds the firmware's wait-for-startup
-  loop, which is what the sequence assumes. Here it holds the *bootloader's*
-  code, because the firmware that would have been there was never loaded: a
-  released processor executes it, faults with no IDT of its own, and triple-faults.
-  With `-no-reboot` that ends the run, which is why the machine dies a few lines
-  after "AP trampoline" rather than reporting a failed processor.
+- A startup IPI alone does not wake these processors. They sit where the bootloader
+  left them and the SIPI is ignored, because they have already consumed the
+  startup-interrupt handshake.
+- An INIT wakes them, and it kills the machine. INIT is a level interrupt whose
+  destination field is ignored, so it resets the sender as well as the targets —
+  hence the "all excluding self" shorthand, which is the one encoding it honours.
+  A released processor then fetches from the reset vector at `0xfffffff0`, where
+  hardware holds the firmware's wait-for-startup loop and this machine holds the
+  *bootloader's* code. The released processor executes it, faults with no IDT of
+  its own, and triple-faults. With `-no-reboot` that ends the run, which is why the
+  machine died a few lines after "AP trampoline" rather than reporting a failed
+  processor. The kernel cannot redirect that address from its own page tables: a
+  released processor is in real mode with paging off, so the reset vector is a
+  physical address and page tables are not consulted at all.
 
-The kernel cannot redirect that address from its own page tables. A released
-processor is in real mode with paging off, so the reset vector is a *physical*
-address and page tables are not consulted at all — mapping `0xfffff000` in the
-kernel's tables changes nothing. The options, none of which is obviously right:
+**Limine has already started every application processor.** Reading its
+`common/smp.c` settled it: for each application processor but the boot one, the
+bootloader runs its own INIT/SIPI and then parks the processor in a loop spinning
+on one field of its per-processor structure — `mp_info->goto_address` — jumping to
+it the moment it becomes non-zero. The kernel's job is to write that field, not to
+send interrupts at all. `smp_start_all()` now does that, which is why the hand-off
+also explains a second thing: the parked processors are running on the *bootloader's*
+page tables, so the bootloader's memory must not go back to the allocator until the
+hand-off has finished. That is what `vmm_release_boot_tables()` is for, and it is
+now called after the hand-off rather than at the CR3 switch.
 
-1. Write a wait-for-SIPI loop into the physical page at `0xfffffff0`. It works,
-   and on hardware it replaces a BIOS loop with an equivalent one, but it means
-   writing to memory the firmware still owns and that is not in the memory map as
-   usable.
-2. Find out what QEMU's `CPU_INTERRUPT_INIT` does with the instruction pointer.
-   If it resumes at the reset vector *without* first disabling interrupts, then a
-   processor that faults there could be caught by an IDT the boot processor
-   pre-installs on it — which is not possible through the boot processor's own
-   window, but is possible if the kernel maps every APIC window and programs each
-   AP's LVTs and IDT from the boot processor before releasing it.
-3. Accept Limine's own AP handoff if it exposes one, instead of doing INIT/SIPI
-   by hand.
+The INIT/SIPI path is kept (`smp_start_cpu()` and `smp_trampoline.S`) because it
+is the only implementation that does not need the bootloader's cooperation. It is
+not called automatically, and the comment at the sequence says why.
 
-Option 2 is the one to try next: it is the only one that does not touch memory
-this kernel does not own, and the "release, then program, then SIPI" order it
-implies is also what makes the INIT sequence safe on hardware.
+Four faults had to be found and fixed to make the hand-off work, all of them
+silent:
+
+1. **`vmm_walk_translate()` returned a page frame instead of an address.** A leaf
+   entry's address field is the start of whatever it maps, so the offset inside the
+   mapping was being dropped — and the offset had already been masked off at the top
+   of the walk, which is why adding it back did not help at first. Every address in
+   a page translated to that page's base: right for one address in 4096. The
+   `phase3-direct-map` probe only used page-aligned addresses, so it could never
+   see it; it now probes unaligned ones too.
+2. **`mp_info->reserved` is the stack, not scratch.** The bootloader's trampoline
+   switches the processor onto it before returning, so writing the kernel's own use
+   of that word into it sent the processor onto a stack the kernel has no idea
+   about. `extra_argument` is the only genuinely free field.
+3. **`gdt_reload()` never loaded the table.** It reloaded the segments and the task
+   register but not the `lgdt`, so a processor arriving from the bootloader's
+   hand-off used the *bootloader's* descriptors. Its far return to selector 0x08
+   found a 32-bit code segment, the processor dropped into compatibility mode, and
+   the next fetch faulted.
+4. **One TSS descriptor cannot be shared.** Loading a task register sets the
+   descriptor's busy bit *in the table*, so the boot processor's `ltr` left the
+   entry marked and every other processor's `ltr` was refused with #GP and the
+   selector as the error code. Each processor now has its own TSS, its own
+   descriptor slot, and its own IST stacks. The `phase4-tss` self-test checks that.
+
+Two more faults turned up on the way, both independent of SMP:
+
+- **`ltr` with a 32-bit operand.** Written as `ltr %ax` it assembles to the 32-bit
+  form, which is undefined and raises #GP; the operand-size prefix has to be written
+  out. The boot processor got away with it because the compiler folded the constant
+  there.
+- **The TSS field offsets were all four bytes low.** RSP0 was at 0x04, where a
+  32-bit TSS keeps SS:0, and IST 1 at 0x24 rather than 0x28. The CPU reads the real
+  offsets, so a ring transition would have loaded RSP0 as zero and a fault would
+  have found no IST stack — neither of which anything in phases 1 to 3 exercised.
 
 ## What was blocking phases 2 and 3, and what fixed it
 Every one of these was silent: no warning, no fault, and in three cases the code
@@ -169,17 +196,22 @@ looked like it was working.
 - **Allocator**: first-fit free list with coalescing over regions handed to it
   explicitly. A 4 MiB static arena is attached at boot and 64 MiB more comes
   from the physical allocator once the direct map is live.
-- **SMP**: per-CPU state reached through `%gs`, an application-processor
-  trampoline in `kernel/arch/x86_64/smp_trampoline.S`, per-CPU LAPIC timer
-  arming, and per-CPU GDT/IDT/TSS reload. The processors do not come up yet; see
-  the phase-4 blocker.
-- **Self tests**: nineteen in-kernel checks (`minx.test=1`) plus a
+- **SMP**: all four processors online. Per-CPU state reached through `%gs`; the
+  bootloader's own per-processor hand-off (`mp_info->goto_address`) used to start
+  the application processors, each given its own stack, IST stacks, TSS and GDT
+  descriptor; per-CPU LAPIC timer arming and per-CPU GDT/IDT/TSS reload. The
+  INIT/SIPI path is kept but not used — see above.
+- **Self tests**: twenty in-kernel checks (`minx.test=1`) plus a
   host-compiled allocator fuzz test (`make test-host`).
 
 ## Known bugs / gaps
-- Only the boot CPU is running. The application processors do not start; see the
-  phase-4 blocker above. `smp_start_all()` reports each one and stays
-  single-CPU rather than taking the machine down to find out.
+- `kprintf` has no lock, so several processors announcing themselves at once
+  interleave their output on the framebuffer and the serial mirror ("smp: 2x" etc).
+  Spinlocks are phase 5; until then the interleaving is cosmetic and the `cpus`
+  command reports the real per-CPU state.
+- Nothing schedules. Every processor except the boot one runs an idle loop of
+  `hlt`, and all device interrupts are routed to LAPIC 0, so the boot processor
+  does all the work. Phase 5.
 - The framebuffer resolution is whatever Limine picks (1280x800 under QEMU
   here); the `resolution:` option in `boot/limine.conf` is not honoured by the
   BIOS path, so the console adapts to whatever arrives.
@@ -192,9 +224,6 @@ looked like it was working.
 - `PTE_CACHE_*` still encodes the PAT field in bits 6:7 rather than the PAT MSR
   or the PWT/PCD/PS combination the SDM describes, so "uncacheable" for MMIO is
   currently write-combining. Nothing depends on the distinction yet.
-- Only the boot processor's local APIC window is mapped, so the kernel cannot read
-  another processor's APIC to wait for it to reset. Phase 4 will need one page per
-  processor, at the addresses ACPI's MADT implies.
 - The serial mirror emits raw ANSI escape bytes for colours and cursor moves.
   That is honest (a dumb serial terminal renders them as characters) but it puts
   control bytes at the start of some self-test result lines, so the harness

@@ -38,10 +38,22 @@ uint64_t percpu_gs_base(unsigned index) {
     return index < MAX_CPU_COUNT ? (uint64_t)&slots[index] : 0;
 }
 
-void percpu_gs_install_self(void) {
-    percpu_slot_t *slot = &slots[percpu_self_index()];
+/* Point GS at slot `index`.
+ *
+ * This takes the index rather than finding it, because the other way round is not
+ * possible at the point an application processor needs it: it has just reloaded
+ * its segment registers, and loading a segment selector in 64-bit mode zeroes
+ * that segment's hidden base -- including GS's -- so %gs:0 no longer resolves to
+ * the slot the accessor is supposed to read.  A caller that knows its index
+ * installs it without consulting a register that has just been invalidated. */
+void percpu_gs_install_index(unsigned index) {
+    percpu_slot_t *slot = &slots[index];
     wrmsr(MSR_GS_BASE, (uint64_t)slot);
     slot->state.gs_installed = 1;
+}
+
+void percpu_gs_install_self(void) {
+    percpu_gs_install_index(percpu_self_index());
 }
 
 unsigned percpu_self_index(void) {
@@ -95,6 +107,25 @@ percpu_t *percpu_by_index(unsigned index) {
 
 unsigned percpu_boot_index(void) {
     return boot_index;
+}
+
+uint64_t percpu_idle_ticks(unsigned index) {
+    return (index < registered) ? slots[index].state.idle_ticks : 0;
+}
+
+bool percpu_is_online(unsigned index) {
+    return index < registered && slots[index].state.online;
+}
+
+bool percpu_is_started(unsigned index) {
+    return index < registered && slots[index].state.started;
+}
+
+unsigned percpu_index_for_lapic_id(uint32_t lapic_id) {
+    for (unsigned i = 0; i < registered; i++)
+        if (slots[i].state.lapic_id == lapic_id)
+            return i;
+    return MAX_CPU_COUNT;
 }
 
 unsigned percpu_count(void) {

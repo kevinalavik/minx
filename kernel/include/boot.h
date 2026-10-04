@@ -63,6 +63,13 @@ void kmain(void);
 /* The bootloader's memory map, for the physical memory manager. */
 struct limine_memmap_response *boot_memmap(void);
 
+/* The bootloader's per-processor table.
+ *
+ * A parked application processor polls its own slot's goto_address and jumps to
+ * it, so the kernel hands off by writing that field rather than by sending
+ * interrupts -- see kernel/arch/x86_64/smp.c. */
+const struct limine_mp_response *boot_mp_response(void);
+
 /* CR3 as the bootloader left it, so its page tables can be released once the
  * kernel switches to its own. */
 uint64_t boot_old_cr3(void);
