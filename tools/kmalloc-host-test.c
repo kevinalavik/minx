@@ -3,6 +3,7 @@
  * kernel image.
  */
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,14 @@ void console_puts(const char *s) {
 
 #define ARENA (4u * 1024u * 1024u)
 static unsigned char arena[ARENA] __attribute__((aligned(4096)));
+
+/* The kernel's heap can be grown out of the physical allocator, and
+ * kmalloc.c calls into it whether or not anything asks it to.  The host has no
+ * physical memory manager, so these two are the whole of the interface the
+ * allocator needs from one -- and they say so, rather than quietly handing out
+ * memory the fuzz cannot account for. */
+int pmm_ready(void) { return 0; }
+uint8_t *pmm_alloc_pages(size_t frames) { (void)frames; return NULL; }
 
 /* Layout of the kernel's block header, mirrored here so the fuzz can inspect
  * the block behind a corrupted allocation.  Must match kernel/mm/kmalloc.c. */

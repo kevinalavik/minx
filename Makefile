@@ -401,7 +401,11 @@ test-host: $(BUILD)/kmalloc-host-test
 $(BUILD)/kmalloc-host-test: tools/kmalloc-host-test.c $(KERNEL_DIR)/mm/kmalloc.c \
                             $(KERNEL_DIR)/lib/string.c $(KERNEL_DIR)/lib/kprintf.c
 	@mkdir -p $(dir $@)
-	$(CC) -std=gnu11 -O1 -g -I$(KERNEL_DIR)/include $^ -o $@
+	# The kernel declares strlcpy/strlcat, which glibc also declares with a
+	# different return type.  The kernel's versions are what the test wants,
+	# so the clash is silenced rather than papered over in the header.
+	$(CC) -std=gnu11 -O1 -g -Wno-incompatible-library-redeclaration \
+	      -I$(KERNEL_DIR)/include $^ -o $@
 
 # ----------------------------------------------------------------- clean ---
 
