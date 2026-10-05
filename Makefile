@@ -146,6 +146,12 @@ USER_CFLAGS := -std=gnu11 -ffreestanding -nostdlib -nostdinc \
 USER_LDFLAGS := -static -nostdlib -no-pie -z noexecstack --build-id=none \
             -L$(BUILD)/lib -lc
 
+# Where a user program is linked, and therefore where it is loaded.  4 MiB: inside the
+# 32-bit part of the space, well above anything the loader puts below it (the program
+# headers) and well below the stack (the top of user space), so a program's segments,
+# its headers and its stack can never overlap however large brk() grows its heap.
+USER_TEXT_BASE := 0x400000
+
 ########################################################################
 # Sources
 ########################################################################
@@ -155,6 +161,12 @@ KERNEL_S := $(shell find $(KERNEL_DIR) -name '*.S' 2>/dev/null | sort)
 
 KERNEL_OBJ := $(KERNEL_C:%.c=$(BUILD)/k/%.o) $(KERNEL_S:%.S=$(BUILD)/k/%.o) \
              $(FONT_OBJ)
+
+# The kernel image embeds the ring-3 test program, because there is no filesystem to
+# read it from until phase 8.  Listed as a prerequisite of the one object that uses it so
+# that -j does not compile the test before the header exists.
+HELLO_IMAGE_H := $(GEN_INC)/hello_image.h
+$(BUILD)/k/kernel/test/selftest.o: $(HELLO_IMAGE_H)
 
 LIBC_C   := $(shell find $(LIBC_DIR)/src -name '*.c' 2>/dev/null | sort)
 LIBC_ASM := $(shell find $(LIBC_DIR)/src -name '*.S' 2>/dev/null | sort)
@@ -275,6 +287,35 @@ $(LIBC): $(LIBC_OBJ)
 
 userspace: $(LIBC) $(ALL_BIN)
 
+# --- ring-3 programs -----------------------------------------------------
+#
+# One directory under user/ is one program: every .c and .S in it, linked together
+# into a single static ELF64 at a fixed address.  No libc, no interpreter, no
+# relocations, because the loader does none of those things -- a loader that has to
+# resolve something is a loader that can resolve the wrong thing.
+#
+# -Ttext matters as much as anything here.  A user program is linked where it will run,
+# and the loader maps every segment exactly where the file says rather than relocating
+# it, so the link address *is* the load address.  ET_EXEC rather than ET_DYN follows
+# from that, and the loader rejects ET_DYN with a message instead of guessing.
+# -Wno-unused-function because the entry point is assembly: minx_exit() is called from
+# _start and from C, and clang's unused-function analysis only sees the C use, so it
+# reports a function that is very much used.  --fatal-warnings because a program that
+# links with a warning has a problem the loader will not find for it.
+USER_PROGRAM_CFLAGS := -Wno-unused-function
+USER_PROGRAM_LDFLAGS := -static -nostdlib -z noexecstack \
+            -Wl,--build-id=none -Wl,-Ttext=$(USER_TEXT_BASE) -Wl,--fatal-warnings
+
+HELLO_SRC := $(wildcard user/hello/*.c) $(wildcard user/hello/*.S)
+
+$(BUILD)/bin/hello: $(HELLO_SRC) user/hello/hello.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS) -Iuser/hello $(HELLO_SRC) \
+	    $(USER_PROGRAM_LDFLAGS) -o $@
+	@readelf -h $@ | grep -q 'Type:.*EXEC' || \
+	    { echo "$@ is not an ET_EXEC ELF; the loader only loads those" >&2; \
+	      exit 1; }
+
 $(BUILD)/bin/%: $(USER_DIR)/%
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_LDFLAGS) $(USER_CFLAGS) $< -o $@
@@ -306,6 +347,17 @@ $(INITRD_ROOT)/.stamp: $(ALL_BIN) $(INITRD_SRC)/tree.stamp
 
 $(INITRD_SRC)/tree.stamp:
 	@touch $@
+
+# The ring-3 test program, embedded in the kernel image.
+#
+# There is no filesystem until phase 8, so the loader's first program cannot be read
+# from one: its image goes into the kernel as an array.  Phase 8 replaces this with a
+# real read of the initrd, and the loader does not change -- only where the bytes come
+# from.
+$(GEN_INC)/hello_image.h: $(BUILD)/bin/hello tools/bin2c.py
+	@mkdir -p $(GEN_INC)
+	$(PYTHON) tools/bin2c.py $< $@ hello_image \
+	    "build/bin/hello, the ring-3 self-test program"
 
 $(INITRD): $(INITRD_ROOT)/.stamp
 	@mkdir -p $(dir $@)

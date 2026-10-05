@@ -33,6 +33,10 @@
 #include "smp.h"
 #include "string.h"
 #include "timer.h"
+#include "hello_image.h"
+#include "elf.h"
+#include "syscall.h"
+#include "vmm.h"
 #include "types.h"
 #include "vmm.h"
 
@@ -1565,6 +1569,335 @@ static bool wait_until(volatile uint64_t *counter, uint64_t target,
     return *counter >= target;
 }
 
+/* --- user space --------------------------------------------------------- */
+
+/* The first program to run in ring 3.
+ *
+ * What is being checked is not that it printed something -- if it printed something,
+ * the syscall path, the console and the loader all worked.  What is being checked is
+ * that everything it *didn't* manage to do stayed that way: it asks for a descriptor
+ * that does not exist, for a pointer that is not mapped, and for a pointer into the
+ * kernel, and each of those has to come back as an error rather than as a success or a
+ * fault.  A boundary that has only been tested with good input has not been tested.
+ *
+ * The program's own checks are inside it -- it returns non-zero if any of them surprise
+ * it -- so the test below only has to confirm that it ran, that it exited, and with
+ * what.  Duplicating the argument checks here would only test this kernel's idea of
+ * what the program does. */
+static void test_user_program(void) {
+    syscall_last_errno_reset();
+
+    task_t *t = program_load_and_run("hello", hello_image,
+                                     (size_t)hello_image_len, 8);
+
+    if (t == NULL) {
+        test_fail("phase6-user", "the program would not load");
+        return;
+    }
+
+    /* The task exits, and nothing wakes anybody when it does, so wait for the exit
+     * itself rather than for a state change.  A program that hangs is a failure the
+     * harness would otherwise report as "the guest never reached TEST-READY". */
+    for (unsigned waited = 0; waited < 20000; waited++) {
+        if (syscall_last_exit() >= 0)
+            break;
+        task_sleep_ms(1);
+    }
+
+    if (syscall_last_exit() < 0) {
+        test_fail("phase6-user", "the program never exited: it either hung or was "
+                  "still waiting to be scheduled after 20 s");
+        return;
+    }
+
+    if (syscall_last_exit() != 0) {
+        test_fail("phase6-user", "the program exited %d, which is its own report "
+                  "that one of its checks failed", syscall_last_exit());
+        return;
+    }
+
+    if (syscall_exit_pid() != t->id) {
+        test_fail("phase6-user", "the exit was recorded against task %lu, but the "
+                  "program is task %lu", (unsigned long)syscall_exit_pid(),
+                  (unsigned long)t->id);
+        return;
+    }
+
+    /* It really ran, rather than the exit having come from somewhere else. */
+    if (t->switch_count < 1 || !t->started) {
+        test_fail("phase6-user", "the program was never actually scheduled "
+                  "(%lu switches, started %d)", (unsigned long)t->switch_count,
+                  t->started ? 1 : 0);
+        return;
+    }
+
+    if (t->state != TASK_DEAD) {
+        test_fail("phase6-user", "the program is still in state %d after its exit "
+                  "returned", t->state);
+        return;
+    }
+
+    kprintf("user: hello ran in ring 3, exited %d, task %lu, %lu switches\n",
+            syscall_last_exit(), (unsigned long)t->id,
+            (unsigned long)t->switch_count);
+
+    test_pass("phase6-user");
+}
+
+/* Ring 3 cannot read the kernel, and the check for that is a page-table walk rather
+ * than a fault: `syscall_user_range_ok()` is the only thing standing between a
+ * program's pointer and the kernel's memory, so it is worth testing on its own rather
+ * than only through a program that happens to exercise it. */
+static void test_user_pointers(void) {
+    page_table_t tables;
+
+    if (vmm_address_space_create(&tables) != 0) {
+        test_fail("phase6-pointers", "could not create an address space");
+        return;
+    }
+
+    /* The kernel image, the direct map, and the top of user space: all three are
+     * addresses that exist and none of which is readable from ring 3. */
+    static const uint64_t forbidden[] = {
+        0xffffffff80000000ull,      /* the kernel image        */
+        0xffff800000100000ull,      /* the direct map          */
+        USER_SPACE_END,              /* just past the top        */
+        ~0ull,                       /* the highest address      */
+    };
+
+    for (unsigned i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); i++) {
+        if (syscall_user_range_ok(forbidden[i], 16, false)) {
+            test_fail("phase6-pointers", "the kernel would accept %#lx as a "
+                      "readable user address", (unsigned long)forbidden[i]);
+            vmm_address_space_destroy(&tables);
+            return;
+        }
+    }
+
+    /* A range that wraps past the top of the address space is not a range. */
+    if (syscall_user_range_ok(USER_SPACE_END - 8, 64, false)) {
+        test_fail("phase6-pointers", "a range that wraps past the top of user space "
+                  "was accepted");
+        vmm_address_space_destroy(&tables);
+        return;
+    }
+
+    /* An empty range at a legal address is legal, and refusing it would break every
+     * program that asks to write nothing. */
+    if (!syscall_user_range_ok(0x1000, 0, false)) {
+        test_fail("phase6-pointers", "an empty range was refused");
+        vmm_address_space_destroy(&tables);
+        return;
+    }
+
+    vmm_address_space_destroy(&tables);
+    test_pass("phase6-pointers");
+}
+
+/* The loader's refusals.
+ *
+ * Each of these is a file that would map something the kernel should not, so the only
+ * evidence the check works is that it is refused *and says why*.  A loader that
+ * accepted a class-32 ELF would still load every program in this tree, and would only
+ * be found out the first time somebody handed it a file from somewhere else. */
+static void test_elf_rejects(void) {
+    static uint8_t fake[128];
+    page_table_t tables;
+    task_t *t;
+
+    /* Too short to be a header at all. */
+    if (vmm_address_space_create(&tables) != 0) {
+        test_fail("phase6-elf", "could not create an address space");
+        return;
+    }
+
+    t = task_create("elfrej", NULL, NULL, TASK_WEIGHT_DEFAULT);
+    if (t == NULL) {
+        test_fail("phase6-elf", "could not create a task");
+        vmm_address_space_destroy(&tables);
+        return;
+    }
+    t->tables = &tables;
+
+    elf_load_result_t r = elf_load(fake, 8, t, 4, USER_IMAGE_BASE + 64);
+    if (r.ok) {
+        test_fail("phase6-elf", "an 8-byte file was loaded as a program");
+        return;
+    }
+
+    /* A well-formed header for the wrong machine. */
+    Elf64_Ehdr *eh = (Elf64_Ehdr *)fake;
+    memset(fake, 0, sizeof(fake));
+    eh->e_ident[EI_MAG0] = ELFMAG0;
+    eh->e_ident[EI_MAG1] = ELFMAG1;
+    eh->e_ident[EI_MAG2] = ELFMAG2;
+    eh->e_ident[EI_MAG3] = ELFMAG3;
+    eh->e_ident[EI_CLASS] = ELFCLASS64;
+    eh->e_ident[EI_DATA] = ELFDATA2LSB;
+    eh->e_type = ET_EXEC;
+    eh->e_machine = 0x1234;            /* not x86-64 */
+    eh->e_phentsize = ELF64_PHDR_SIZE;
+    eh->e_phnum = 1;
+    eh->e_phoff = sizeof(Elf64_Ehdr);
+
+    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64);
+    if (r.ok) {
+        test_fail("phase6-elf", "an ELF for machine 0x1234 was loaded");
+        return;
+    }
+
+    /* The right machine, the wrong class. */
+    eh->e_machine = EM_X86_64;
+    eh->e_ident[EI_CLASS] = ELFCLASS32;
+
+    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64);
+    if (r.ok) {
+        test_fail("phase6-elf", "a 32-bit ELF was loaded");
+        return;
+    }
+
+    /* Right class and machine, but no loadable segments: an ET_EXEC with nothing in it
+     * has no entry point worth jumping to. */
+    eh->e_ident[EI_CLASS] = ELFCLASS64;
+    ((Elf64_Phdr *)(fake + eh->e_phoff))->p_type = PT_NULL;
+
+    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64);
+    if (r.ok) {
+        test_fail("phase6-elf", "an ELF with no loadable segments was loaded");
+        return;
+    }
+
+    vmm_address_space_destroy(&tables);
+    test_pass("phase6-elf");
+}
+
+/* --- address spaces ----------------------------------------------------- */
+
+/* Two tasks, two address spaces, one shared kernel.
+ *
+ * The check is that a page mapped by one is *not* reachable from the other, which is
+ * the entire reason an address space exists.  A kernel that shares its top-level
+ * entries the wrong way round, or that maps into whatever tables happen to be in CR3
+ * rather than the task's own, passes any test that only checks that mapping works.
+ *
+ * Both tasks write their own page, then both read the other's address.  The read has
+ * to fault, and a fault is reported by making the *other* task's page readable and
+ * seeing whether it reads back its own value.  Doing it that way rather than by
+ * catching the fault keeps the test to the same shape as the rest of the suite:
+ * counters, no expected faults. */
+static volatile uint64_t aspace_own_value[2];
+static volatile uint64_t aspace_seen_value[2];
+static volatile uint64_t aspace_done;
+static volatile uint64_t aspace_failed;
+static volatile uint64_t aspace_kernel_ok[2];
+static page_table_t aspace_tables[2];
+static task_t *aspace_tasks[2];
+
+static void aspace_worker(void *arg) {
+    unsigned which = (unsigned)(uintptr_t)arg;
+    uint64_t slot = (uint64_t)(which + 1) * 0x100000;
+    uint64_t mine = 0x1111000000000000ull + which;
+
+    if (vmm_map_user(slot, vmm_user_page_alloc(), page_size, true) != 0) {
+        __atomic_store_n(&aspace_failed, 1, __ATOMIC_RELEASE);
+        return;
+    }
+
+    *(volatile uint64_t *)slot = mine;
+    aspace_own_value[which] = *(volatile uint64_t *)slot;
+
+    /* Now the other task's slot.  Its address is derived from the page it mapped, and
+     * is not mapped here, so the read must not produce the other task's value -- and
+     * must not fault the machine either, because this address is well below anything
+     * the kernel has mapped and the fault handler reports rather than kills for a
+     * supervisor read of an unmapped user address... which it does kill for.  So the
+     * read is done through a translation instead: what matters is whether the two
+     * address spaces have the same page behind the same virtual address. */
+    uint64_t other_slot = (uint64_t)(1 - which + 1) * 0x100000;
+    uint64_t translated = vmm_translate(other_slot);
+
+    aspace_seen_value[which] = (translated != 0) ? *(volatile uint64_t *)other_slot : 0;
+
+    /* The kernel half has to be reachable from *this* address space, or the task could
+     * never make a syscall.  Translatable is the right question here, not readable:
+     * reading it would be a supervisor read of a kernel address, which is a fault the
+     * handler treats as a bug in whoever did it. */
+    aspace_kernel_ok[which] = vmm_translate(0xffffffff80001000ull) != 0;
+
+    __atomic_add_fetch(&aspace_done, 1, __ATOMIC_ACQ_REL);
+}
+
+static void test_address_spaces(void) {
+    for (unsigned i = 0; i < 2; i++) {
+        aspace_own_value[i] = 0;
+        aspace_seen_value[i] = 0;
+    }
+    aspace_done = 0;
+    aspace_failed = 0;
+
+    for (unsigned i = 0; i < 2; i++) {
+        if (vmm_address_space_create(&aspace_tables[i]) != 0) {
+            test_fail("phase6-aspace", "could not create address space %u", i);
+            return;
+        }
+
+        aspace_tasks[i] = task_create("aspace", aspace_worker,
+                                      (void *)(uintptr_t)i, TASK_WEIGHT_MAX);
+        if (aspace_tasks[i] == NULL) {
+            test_fail("phase6-aspace", "could not create task %u", i);
+            return;
+        }
+        aspace_tasks[i]->tables = &aspace_tables[i];
+        aspace_tasks[i]->is_user = true;
+    }
+
+    task_wakeup(aspace_tasks[0]);
+    task_wakeup(aspace_tasks[1]);
+
+    if (!wait_until((volatile uint64_t *)&aspace_done, 2, 20000)) {
+        test_fail("phase6-aspace", "only %lu of the two tasks finished", 
+                  (unsigned long)aspace_done);
+        return;
+    }
+    if (aspace_failed) {
+        test_fail("phase6-aspace", "a task could not map its own page");
+        return;
+    }
+
+    /* Each task read back what it wrote... */
+    for (unsigned i = 0; i < 2; i++) {
+        if (aspace_own_value[i] != 0x1111000000000000ull + i) {
+            test_fail("phase6-aspace", "task %u read back %#lx from its own page, "
+                      "expected %#lx", i, (unsigned long)aspace_own_value[i],
+                      (unsigned long)(0x1111000000000000ull + i));
+            return;
+        }
+    }
+
+    /* ...and neither saw the other's, which is the part that distinguishes two address
+     * spaces from one address space with two names. */
+    for (unsigned i = 0; i < 2; i++) {
+        if (aspace_seen_value[i] != 0) {
+            test_fail("phase6-aspace", "task %u could reach the page task %u mapped, "
+                      "so the two tasks share an address space", i, 1 - i);
+            return;
+        }
+    }
+
+    /* And the kernel half is shared: each task still reaches the kernel image from its
+     * own address space, which is what makes a process able to make a syscall at all. */
+    for (unsigned i = 0; i < 2; i++) {
+        if (!aspace_kernel_ok[i]) {
+            test_fail("phase6-aspace", "task %u's address space cannot reach the "
+                      "kernel image, so it could never make a syscall", i);
+            return;
+        }
+    }
+
+    kprintf("aspace: 2 tasks, separate pages, kernel shared\n");
+    test_pass("phase6-aspace");
+}
+
 typedef struct {
     volatile uint64_t count;
     volatile uint64_t slices;     /* observed time slices taken */
@@ -2063,6 +2396,10 @@ void test_run_all(void) {
     test_ipi();
     test_smp_tss();
     test_smp_online();
+    test_user_pointers();
+    test_elf_rejects();
+    test_address_spaces();
+    test_user_program();
     test_sched_queues();
     test_sched_parallel();
     test_sched_preempt();
