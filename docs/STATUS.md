@@ -1,6 +1,7 @@
 # STATUS
 
-Current phase: 5 (scheduler) — phases 1 to 4 VERIFIED. The scheduler is built and
+Current phase: 6 (userspace entry) — phases 1 to 4 VERIFIED, phase 5 implemented but
+intermittent, phase 6 built and three of four tests passing. The scheduler is built and
 its six tests pass, but `make test` is only about 80% clean at `-smp 4` (11 of 14
 runs), so phase 5 is **not** VERIFIED and must not be marked so until it is. The
 fault has been reduced from "an unexplained hang" to two named ones; "Known bugs /
@@ -14,7 +15,7 @@ there, not at the top.
 | 2 | CPU core, keyboard into console | VERIFIED | `phase2-acpi` (4 processors with distinct LAPIC ids, IOAPIC at 0xfec00000), `phase2-interrupts` (IOAPIC owns all 16 lines, 8259s stay masked, a mask round trip changes the chip's own bit, and both the LAPIC timer and the 8253 really fire over 120 ms with interrupts on), `phase2-keyboard` (8042 self test, scancode set 1, reachable on IRQ 1), `phase2-input` (event ring in and out in order). Typed keys reach the graphical console: `tools/type-test.sh` types `help`, `keys`, `irqs`, `uptime`, `meminfo` and all five answer. |
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
 | 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | IN PROGRESS | **Implemented; passes, but intermittently. Latest measurement over fourteen `-smp 4` runs of the test ISO: eleven 34/34, three failures** (58% before the fixes below, 79% after). `make test` needs 34/34, so the phase is not VERIFIED. The fault is localised to a corrupted per-processor `current` pointer — see "Known bugs / gaps".  `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). A good `-smp 4` run reads `sched: cpu 0: 41439 ticks, 11149 switches, 5558 steals` and `sched: 6 tasks ran on 4 processor(s)`. **NOT VERIFIED: it is intermittent.** Roughly one run in three at `-smp 4` dies instead — see "Known bugs / gaps". |
-| 6 | Userspace entry | NOT STARTED | |
+| 6 | Userspace entry | IN PROGRESS | **Built; three of the four new tests pass.** `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. Passing: `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel). **`phase6-user` has not been observed passing** — see below. |
 | 7 | Processes, signals, pipes | NOT STARTED | |
 | 8 | VFS + ramfs + initrd + devfs | NOT STARTED | |
 | 9 | TTY + libc + sh | NOT STARTED | |
@@ -230,6 +231,22 @@ looked like it was working.
   interleave their output on the framebuffer and the serial mirror ("smp: 2x" etc).
   Spinlocks are phase 5; until then the interleaving is cosmetic and the `cpus`
   command reports the real per-CPU state.
+- **THE BLOCKER, and it now reaches phase 6 too.** See the phase-5 entry below for the
+  full account. The short version: a per-processor `current` pointer and the per-processor
+  `idle` pointer get overwritten, `schedule()` then picks a value that is not a task, and
+  the machine dies trying to use it. Captured messages, in the order they appeared:
+  - `sched: processor 2 has 0xffff800000100030 as its current task, and that has weight 0`
+    -- a heap payload used as a `task_t *`.
+  - `sched: [from this processor's idle task] processor 0 chose 0xffffffff8000a0a0, and
+    could not claim it` -- a *kernel text address* used as a `task_t *`.
+  - `sched: processor 3 re-entered schedule() from task_sleep_ms+178 while it was already
+    switching` -- `schedule()`'s frame was still live on the stack when `task_sleep_ms`
+    ran, which means a context was saved at the wrong place.
+  - `rip=0xdeadbeef`, which is `TASK_STACK_GUARD`: a stack pointer that came from a guard
+    word rather than from a stack.
+  Phase 6 cannot be signed off until this is fixed, because `phase6-user` is exactly the
+  test that dies of it.
+
 - **THE BLOCKER FOR PHASE 5. An intermittent fault at 4 or more processors.** It
   has been reduced from "a hang somewhere" to two named things, and one of them has
   a fix that took it from 58% to 79% clean. `-smp 1` and `-smp 2` have not been seen to
