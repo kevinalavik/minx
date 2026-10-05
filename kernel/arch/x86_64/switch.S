@@ -43,6 +43,94 @@ task_switch:
     ret
 .size task_switch, .-task_switch
 
+/* void task_save_publish_and_switch(uint64_t *save_rsp, task_t *prev,
+ *                                   sched_cpu_t *c, uint64_t next_rsp)
+ *
+ * Save the running task's context, publish it to a run queue, and switch to another
+ * task, without ever returning to C.  Never returns.
+ *
+ * Why this cannot be task_switch(), and why the publication is inside it:
+ *
+ * The context of a task is its callee-saved registers *and its stack pointer*, and the
+ * stack pointer is stored by the same act of pushing them.  So the save has to happen
+ * before the publication: publishing first leaves a window in which the task is on
+ * another processor's run queue while its saved_rsp still names an older stack frame.
+ * That processor restores a stale RSP and the task resumes on a frame already in use,
+ * which corrupts two live frames at once and hangs the machine in a way that looks like
+ * a timer that stopped.
+ *
+ * Why it cannot come back to C either, which is the part that is easy to get wrong.
+ * Saving and publishing as two calls does not work, because the six pushes sit *between*
+ * the outer call's return address and the callback's.  With S the stack pointer of
+ * schedule():
+ *
+ *     S-8    return address of `call task_save_publish_and_switch`
+ *     S-16   rbp \
+ *     S-24   rbx  |
+ *     S-32   r12  |  the callee-saved set -- this is prev's saved context
+ *     S-40   r13  |
+ *     S-48   r14  |
+ *     S-56   r15 /   <- saved_rsp points here
+ *     S-64   return address of `call sched_publish_outgoing`
+ *
+ * Getting from the callback back to C means popping S-64 and then S-56, and popping S-56
+ * destroys the context that was just saved -- so this function does not return to C at
+ * all: after publishing, it switches.  That also settles where a preempted task resumes,
+ * at S-8, which is *after* the publication, so the publication is never repeated.
+ * Publishing from C after a save that returns would instead put the resume point *before*
+ * the insertion, and every preemption would queue the task again.
+ *
+ * next_rsp travels in %rcx and is moved into %r12 before the callback is called, because
+ * the callback is C and may clobber the argument registers -- but %r12 is callee-saved,
+ * so it survives.  Using it is free: prev's own %r12 is already on the stack by then.
+ */
+.global task_save_publish_and_switch
+.type task_save_publish_and_switch, @function
+task_save_publish_and_switch:
+    pushq   %rbp
+    pushq   %rbx
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
+    movq    %rsp, (%rdi)        /* final: from here on another processor may run it */
+    movq    %rcx, %r12          /* prev's %r12 is saved above; the slot is now free */
+    /* rdi = save_rsp, rsi = prev, rdx = c: already the arguments the callback wants. */
+    call    sched_publish_outgoing
+    movq    %r12, %rsp          /* continue on the chosen task's stack */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    popq    %rbp
+    ret                            /* into the chosen task's resume point */
+.size task_save_publish_and_switch, .-task_save_publish_and_switch
+
+/* void task_restore_context(uint64_t new_rsp)
+ *
+ * The second half of a switch on its own: continue on the stack at new_rsp with that
+ * task's callee-saved registers restored, returning into wherever it was.
+ *
+ * Does not return to its caller -- that is what a switch means.  There is deliberately
+ * no `sti` here, unlike task_enter_first(): a task that has already run has live state
+ * to return into, and that state decides whether interrupts should be on.  A task that
+ * has never run has none, so it goes through task_enter_first() and the shim, where they
+ * are turned on.
+ */
+.global task_restore_context
+.type task_restore_context, @function
+task_restore_context:
+    movq    %rdi, %rsp
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    popq    %rbp
+    ret
+.size task_restore_context, .-task_restore_context
+
 /* void task_enter_first(uint64_t new_rsp)
  *
  * The first switch onto a task that has never run: there is nothing to save, so

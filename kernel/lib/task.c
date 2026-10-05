@@ -36,7 +36,16 @@
 /* Provided by kernel/arch/x86_64/switch.S.  task_start_shim is jumped to by the
  * `ret` at the end of a first switch onto a task; it reads the entry point and
  * the argument off that task's stack and calls task_start(). */
+/* task_switch() is the one-instruction-pair primitive: it saves and switches as a
+ * single indivisible step, which is only correct when the outgoing task is not going
+ * to be published to another processor before the switch.  schedule() has to do the
+ * two halves separately, for the reason given at task_save_and_publish() below, so
+ * those are separate entry points here too.
+ *
+ * task_switch() is retained: it remains the correct primitive for a switch that cannot
+ * race, and nothing in the tree has been removed to make room for the split. */
 void task_switch(uint64_t *save_rsp, uint64_t new_rsp);
+void task_restore_context(uint64_t new_rsp);
 void task_enter_first(uint64_t new_rsp);
 void task_start_shim(void);
 void task_start(void (*entry)(void *), void *arg);
@@ -76,6 +85,14 @@ typedef struct {
     uint32_t      self_returned_reported;
     uint32_t      reentry_reported;
 } sched_cpu_t;
+
+/* Provided by kernel/arch/x86_64/switch.S, and the reason schedule() cannot be a
+ * single call to task_switch(): it saves the outgoing task's context and publishes it
+ * in one indivisible step, because a task that another processor can reach before its
+ * saved stack pointer is final runs a stack frame that is already in use.  Declared
+ * here because it takes a sched_cpu_t. */
+void task_save_publish_and_switch(uint64_t *save_rsp, task_t *prev, sched_cpu_t *c,
+                                 uint64_t next_rsp);
 
 static sched_cpu_t cpu[MAX_CPU_COUNT];
 
@@ -709,6 +726,41 @@ static task_t *steal_from(unsigned victim) {
     if (t != NULL)
         cpu[percpu_self_index()].steals++;
 
+    /* Never take another processor's idle task, and report nothing when the fairest
+     * thing on the victim's queue is one.
+     *
+     * An idle task is not work.  It is what a processor runs when it has nothing else,
+     * and the two are not interchangeable: a processor that steals another's idle task
+     * runs it *instead of* its own, so the processor it was taken from is now the one
+     * with an idle task, and the two trade places on every tick for as long as the
+     * system has nothing else to run.
+     *
+     * At boot that trade is fatal rather than merely wasteful, because the boot task is
+     * the only runnable task in the system for the first few milliseconds.  The boot
+     * processor's run queue is empty the whole time, so it steals on every tick; it
+     * takes an idle task, runs it, and on the next tick takes the next one -- and the
+     * boot task is never picked again.  Nothing looks wrong: every processor is in its
+     * idle loop and taking its timer.  The self-tests run on the boot task, so the
+     * suite simply stops after the scheduler comes up, which is what it did.
+     *
+     * The in-schedule guard does not save this.  It defers a preemption of a processor
+     * whose own queue is empty, and that is precisely the processor that is stealing an
+     * idle task, so the guard never fires and there is no preemption to break the
+     * cycle.
+     *
+     * Refusing idle tasks here costs nothing: work reaches another processor by being
+     * put on that processor's queue by task_wakeup_on(), which is a direct enqueue, not
+     * a steal.  Nothing is ever *published* to a run queue to be stolen from, because
+     * the outgoing task is the only thing that goes on one and it is always real work.
+     * If the fairest task available anywhere is an idle task, the honest answer is that
+     * there is no work, and the caller falls back to this processor's own idle task. */
+    if (t != NULL && t->is_idle) {
+        ticket_lock(&c->rq.lock);
+        rq_push(c, t);
+        ticket_unlock(&c->rq.lock);
+        return NULL;
+    }
+
     return t;
 }
 
@@ -766,6 +818,50 @@ static void charge_current(sched_cpu_t *c) {
      * quarter of the virtual time and therefore runs four times as often. */
     t->vruntime += elapsed / t->weight;
     c->slice_start_ns = now;
+}
+
+/* Put the outgoing task back on a run queue, or do nothing with it.
+ *
+ * Called from task_save_and_publish() in switch.S, which has already pushed the task's
+ * callee-saved registers and stored its stack pointer.  That ordering is the whole
+ * reason this is a callback rather than a line of C between a save and a switch: the
+ * task must not be reachable by another processor until its saved context is final, and
+ * its saved context is not final until the save has happened.
+ *
+ * `save_rsp` is unused and takes its place only so the argument list matches the three
+ * registers the assembly calls with.  Interrupts are off here -- schedule() turned them
+ * off before choosing anything -- so nothing can preempt between the state store and the
+ * queue insertion.
+ */
+void sched_publish_outgoing(uint64_t *save_rsp, task_t *prev, sched_cpu_t *c) {
+    (void)save_rsp;
+
+    /* The idle task goes back to runnable without going on a queue: it is the fallback
+     * schedule() falls back to, and it is claimed through the same
+     * TASK_RUNNABLE -> TASK_RUNNING transition as anything else.
+     *
+     * Leaving it TASK_RUNNING after switching away from it means the next time the run
+     * queue is empty the claim fails, and a schedule() that fails to claim anything
+     * returns *without switching*.  A task that called schedule() in order to sleep then
+     * returns from its sleep still marked asleep, and the caller loops forever putting it
+     * back on the blocked list. */
+    if (prev->is_idle) {
+        __atomic_store_n(&prev->state, TASK_RUNNABLE, __ATOMIC_RELEASE);
+        return;
+    }
+
+    /* Only if it is still runnable.  The commonest reason it is not: it called
+     * schedule() itself in order to sleep or block, and it is already on the blocked
+     * list.  Re-queueing it would put one task on a list twice, and the second link
+     * splices the whole list -- entries after the spliced point become unreachable and
+     * the tasks on them never run, which is a hang rather than a wrong answer. */
+    if (__atomic_load_n(&prev->state, __ATOMIC_ACQUIRE) != TASK_RUNNING)
+        return;
+
+    __atomic_store_n(&prev->state, TASK_RUNNABLE, __ATOMIC_RELEASE);
+    ticket_lock(&c->rq.lock);
+    rq_push(c, prev);
+    ticket_unlock(&c->rq.lock);
 }
 
 void schedule(void) {
@@ -911,47 +1007,21 @@ void schedule(void) {
     percpu_t *self = percpu_self();
     uint32_t last = prev != NULL ? prev->last_cpu : MAX_CPU_COUNT;
 
+    /* Everything that has to be true of the chosen task is made true here, *before*
+     * the switch, because the switch below does not come back.  Each of these was
+     * already done before the switch; the order between them is new, and it is new only
+     * because the sequence that saves the outgoing task, publishes it, and switches can
+     * no longer return into the middle of it.
+     *
+     * None of it needs the outgoing task's registers, which is what makes that safe: the
+     * bookkeeping touches `next`, `c` and `self`, none of which live in registers that
+     * get saved away. */
     c->current = next;
     self->current = next;
     next->last_cpu = index;
     next->ran_on_cpu = index;
     next->switch_count++;
     next->started = true;
-
-    /* Put the old task back, but only if it is still runnable.
-     *
-     * The commonest reason it is not: it called schedule() itself in order to
-     * sleep or block, and it is already on the blocked list.  Re-queueing it would
-     * put one task on a list twice, and the second link corrupts the whole list --
-     * which is a hang rather than a wrong answer, because the entries after the
-     * spliced point are then unreachable and the tasks on them never run. */
-    if (prev != NULL) {
-        if (!prev->is_idle) {
-            /* Only if it is still runnable.  The commonest reason it is not: it
-             * called schedule() itself in order to sleep or block, and it is
-             * already on the blocked list.  Re-queueing it would put one task on a
-             * list twice, and the second link splices the whole list. */
-            if (__atomic_load_n(&prev->state, __ATOMIC_ACQUIRE) ==
-                TASK_RUNNING) {
-                __atomic_store_n(&prev->state, TASK_RUNNABLE, __ATOMIC_RELEASE);
-                ticket_lock(&c->rq.lock);
-                rq_push(c, prev);
-                ticket_unlock(&c->rq.lock);
-            }
-        } else {
-            /* The idle task goes back to runnable without going on a queue: it is
-             * the fallback schedule() falls back to, and it is claimed through the
-             * same TASK_RUNNABLE -> TASK_RUNNING transition as anything else.
-             *
-             * Leaving it TASK_RUNNING after switching away from it means the next
-             * time the run queue is empty the claim fails, and a schedule() that
-             * fails to claim anything returns *without switching*.  A task that
-             * called schedule() in order to sleep then returns from its sleep
-             * still marked asleep, and the caller loops forever putting it back on
-             * the blocked list. */
-            __atomic_store_n(&prev->state, TASK_RUNNABLE, __ATOMIC_RELEASE);
-        }
-    }
 
     if (last != MAX_CPU_COUNT && last != index)
         c->migrations++;
@@ -968,22 +1038,28 @@ void schedule(void) {
 
     /* Clear the guard before switching, not after.  A task that is switched to has
      * to be able to schedule immediately -- to sleep, to yield -- and this
-     * processor is now running *it*.  Nothing can arrive in the three
-     * instructions between here and the switch because interrupts are off.
+     * processor is now running *it*.  Nothing can arrive between here and the switch
+     * because interrupts are off, and the switch itself turns none on.
      *
-     * The task being switched to does not inherit the switcher's interrupt state:
-     * a task with a saved context brings its own flags back with it, and a task
-     * that has never run gets them turned on where it enters, which is
+     * The task being switched to does not inherit the switcher's interrupt state: one
+     * that has never run gets interrupts turned on where it enters, which is
      * task_enter_first() and task_start_shim() in switch.S.  That is the piece that
-     * matters most here -- an idle task entered with interrupts off executes one
-     * `hlt` and is never woken again, which looks exactly like a scheduler whose
-     * timer has stopped. */
+     * matters most here -- an idle task entered with interrupts off executes one `hlt`
+     * and is never woken again, which looks exactly like a scheduler whose timer has
+     * stopped. */
     c->in_schedule = 0;
 
+    /* A task that has never run has no resume point of its own: what is on its stack is
+     * the bootstrap frame task_stack_init() built, and it goes through task_enter_first(),
+     * which turns interrupts on for it.
+     *
+     * Anything else is the save-publish-switch sequence, and there is no outgoing task
+     * to publish when there was no outgoing task -- which only happens on a processor
+     * that has not entered the scheduler yet, so there is nothing of its own to save. */
     if (prev == NULL)
         task_enter_first(next->saved_rsp);
     else
-        task_switch(&prev->saved_rsp, next->saved_rsp);
+        task_save_publish_and_switch(&prev->saved_rsp, prev, c, next->saved_rsp);
 
     /* Only reached when this task is switched back into. */
     irq_restore(flags);

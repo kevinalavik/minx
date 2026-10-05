@@ -116,16 +116,47 @@ switched to. `task_t.state` is the arbiter — only one processor ever wins the
 `TASK_RUNNABLE → TASK_RUNNING` transition, and the loser gives the task back rather
 than reporting an error.
 
+A fourth rule governs the *outgoing* task, and it is the one whose absence cost phase 5
+a long while. It is stated here because it is a locking rule, not a scheduling one: the
+run-queue lock serialises the queue, and the queue is not the only thing that has to be
+consistent when a task becomes visible.
+
+> **A task's saved context is finished before any other processor can reach it.**
+
+A context is its callee-saved registers *and its stack pointer*, so with a stack-based
+context the two become consistent at the instant the save stores `%rsp` — which is what
+`task_save_and_publish()` does, in that order, before calling back into C to queue the
+task. Publishing first leaves a window in which the task is on another processor's queue
+while its `saved_rsp` still names an older frame; that processor restores a stale `RSP`
+and the task resumes on a stack frame already in use. Two live frames on one kernel stack
+corrupts both, and the visible symptom is a processor that stops taking interrupts with
+no fault reported anywhere.
+
+The publication is *inside* the save, not after it, and that is not tidiness. The resume
+point is wherever the save function returns to in C. If the publication were a line of C
+after that return, the resume point would sit *before* it, and every preemption would
+queue the task again — one task on one list many times, which splices the list and hangs
+the machine in a different place each time. `sched_publish_outgoing()` therefore runs
+with its frame below the saved context, in space the next save reuses, and must touch
+nothing that outlives it.
+
 Three rules the switch itself imposes, each of which was a hang before it was a rule:
 
 - **Nothing is ever pushed between processors.** A processor that runs dry steals; it
   never waits behind a queue that is being filled.
-- **A task switched to must not inherit the switcher's interrupt state.** With
-  interrupts off across the switch, a task with a saved context brings its own flags
-  back, and one with no saved context gets them turned on where it enters
-  (`task_enter_first` and `task_start_shim` in `switch.S`). A task entered with IF
-  clear that then calls `hlt` never wakes, and its processor stops taking interrupts
-  without reporting anything.
+- **A task switched to must not end up running with interrupts off when it expects
+  them.** Stated that way because the obvious version of this rule is not what the code
+  does: `task_restore_context()` does **not** save and restore `RFLAGS`, so a resumed
+  task briefly has the switcher's flags, which are off. That is safe on both paths that
+  exist, and each is safe for a different reason. A task that returns through
+  `schedule()` is fixed by the `irq_restore()` immediately after the switch, with the
+  flags `irq_save()` took from its *own* state on entry. A task that was preempted inside
+  an interrupt handler is fixed by that handler's `iretq`, which loads `RFLAGS` from the
+  interrupted frame. A task that has never run has neither, so it goes through
+  `task_enter_first()`, whose `sti` is the only one in the path. Getting this wrong
+  presents as a scheduler whose timer has stopped, because the affected task is usually
+  the idle task: it executes one `hlt` with IF clear and is never woken again, and
+  nothing is faulted.
 - **Interrupts stay off across "decide to block" *and* the switch** (`task_sleep_ms`,
   `task_wait`). With them on, a tick can preempt a task between the moment it is on
   the sleep list and the moment it switches away — and since it is deliberately not

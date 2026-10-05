@@ -577,3 +577,87 @@ restore loads `RSP = 0` and the machine triple-faults on the first instruction.
 Reverted rather than committed because it did not boot. A fix for the root cause of a fault
 that only moves the fault somewhere else is not a fix, and the tree is better off working
 and documented than broken and interesting.
+
+## 2026-10-05 — Fixing the phase-5 fault for real: save-and-publish inside one call
+Decision: implemented. Supersedes the entry above, which was right about the cause and
+wrong about the remedy.
+
+The cause stands: **a preempted task must not be claimable before its context is
+finished.** `schedule()` used to requeue the outgoing task and *then* call
+`task_switch()`, which writes the outgoing task's `saved_rsp` as its last act. In
+between sat the run-queue lock and the address-space load, so for that whole window the
+task was reachable by another processor while its saved stack pointer still named an
+older frame. That processor restored a stale `RSP`, and the task resumed executing a
+stack frame already in use. Two live frames on one kernel stack is a hang, and it
+presents as a processor whose timer has stopped — which is exactly how the phase-5 fault
+looked, and why it took so long to find.
+
+The remedy above was to move the context out of the stack into `task_t.regs[8]`, so it
+could be finished before publication. That attempt did not boot, and the diagnosis in
+`docs/STATUS.md` is right: three separate mistakes, each of which turned an
+intermittent fault into a deterministic one. It is kept in `git stash` rather than
+deleted. But the move to `regs[]` was not necessary, and paying for it was what made
+the attempt fragile.
+
+**The context can be finished on the stack; what it cannot do is skip the code between
+the save and the publication.** Both halves of `task_switch()` were indivisible only
+because they were written as one function, and the ordering problem lived in C, not in
+the assembly. So `schedule()` now uses two halves, with the publication inside the save:
+
+    task_save_and_publish(&prev->saved_rsp, prev, c);
+
+`task_save_and_publish()` in `switch.S` pushes the six callee-saved registers, stores
+`%rsp`, *then* calls `sched_publish_outgoing()` in C, then returns. Three properties
+fall out of that order, and all three are load-bearing:
+
+- The registers are on the stack and `saved_rsp` is final **before** the task is
+  reachable by another processor. There is no window.
+- The resume point — where that function's `ret` lands in C — is **after** the queue
+  insertion. Saving first and publishing from C afterwards would look equivalent and is
+  not: the resume point would be *before* the insertion, so every preemption would
+  republish the task, putting one task on one list many times over.
+- The callback's own frame sits below the saved context, in space the next save reuses.
+  That is why it must touch nothing that outlives it. It takes the three arguments the
+  assembly already has in place, so no register shuffling is needed.
+
+`task_restore_context()` is the load half, and deliberately has no `sti`: a task that
+has already run has live state to return into, and that state decides whether interrupts
+should be on. A task that has never run still goes through `task_enter_first()`, which
+turns them on. This is the invariant that was previously only asserted in a comment and
+was in fact untrue — `task_switch()` never saved `RFLAGS`, so a resumed task got the
+*switcher's* interrupt state and relied on the `irq_restore()` after the switch call to
+put its own back. That works on both paths that exist today and is left alone, because
+the fault in hand is not it, and changing the frame layout would put the ring-3 entry
+frame in `task_create_user()` and `task_enter_user()` at risk for no evidence.
+
+`task_switch()` is retained unchanged. It remains the correct primitive for a switch that
+cannot race, and nothing was removed to make room for the split.
+
+Rejection logged as well: moving the context into `task_t` is *not* what fixes this, and
+the three mistakes it took are now written down in `docs/STATUS.md` so the next attempt at
+the same idea does not repeat them.
+
+### The saved-frame layout, written out because it is easy to get wrong
+
+With `save_rsp` = `%rsp` after the six pushes (S-56, where S is `schedule()`'s stack
+pointer and the `call` put its return address at S-8):
+
+    S-16  rbp     \
+    S-24  rbx      |
+    S-32  r12      |  the callee-saved set, as task_restore_context's pops read it
+    S-40  r13      |
+    S-48  r14      |
+    S-56  r15     /   <- saved_rsp points here
+    S-64  return address of `call sched_publish_outgoing`  (scratch: reused next time)
+
+`task_restore_context()` pops upward from `saved_rsp` and its final `ret` takes the word
+at S-8, which is the return address of `call task_save_and_publish` — so a resumed task
+continues in `schedule()` *after* the save-and-publish, which is after the queue
+insertion. That is the property the whole design exists to get.
+
+`task_save_and_publish()` therefore needs **two** `ret`s, not one: the callback's `call`
+pushed a return address below the saved registers, and the saved context is six quadwords
+above where that address is. One `ret` unwinds the callback and then falls through into
+the saved `r15` and executes it — which kills the machine before the first processor has
+finished announcing itself. Cost: one build-and-run cycle to find, and it is exactly the
+kind of thing that reads as a scheduler bug in the log.

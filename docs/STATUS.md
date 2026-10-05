@@ -224,6 +224,22 @@ looked like it was working.
   host-compiled allocator fuzz test (`make test-host`).
 
 ## Known bugs / gaps
+- **The phase-5/6 blocker has a fix in the tree; the measurement is in "The
+  save-and-publish switch" below.** Root cause, established by reading the code rather
+  than by inference: `schedule()` published the outgoing task to a run queue *before*
+  `task_switch()` wrote that task's `saved_rsp`. A stack-based context is not finished
+  until the instant its stack pointer is stored, so for the whole of the window between
+  the queue insertion and the store, the task was reachable by another processor while
+  its `saved_rsp` still named an *older* frame. That processor restored a stale `RSP`
+  and the task resumed on a frame already in use. Two live frames on one kernel stack
+  corrupts both, and the visible result is a processor that stops taking interrupts with
+  no fault reported anywhere -- which is what every captured symptom of this fault
+  actually was.
+  This accounts for all four captured messages at once, including the two that looked
+  like unrelated bugs: `current` holding a heap payload and `cpu[i].idle` holding a
+  kernel text address are both what a `task_t *` read through a corrupted stack looks
+  like, and the "re-entered `schedule()` from `task_sleep_ms`" report is what a context
+  saved at the wrong stack depth looks like.
 - The mutex and the semaphore spin instead of sleeping. Correct, and right for a
   short critical section; wrong for one that can block, which is why the wait
   queues they would need are not written yet either. Phase 5.
