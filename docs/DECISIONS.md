@@ -547,3 +547,33 @@ before it is dereferenced.
 A short list is the argument for turning it off now. The list gets longer as phase 7 adds
 COW, a real heap and a growing stack, and at that point the pairs outnumber the
 protections. The decision to revisit it is written down where the three sites are.
+
+## 2026-10-05 — Tried and reverted: finishing a task's context before publishing it
+Decision: reverted. The kernel is at the state before the attempt: `schedule()` requeues the
+old task and *then* switches, as before.
+Alternatives kept on record, none of them implemented.
+Reason, and it is the most important thing found about the phase-5 fault: **a preempted task
+must not be claimable before its context is finished.** `schedule()` publishes the old task
+to a run queue before switching away, and between the two there is a window -- a lock
+acquisition, an address-space load -- in which the old task's saved stack pointer still
+refers to a frame on the preempting processor's stack. A second processor that claims it
+there switches to a half-written context and runs it with the preemptor's registers, which
+is how a `task_t *` becomes a kernel text address.
+
+The correct fix is to save the context, *then* publish, *then* restore. That sounds like a
+reordering and is not: a stack-based saved context is not finished until the instant it is
+restored from, and the scheduler must do work in between, so the context has to move out of
+the stack and into `task_t`. `task_t.regs[8]` -- six callee-saved registers, a return address
+and a stack pointer -- is where it goes, and `schedule()` then orders every early return
+*before* the save, because after the save there is nothing on the stack for a normal return
+to unwind.
+
+The attempt is kept in `git stash` rather than deleted, and `docs/STATUS.md` lists the three
+mistakes in it: publishing with a non-claimable `TASK_SWITCHING` state deadlocks the
+scheduler; a save half that returns leaves the registers below the stack pointer where the
+bookkeeping overwrites them; and a never-run task needs both context forms populated, or a
+restore loads `RSP = 0` and the machine triple-faults on the first instruction.
+
+Reverted rather than committed because it did not boot. A fix for the root cause of a fault
+that only moves the fault somewhere else is not a fix, and the tree is better off working
+and documented than broken and interesting.
