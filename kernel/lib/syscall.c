@@ -394,10 +394,23 @@ task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
     /* The entry and stack pointer the loader worked out have to go into the ring-3
      * frame that task_create_user() built a placeholder in.  The frame lives at the top
      * of the task's own stack, which the kernel can reach through the direct map. */
-    uint64_t *frame = (uint64_t *)phys_to_virt(virt_to_phys(USER_STACK_TOP)
-                                               - USER_FRAME_BYTES);
+    /* `iretq` pops RIP, CS, RFLAGS, SS and RSP in that order, so RIP is the first
+     * quadword of the frame and RSP the fifth; task_create_user() lays them out in that
+     * order and records a kernel alias of the frame's page for exactly this.
+     *
+     * The alias cannot be recomputed here.  The page is mapped only in this task's
+     * address space, so phys_to_virt() of the user address is arithmetic on a user
+     * address: it wraps, and adding the offset back lands nowhere. */
+    if (t->user_frame == NULL) {
+        kwarn("program: %s has no ring-3 frame to patch", name);
+        vmm_address_space_destroy(t->tables);
+        kfree(t->tables);
+        t->tables = NULL;
+        return NULL;
+    }
+    uint64_t *frame = t->user_frame;
 
-    frame[2] = r.entry;            /* RIP */
+    frame[0] = r.entry;            /* RIP */
     frame[4] = r.entry_rsp;        /* RSP */
 
     /* A virtual address: this is what the CPU loads into RSP. */

@@ -126,6 +126,18 @@ typedef struct task {
      * overflow that crosses it in one go. */
     uint64_t     stack_low;
     volatile uint64_t *stack_guard;
+
+    /* A kernel alias of this task's ring-3 return frame, for a user task only; NULL
+     * for a kernel task.
+     *
+     * The frame sits at the top of the task's own user stack, which exists only in that
+     * task's address space -- so the kernel cannot reach it through its own page tables,
+     * and `phys_to_virt()` of the *user* address does not work either: that is just
+     * arithmetic on a user address, and it yields a kernel address with no page behind
+     * it.  What does work is the direct map of the frame's own physical page, which is
+     * what this holds.  It exists because the loader has to patch RIP and RSP into the
+     * frame after the ELF is read, and that happens well after the task is created. */
+    uint64_t    *user_frame;
 } task_t;
 
 /* The word written at the bottom of every task stack. */

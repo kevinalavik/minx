@@ -44,10 +44,11 @@ task_switch:
 .size task_switch, .-task_switch
 
 /* void task_save_publish_and_switch(uint64_t *save_rsp, task_t *prev,
- *                                   sched_cpu_t *c, uint64_t next_rsp)
+ *                                   sched_cpu_t *c, uint64_t next_rsp,
+ *                                   const page_table_t *next_tables)
  *
- * Save the running task's context, publish it to a run queue, and switch to another
- * task, without ever returning to C.  Never returns.
+ * Save the running task's context, publish it to a run queue, load another task's address
+ * space, and switch to it, without ever returning to C.  Never returns.
  *
  * Why this cannot be task_switch(), and why the publication is inside it:
  *
@@ -80,9 +81,17 @@ task_switch:
  * Publishing from C after a save that returns would instead put the resume point *before*
  * the insertion, and every preemption would queue the task again.
  *
- * next_rsp travels in %rcx and is moved into %r12 before the callback is called, because
- * the callback is C and may clobber the argument registers -- but %r12 is callee-saved,
- * so it survives.  Using it is free: prev's own %r12 is already on the stack by then.
+ * The address space is loaded *here*, between the publication and the switch, and not in
+ * C before the call.  That ordering is forced by the same thing that forces everything
+ * else here: a user task's saved_rsp is a user virtual address, and the pushes that save
+ * its context have to happen while its own address space is still loaded.  Switching
+ * first means pushing onto a user stack that the incoming task's tables do not map, which
+ * is a page fault on the first push of every preemption of a ring-3 task.
+ *
+ * next_rsp and next_tables travel in %rcx and %r8 and are moved into %r12 and %r13 before
+ * the first call, because the callbacks are C and may clobber the argument registers --
+ * but %r12 and %r13 are callee-saved, so they survive.  Using them is free: prev's own
+ * %r12 and %r13 are already on the stack by then.
  */
 .global task_save_publish_and_switch
 .type task_save_publish_and_switch, @function
@@ -95,8 +104,12 @@ task_save_publish_and_switch:
     pushq   %r15
     movq    %rsp, (%rdi)        /* final: from here on another processor may run it */
     movq    %rcx, %r12          /* prev's %r12 is saved above; the slot is now free */
-    /* rdi = save_rsp, rsi = prev, rdx = c: already the arguments the callback wants. */
+    movq    %r8, %r13           /* likewise prev's %r13 */
+    /* rdi = save_rsp, rsi = prev, rdx = c: already the arguments the callback wants.
+     * Still in prev's address space, which is where the outgoing task's stack lives. */
     call    sched_publish_outgoing
+    movq    %r13, %rdi          /* next_tables */
+    call    vmm_address_space_switch
     movq    %r12, %rsp          /* continue on the chosen task's stack */
     popq    %r15
     popq    %r14
@@ -195,16 +208,17 @@ task_start_shim:
 .type task_enter_user, @function
 task_enter_user:
     sti
-    /* Task_enter_first popped the six registers and then returned through the return
-     * address slot, so %rsp is now two quadwords past the start of the saved context --
-     * that is, just above the saved context and below the ring-3 frame.
+    /* Nothing to drop.  Restoring the saved context returned through its return-address
+     * slot, so %rsp is now eight bytes past the top of that frame -- and the ring-3
+     * return frame begins immediately there, with RIP as its first quadword.
      *
-     * `iretq` wants RSP pointing at the frame's *RIP*, which is the third quadword of
-     * the frame, so this has to drop the frame's RFLAGS and CS.  Two quadwords, sixteen
-     * bytes: the distance from where the return left the stack to where iretq starts
-     * reading.  task_create_user() lays the two frames out contiguously from that, and
-     * the arithmetic is in one place there and one place here. */
-    addq $16, %rsp
+     * That is the arrangement `iretq` wants: it pops RIP, CS, RFLAGS, SS and RSP in that
+     * order, each one quadword above the last, and enters ring 3 with %rsp pointing at
+     * RIP.  An earlier version of this advanced %rsp by two quadwords to reach RIP in the
+     * middle of the frame, which put RIP in the right slot and left CS holding the SS
+     * selector, with SS and RSP read from above the frame -- a #GP out of `iretq` with no
+     * ring-3 task anywhere.  task_create_user() writes the frame in the order the CPU
+     * pops it for exactly this reason. */
     jmp    __enter_user
 .size task_enter_user, .-task_enter_user
 

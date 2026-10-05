@@ -92,7 +92,8 @@ typedef struct {
  * saved stack pointer is final runs a stack frame that is already in use.  Declared
  * here because it takes a sched_cpu_t. */
 void task_save_publish_and_switch(uint64_t *save_rsp, task_t *prev, sched_cpu_t *c,
-                                 uint64_t next_rsp);
+                                 uint64_t next_rsp,
+                                 const page_table_t *next_tables);
 
 static sched_cpu_t cpu[MAX_CPU_COUNT];
 
@@ -502,9 +503,16 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
      * for and why the user half lives in different PML4 entries from the kernel's. */
     uint32_t pages = stack_pages == 0 ? 1 : stack_pages;
     uint64_t top = USER_STACK_TOP;
+    uint64_t top_phys = 0;
 
     for (uint32_t i = 0; i < pages; i++) {
         uint64_t phys = vmm_user_page_alloc();
+
+        /* The page at the very top is the one the two frames go in, and the kernel has
+         * to be able to write them, so its physical address is kept: the frames are
+         * reachable only through the direct map of that page. */
+        if (i == 0)
+            top_phys = phys;
 
         if (phys == 0) {
             vmm_address_space_destroy(tables);
@@ -525,20 +533,22 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
 
     /* The two frames, laid out together at the very top of the stack.
      *
-     * Reading downwards from `top`, which is one past the last byte of the stack:
+     * Reading upwards from `top - 96`, which is where `saved_rsp` points and therefore
+     * the lowest address here:
      *
-     *     top -  8   RFLAGS        \
-     *     top - 16   CS             |  the ring-3 return frame, which `iretq` pops
-     *     top - 24   RIP            |  five quadwords, in the order the CPU pops
-     *     top - 32   SS             |  them: RIP, CS, RFLAGS, then SS and RSP
-     *     top - 40   RSP           /
-     *     top - 48   r15           \
-     *     top - 56   r14            |  the scheduler's saved context: six
-     *     top - 64   r13            |  callee-saved registers and a return
-     *     top - 72   r12            |  address, which task_switch's `ret` takes
-     *     top - 80   rbx            |
-     *     top - 88   rbp           /
-     *     top - 96   task_enter_user
+     *     top - 96   r15           \
+     *     top - 88   r14            |  the scheduler's saved context: six
+     *     top - 80   r13            |  callee-saved registers, then a return
+     *     top - 72   r12            |  address, which the restore's `ret` takes.
+     *     top - 64   rbx            |  They are in push order, so the pops read them
+     *     top - 56   rbp           /   back the right way round.
+     *     top - 48   task_enter_user
+     *     top - 40   RIP            \
+     *     top - 32   CS             |  the ring-3 return frame, in the order `iretq`
+     *     top - 24   RFLAGS         |  pops it: RIP, CS, RFLAGS, then SS and RSP.
+     *     top - 16   SS             |  Five quadwords, and the CPU enters ring 3 with
+     *     top -  8   RSP           /   %rsp pointing at RIP, so task_enter_user() adds
+     *                                  nothing before its `iretq`.
      *
      * The return address has to be a *kernel* address, because that is what runs when
      * the context is restored; it drops the stack to the ring-3 frame and hands it to
@@ -553,15 +563,30 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
      * (here, the loader's segment copies and its stack) which would each then need an
      * stac/clac pair and a comment saying why.  Turning it on is a small change; leaving
      * it off is the honest default while the list is this short. */
-    uint64_t *frame = (uint64_t *)phys_to_virt(virt_to_phys(top) - USER_FRAME_BYTES);
-    uint64_t *ctx = (uint64_t *)phys_to_virt(virt_to_phys(top) - USER_FRAME_BYTES
-                                            - USER_CTX_BYTES);
+    uint64_t *frame = (uint64_t *)(phys_to_virt(top_phys) + page_size
+                                   - USER_FRAME_BYTES);
+    uint64_t *ctx = (uint64_t *)(phys_to_virt(top_phys) + page_size
+                                 - USER_FRAME_BYTES - USER_CTX_BYTES);
     uint64_t user_stack_top = top - (uint64_t)pages * page_size;
 
-    frame[0] = 0x002;                      /* RFLAGS: IF set, so the task's first */
-    frame[1] = GDT_USER_CODE;              /* CS      interrupt is its own choice */
-    frame[2] = entry;                      /* RIP */
-    frame[3] = GDT_USER_DATA;              /* SS */
+    /* In the order `iretq` pops them, which is the only order that works: RIP, CS,
+     * RFLAGS, SS, RSP, each one quadword above the last, with RSP left pointing at RIP.
+     * The first version of this frame listed them the other way round -- RFLAGS first,
+     * RIP last -- and compensated in task_enter_user() by advancing %rsp past the first
+     * two words.  That put RIP in the right slot by luck and left CS holding the SS
+     * selector, with SS and RSP loaded from above the frame: a #GP out of `iretq` with
+     * no ring-3 task in existence, which is what phase6-user hit every time.
+     *
+     * The addressing is not negotiable either.  `virt_to_phys()` subtracts the direct-map
+     * offset, so it is only meaningful for a kernel address; applied to a user address it
+     * wraps, and `phys_to_virt()` of the result lands nowhere.  The frames are in a page
+     * that exists only in this task's address space, so the direct map of that page's own
+     * physical address is the one route to them. */
+    frame[0] = entry;                      /* RIP */
+    frame[1] = GDT_USER_CODE;              /* CS   */
+    frame[2] = 0x002;                      /* RFLAGS: IF set, so the task's first
+                                           *   interrupt is its own choice */
+    frame[3] = GDT_USER_DATA;              /* SS   */
     frame[4] = user_stack_top;             /* RSP: the bottom of its own stack */
 
     for (unsigned i = 0; i < 6; i++)
@@ -574,6 +599,7 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
      * would load a physical address into RSP, and with a 64 GiB heap under the direct map
      * that is an address in the middle of nothing in particular. */
     t->saved_rsp = top - USER_FRAME_BYTES - USER_CTX_BYTES;
+    t->user_frame = frame;
     t->stack = NULL;                       /* it owns no kernel stack yet */
     t->stack_top = 0;
 
@@ -1032,9 +1058,17 @@ void schedule(void) {
     /* The address space is part of the context, so it has to be loaded before the
      * switch rather than by whoever mapped something.  vmm_address_space_switch()
      * compares first, so for the common case -- two kernel tasks, which share the
-     * kernel's tables -- this is one compare and no TLB flush. */
-    vmm_address_space_switch(next->tables != NULL ? next->tables
-                                             : vmm_kernel_tables());
+     * kernel's tables -- this is one compare and no TLB flush.
+     *
+     * It is *called* from inside task_save_publish_and_switch() rather than from here,
+     * and that is not tidiness.  A user task's saved_rsp is a user virtual address, so
+     * the pushes that save its context have to happen while its own address space is
+     * still loaded; loading the incoming task's tables first means pushing onto a user
+     * stack those tables do not map, which faults on the first push of every preemption
+     * of a ring-3 task.  The address to load is computed here and handed over as an
+     * argument. */
+    page_table_t *next_tables = next->tables != NULL ? next->tables
+                                                    : vmm_kernel_tables();
 
     /* Clear the guard before switching, not after.  A task that is switched to has
      * to be able to schedule immediately -- to sleep, to yield -- and this
@@ -1056,10 +1090,23 @@ void schedule(void) {
      * Anything else is the save-publish-switch sequence, and there is no outgoing task
      * to publish when there was no outgoing task -- which only happens on a processor
      * that has not entered the scheduler yet, so there is nothing of its own to save. */
-    if (prev == NULL)
+    if (prev == NULL) {
+        /* The address space is loaded here because the sequence that normally does it is
+         * not on this path.  That path is for a processor that has not entered the
+         * scheduler yet, so it has no outgoing task to save -- and skipping the load
+         * there means the task starts on whatever tables the processor already had.
+         *
+         * It used to be reachable at run time as well, because task_exit() cleared
+         * `current` on its way out; task_exit() no longer does that.  Both halves are
+         * needed: this one because the path exists at all, and the other because a task
+         * that starts on the wrong tables faults on its first memory access and says
+         * nothing about why. */
+        vmm_address_space_switch(next_tables);
         task_enter_first(next->saved_rsp);
-    else
-        task_save_publish_and_switch(&prev->saved_rsp, prev, c, next->saved_rsp);
+    } else {
+        task_save_publish_and_switch(&prev->saved_rsp, prev, c, next->saved_rsp,
+                                     next_tables);
+    }
 
     /* Only reached when this task is switched back into. */
     irq_restore(flags);
@@ -1154,8 +1201,23 @@ void task_exit(void) {
             hlt();
     }
 
-    cpu[index].current = NULL;
-    percpu_self()->current = NULL;
+    /* Leave through schedule() as an ordinary switch away from a task that is no
+     * longer runnable, which is what this is.
+     *
+     * It used to clear `current` first, so that schedule() would see no outgoing task
+     * and take the first-entry path instead.  That is wrong for a reason that only shows
+     * up with two tasks on one processor: the first-entry path enters a task that has
+     * never run, and it deliberately does *not* load the chosen task's address space --
+     * that is done by the save-publish-switch sequence, which the first-entry path does
+     * not go through.  So the next task started up and ran on the dead one's page tables,
+     * mapped its page into its own, walked its own tables to find it, and then took a
+     * page fault writing to it.  The walk and the fault disagreed about which address
+     * space was loaded, which is a confusing enough report to be worth writing down.
+     *
+     * As an ordinary switch-away, the context is saved -- which costs nothing for a task
+     * that will never be resumed -- and sched_publish_outgoing() declines to queue it
+     * because its state is no longer TASK_RUNNING.  That is what that state check is
+     * for, and this is the case it was written for. */
     schedule();
 
     for (;;)

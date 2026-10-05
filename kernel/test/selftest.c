@@ -1793,6 +1793,10 @@ static volatile uint64_t aspace_kernel_ok[2];
 static page_table_t aspace_tables[2];
 static task_t *aspace_tasks[2];
 
+/* Why a task could not map its own page: 1 = vmm_map_user refused, 2 = it claimed
+ * success but the page is not in the address space the task is running in. */
+static volatile int aspace_map_why[2];
+
 static void aspace_worker(void *arg) {
     unsigned which = (unsigned)(uintptr_t)arg;
     uint64_t slot = (uint64_t)(which + 1) * 0x100000;
@@ -1800,6 +1804,17 @@ static void aspace_worker(void *arg) {
 
     if (vmm_map_user(slot, vmm_user_page_alloc(), page_size, true) != 0) {
         __atomic_store_n(&aspace_failed, 1, __ATOMIC_RELEASE);
+        aspace_map_why[which] = 1;
+        return;
+    }
+
+    /* A mapping that reports success but is not in the address space the task is
+     * running in is the failure this whole test exists to catch, so it is checked
+     * rather than left to the write below: the write faults the machine, and a
+     * machine that is dead says nothing. */
+    if (vmm_translate(slot) == 0) {
+        __atomic_store_n(&aspace_failed, 1, __ATOMIC_RELEASE);
+        aspace_map_why[which] = 2;
         return;
     }
 
@@ -1860,7 +1875,12 @@ static void test_address_spaces(void) {
         return;
     }
     if (aspace_failed) {
-        test_fail("phase6-aspace", "a task could not map its own page");
+        unsigned w = aspace_map_why[0] != 0 ? 0 : 1;
+        test_fail("phase6-aspace", "task %u could not map its own page at %#lx: "
+                  "%s", w, (unsigned long)((w + 1) * 0x100000),
+                  aspace_map_why[w] == 1 ? "vmm_map_user refused it"
+                                         : "vmm_map_user claimed success but the "
+                                           "page is not in its own address space");
         return;
     }
 
