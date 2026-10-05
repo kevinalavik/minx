@@ -70,6 +70,9 @@ typedef struct {
     uint32_t      steals;
     uint32_t      migrations;
     uint32_t      idle_ticks;
+    uint32_t      claim_failed_reported;
+    uint32_t      self_returned_reported;
+    uint32_t      reentry_reported;
 } sched_cpu_t;
 
 static sched_cpu_t cpu[MAX_CPU_COUNT];
@@ -193,10 +196,27 @@ static void rq_remove(sched_cpu_t *c, task_t *t) {
  * queue, which is what stops two equal-weight tasks from taking turns in lock
  * step forever: each is chosen immediately after the other and neither ever sees
  * the other's work finish. */
-/* Walking a list of tasks is trusting every link in it.  The check costs a compare
- * against a value already in the cache and turns "followed a link into a node that is
- * not a task" into a report naming the node, which is the only way to tell a heap
- * pointer that found its way into `current` from any other corruption. */
+/* Walking a list of tasks is trusting every link in it, including the head.
+ *
+ * The head is the one that is easiest to get wrong and the hardest to notice, because
+ * a walk that starts on a node which is not on the list looks exactly like a walk that
+ * starts on a task with an odd state: the node's `state`, `weight` and `vruntime` are
+ * all read, all of them mean something, and none of them is a pointer.  That is how a
+ * heap address reaches `current` -- not by being *followed* to, but by already being
+ * the first thing the walk looks at.
+ *
+ * The check costs a compare against a value already in cache, and it turns "the list
+ * head is not a task on this list" into a report that names it. */
+static task_t *list_head_checked(task_t *head, task_t **list_head,
+                                 const char *what) {
+    if (head != NULL && head->list_tag != (uint64_t)(uintptr_t)list_head)
+        panic("smp: the %s starts at task %p, which is on the list at %p, not "
+              "this one\n", what, (void *)head,
+              (void *)(uintptr_t)head->list_tag);
+
+    return head;
+}
+
 static task_t *list_next_checked(task_t *t, task_t **head, const char *what) {
     task_t *next = t->next;
 
@@ -210,7 +230,8 @@ static task_t *list_next_checked(task_t *t, task_t **head, const char *what) {
 
 static task_t *rq_pick_fairest(sched_cpu_t *c) {
     task_t *best = NULL;
-    task_t *t = c->rq.head;
+    task_t *t = list_head_checked(c->rq.head, &c->rq.head, "run queue for "
+                                  "this processor");
 
     while (t != NULL) {
         task_t *next = list_next_checked(t, &c->rq.head, "run queue");
@@ -464,6 +485,7 @@ task_t *task_by_index(unsigned i) {
     t = all_tasks.head;
     for (unsigned n = 0; t != NULL && n < i; n++)
         t = t->all_next;
+
     ticket_unlock(&all_tasks.lock);
 
     return t;
@@ -642,6 +664,23 @@ void schedule(void) {
      * this processor from ever sleeping, because it would find the processor
      * "already switching" for as long as this task was away. */
     if (c->in_schedule) {
+        /* The flag exists so that a preemption arriving during a switch does not
+         * switch again, and `need_resched` is cleared on the way in, so returning
+         * here without setting it again *loses* the request that caused this call.
+         * That is not a dropped optimisation: the caller came here to sleep or to
+         * yield, so nothing is switched to, it returns still asleep, and the one
+         * thing that would have woken it is the very flag that was just cleared.
+         *
+         * So put the request back.  The outer schedule() clears the flag and switches
+         * on the way out, and the next tick acts on the request that was deferred. */
+        c->need_resched = 1;
+        if (!c->reentry_reported) {
+            c->reentry_reported = 1;
+            kprintf("sched: processor %u re-entered schedule() from %p while it "
+                    "was already switching (in_schedule was set); the request is "
+                    "deferred to the next tick\n", index,
+                    __builtin_return_address(0));
+        }
         irq_restore(flags);
         return;
     }
@@ -657,11 +696,18 @@ void schedule(void) {
     next = rq_pop(c);
     ticket_unlock(&c->rq.lock);
 
-    /* Nothing of its own: take someone else's, then fall back to idle. */
-    if (next == NULL)
+    /* Nothing of its own: take someone else's, then fall back to idle.  Which of
+     * the three the chosen task came from is recorded, because a chosen task that
+     * turns out not to be a task points at one of them and nothing else does. */
+    const char *source = "its own run queue";
+    if (next == NULL) {
         next = steal_any();
-    if (next == NULL)
+        source = "another processor's run queue (a steal)";
+    }
+    if (next == NULL) {
         next = c->idle;
+        source = "this processor's idle task";
+    }
 
     if (next == NULL) {
         c->in_schedule = 0;
@@ -671,7 +717,32 @@ void schedule(void) {
         return;
     }
 
+    /* The idle task is the fallback, so it is checked rather than assumed.  It is
+     * the one candidate that is not reached by walking a list, and a captured
+     * multi-processor run showed it is exactly the one that goes wrong: the task
+     * `schedule()` chose was `cpu[index].idle`, and it was not a task.  A
+     * non-NULL `idle` that does not look like a task means this processor's
+     * scheduler state has been overwritten, and saying which field is the whole
+     * difference between a bug report and a mystery. */
+    if (next == c->idle && next->is_idle != true)
+        panic("sched: processor %u's idle task is %p, and it is not an idle "
+              "task: state %d, weight %u, id %lu\n", index, (void *)next,
+              __atomic_load_n(&next->state, __ATOMIC_ACQUIRE), next->weight,
+              (unsigned long)next->id);
+
     if (next == prev) {
+        /* Getting yourself back is correct and it is what the idle task relies on:
+         * there is nothing else to run, so it must not spin looking for work.  For
+         * anything else it means a caller that called schedule() in order to sleep or
+         * yield returned without switching, and it is still asleep -- which is a bug
+         * with no symptom of its own.  So the idle task is the only one allowed to
+         * land here quietly. */
+        if (prev != NULL && !prev->is_idle && !c->self_returned_reported) {
+            c->self_returned_reported = 1;
+            kprintf("sched: processor %u chose the task it is already running "
+                    "(%lu, %s, state %d); it will not be switched away from\n",
+                    index, (unsigned long)prev->id, prev->name, prev->state);
+        }
         c->in_schedule = 0;
         irq_restore(flags);
         return;
@@ -679,10 +750,34 @@ void schedule(void) {
 
     /* Claiming the task is an atomic transition: if another processor got there
      * first it is not ours to run, and putting it back is the correct answer
-     * rather than an error. */
+     * rather than an error.
+     *
+     * "Putting it back" is the important half, and it is why `next` is popped before
+     * the claim rather than after: a task is off every queue while it is being
+     * claimed, so a failed claim cannot leave it on two of them.  If it was popped
+     * from another processor's queue by `steal_any()`, though, a failed claim does
+     * leave it on *no* queue, and the processor that stole it carries on with its own
+     * task instead -- which is a lost task, not a wrong one.
+     *
+     * So this is reported rather than swallowed.  A silent return here is
+     * indistinguishable, from the outside, from a scheduler with nothing to run: no
+     * switch happens, so a caller that called schedule() in order to sleep returns
+     * still marked asleep.  Reported once per processor, because a burst of them is
+     * one problem, not many. */
     int32_t runnable = TASK_RUNNABLE;
     if (!__atomic_compare_exchange_n(&next->state, &runnable, TASK_RUNNING,
                                      false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        c->need_resched = 1;      /* try again on the way out of the tick */
+        if (!c->claim_failed_reported) {
+            c->claim_failed_reported = 1;
+            kprintf("sched: [from %s] processor %u chose %p with state %d and id "
+                    "%lu, and could not claim it -- it is not a task, or another "
+                    "processor took it first.  This processor keeps its own task, so "
+                    "a caller that came here to sleep returns still asleep.\n",
+                    source, index, (void *)next,
+                    __atomic_load_n(&next->state, __ATOMIC_ACQUIRE),
+                    (unsigned long)next->id);
+        }
         c->in_schedule = 0;
         irq_restore(flags);
         return;
@@ -778,7 +873,9 @@ static void wake_sleepers(void) {
     unsigned n = 0;
 
     ticket_lock(&blocked.lock);
-    for (task_t *t = blocked.head; t != NULL && n < 16; ) {
+    for (task_t *t = list_head_checked(blocked.head, &blocked.head,
+                                       "blocked list");
+         t != NULL && n < 16; ) {
         /* The link to follow has to be taken *before* the removal, because
          * removing clears exactly that link -- reading it afterwards ends the walk
          * after one task, so a burst of sleepers would wake one per tick and the
