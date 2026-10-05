@@ -9,6 +9,7 @@
 #include "kprintf.h"
 #include "pagemap.h"
 #include "pmm.h"
+#include "task.h"
 #include "string.h"
 #include "types.h"
 
@@ -45,7 +46,29 @@ static struct {
 } vmm;
 
 bool vmm_active(void) { return vmm.active; }
-page_table_t *vmm_tables(void) { return &vmm.tables; }
+
+/* The kernel's own tables.  Fixed for the life of the kernel: this is what the
+ * direct map, the kernel image, the heap and every MMIO window are mapped into, and
+ * an application processor's trampoline needs it before there is a task at all. */
+page_table_t *vmm_kernel_tables(void) { return &vmm.tables; }
+
+/* The tables in use right now.
+ *
+ * The current task's own address space once there is one, and the kernel's own
+ * before that -- during boot, and on an application processor between arriving and
+ * entering the scheduler.  Every mapping, unmapping and walk below goes through this
+ * rather than through vmm_kernel_tables(), which is what makes a user mapping land in
+ * the address space of the task that asked for it and in no other.
+ *
+ * A kernel task carries the kernel's tables in its `tables` field, so for every
+ * kernel task the two are the same pointer and this is free. */
+page_table_t *vmm_tables(void) {
+    task_t *self = sched_current();
+
+    if (self != NULL && self->tables != NULL)
+        return self->tables;
+    return &vmm.tables;
+}
 
 /* Translate through the kernel's own tables.  Before vmm_init() there are none,
  * so this falls back to walking CR3, which at that point is the bootloader's. */
@@ -53,7 +76,7 @@ uint64_t vmm_translate(uint64_t virt) {
     if (!vmm.active)
         return vmm_walk_translate(virt, NULL);
 
-    pte_t leaf = pt_get(&vmm.tables, virt);
+    pte_t leaf = pt_get(vmm_tables(), virt);
     if (leaf == 0)
         return 0;
 
@@ -459,7 +482,7 @@ int vmm_map_kernel_virt(uint64_t virt, uint64_t phys, size_t bytes,
     if (!executable)
         flags |= PTE_NX;
 
-    if (!pt_map_range(&vmm.tables, virt, phys, span, flags))
+    if (!pt_map_range(vmm_tables(), virt, phys, span, flags))
         return -1;
 
     vmm.stats.kernel_pages += span / page_size;
@@ -472,7 +495,7 @@ int vmm_unmap_kernel_virt(uint64_t virt, size_t bytes) {
 
     size_t span = ALIGN_UP(bytes, page_size);
     for (size_t off = 0; off < span; off += page_size)
-        pt_unmap_page(&vmm.tables, virt + off);
+        pt_unmap_page(vmm_tables(), virt + off);
 
     if (vmm.stats.kernel_pages >= span / page_size)
         vmm.stats.kernel_pages -= span / page_size;
@@ -484,7 +507,7 @@ int vmm_set_nx_range(uint64_t virt, size_t bytes, bool nx) {
         return -1;
 
     for (size_t off = 0; off < ALIGN_UP(bytes, page_size); off += page_size) {
-        if (!pt_set_nx(&vmm.tables, virt + off, nx))
+        if (!pt_set_nx(vmm_tables(), virt + off, nx))
             return -1;
     }
     return 0;
@@ -499,7 +522,7 @@ int vmm_map_user(uint64_t virt, uint64_t phys, size_t bytes, bool writable) {
     if (writable)
         flags |= PTE_WRITE;
 
-    if (!pt_map_range(&vmm.tables, virt, phys, span, flags))
+    if (!pt_map_range(vmm_tables(), virt, phys, span, flags))
         return -1;
 
     vmm.stats.user_pages += span / page_size;
@@ -512,7 +535,7 @@ int vmm_unmap_user(uint64_t virt, size_t bytes) {
 
     size_t span = ALIGN_UP(bytes, page_size);
     for (size_t off = 0; off < span; off += page_size)
-        pt_unmap_page(&vmm.tables, virt + off);
+        pt_unmap_page(vmm_tables(), virt + off);
 
     if (vmm.stats.user_pages >= span / page_size)
         vmm.stats.user_pages -= span / page_size;

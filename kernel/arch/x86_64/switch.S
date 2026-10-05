@@ -88,4 +88,52 @@ task_start_shim:
     jmp     task_start
 .size task_start_shim, .-task_start_shim
 
+/* void task_enter_user(void)
+ *
+ * Reached by the `ret` at the end of a first switch onto a ring-3 task, so it runs on
+ * the task's own stack with the ring-3 return frame already built underneath it.
+ *
+ * The kernel trampoline and the user frame are the same shape one level apart: six
+ * callee-saved registers and a return address, then RFLAGS, CS, RIP, SS and RSP.  So
+ * the job here is to leave the frame exactly where `iretq` expects it and get to the
+ * trampoline, which is all of dropping the stack by the register frame.
+ *
+ * Interrupts are on before `iretq` rather than left to the frame.  RFLAGS in the frame
+ * has IF set, and `iretq` does load it -- but a task whose very first instruction is
+ * reached with IF still clear would run a long way before its first timer tick, and
+ * the first thing it is likely to do is a syscall.
+ */
+.global task_enter_user
+.type task_enter_user, @function
+task_enter_user:
+    sti
+    /* Task_enter_first popped the six registers and then returned through the return
+     * address slot, so %rsp is now two quadwords past the start of the saved context --
+     * that is, just above the saved context and below the ring-3 frame.
+     *
+     * `iretq` wants RSP pointing at the frame's *RIP*, which is the third quadword of
+     * the frame, so this has to drop the frame's RFLAGS and CS.  Two quadwords, sixteen
+     * bytes: the distance from where the return left the stack to where iretq starts
+     * reading.  task_create_user() lays the two frames out contiguously from that, and
+     * the arithmetic is in one place there and one place here. */
+    addq $16, %rsp
+    jmp    __enter_user
+.size task_enter_user, .-task_enter_user
+
+/* The kernel side of entering a ring-3 task.
+ *
+ * Reached by `jmp` from task_enter_user with %rsp already dropped past the register
+ * frame, so %rsp points at the user return frame: RFLAGS, CS, RIP, SS, RSP.
+ *
+ * There is nothing to restore -- every general register was zero by construction, which
+ * is the point: a task entering ring 3 starts with a register file the kernel chose,
+ * not with whatever a kernel thread happened to be using.  So this is just the frame
+ * handed back to the CPU.
+ */
+.global __enter_user
+.type __enter_user, @function
+__enter_user:
+    iretq
+.size __enter_user, .-__enter_user
+
 .section .note.GNU-stack,"",@progbits

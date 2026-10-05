@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "pagetables.h"
 #include "percpu.h"
 #include "spinlock.h"
 
@@ -54,6 +55,28 @@ typedef struct task {
     void        *stack;          /* the kernel stack, NULL if it uses its own */
     uint64_t     stack_top;
     uint64_t     saved_rsp;      /* the context: callee-saved regs and a ret */
+
+    /* This task's own address space, or NULL to mean the kernel's.
+     *
+     * NULL rather than a pointer to the kernel's tables for a kernel task, so that
+     * "is this a user task" is one comparison and does not have to compare against
+     * something that moves.  vmm_tables() is the only thing that should read it, and
+     * it turns NULL into the kernel's tables.
+     *
+     * Owned by the task: created with it, and released when the task is destroyed.
+     * Nothing in the scheduler shares one, because sharing one would mean a mapping
+     * one process makes appears in all of them. */
+    page_table_t *tables;
+
+    /* Set for a task that entered ring 3, so the exception and page-fault paths can
+     * tell a user address from a kernel one without trusting the faulting `cs`. */
+    bool         is_user;
+
+    /* The program's own idea of how it went, from its `exit`, and the top of its heap
+     * from `brk`.  Read by the self tests, and by /proc later; a task's exit status is
+     * the one piece of state a program cannot set for itself. */
+    int          exit_code;
+    uint64_t     brk;
 
     volatile int state;
     uint32_t     weight;
@@ -134,6 +157,22 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg,
                     uint32_t weight);
 task_t *task_create_idle(unsigned index);
 
+/* A new task that starts in ring 3.
+ *
+ * Its own address space is created for it, and its stack is laid out with a return
+ * frame that puts it in user code at `entry`: the user code selector in CS, the user
+ * data selector in SS, a user stack pointer at the top of its own stack, and IF set
+ * so its first interrupt is its own choice.
+ *
+ * `stack_pages` is rounded up to a whole number of pages, which are allocated, zeroed
+ * and mapped user-writable at the top of the user address space.  They are *not*
+ * mapped for the kernel: a kernel thread must not be able to write a user stack
+ * through the direct map, which is what CR4.SMAP is for.
+ *
+ * Returns NULL if the address space, the stack or the task cannot be allocated. */
+task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
+                         uint32_t weight);
+
 /* Put a task on some processor's run queue and make sure a processor is awake to
  * run it.  Wakes an idle processor if the one woken has nothing to do. */
 int  task_wakeup(task_t *t);
@@ -142,6 +181,16 @@ int  task_wakeup_on(unsigned index, task_t *t);
 /* Mark a task dead.  Its stack is not freed: there is nothing to free it into
  * safely, and a leaked 16 KiB is better than a use-after-free. */
 void task_exit(void);
+
+/* The two frames a user task starts with, and their sizes.
+ *
+ * A user task's stack holds, at the very top, the scheduler's saved context (six
+ * callee-saved registers and a return address) directly below which is the ring-3 return
+ * frame that `iretq` pops: RFLAGS, CS, RIP, SS, RSP.  task_create_user() writes both from
+ * these sizes, and task_enter_user() in switch.S adds USER_CTX_BYTES to the stack pointer
+ * to get from one to the other -- so they cannot drift apart silently. */
+#define USER_FRAME_BYTES  (5 * sizeof(uint64_t))
+#define USER_CTX_BYTES    (7 * sizeof(uint64_t))
 
 /* --- scheduling --------------------------------------------------------- */
 

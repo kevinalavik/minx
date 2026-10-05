@@ -32,8 +32,75 @@ int  vmm_init(void);
 /* True once CR3 points at the kernel's own tables. */
 bool vmm_active(void);
 
-/* The tables in use.  Only valid after vmm_init(). */
+/* The kernel's own tables.  Only valid after vmm_init().
+ *
+ * Named separately from vmm_tables() because they are two different questions:
+ * this one is "the tables the kernel was built with", which never changes and is
+ * what an application processor's trampoline needs before there is a task at all.
+ * vmm_tables() is "the tables in use right now", which is a task's own once user
+ * space exists. */
+page_table_t *vmm_kernel_tables(void);
+
+/* The tables in use right now: the current task's own address space, or the
+ * kernel's when nothing is running yet (during boot, and on an application
+ * processor between arriving and entering the scheduler).
+ *
+ * Everything that maps, unmaps or walks memory goes through this rather than
+ * through vmm_kernel_tables(), which is what makes a user mapping land in the
+ * address space of the task that asked for it and nothing else. */
 page_table_t *vmm_tables(void);
+
+/* --- address spaces ----------------------------------------------------- */
+
+/* A fresh address space: the kernel's upper half copied in, the lower half
+ * empty.
+ *
+ * Copying rather than sharing the top-level entries is deliberate.  The kernel
+ * lives at 0xffffffff80000000, which is PML4 slot 511, and user addresses live
+ * below 4 GiB, which is slot 0 -- so entries 256..511 can be shared by pointer
+ * between every address space and only slots 0..255 need to be per-process.
+ * They are not shared here, for one reason: `CR4.SMAP` and the whole point of
+ * SMAP is that a supervisor write through the direct map cannot reach a user
+ * page, which requires the two halves to be separate top-level entries
+ * genuinely separate -- and sharing them by pointer would put user mappings
+ * into the kernel's walk.  Sixteen pointers per space is cheaper than the
+ * subtlety.
+ *
+ * Returns 0 on success, -1 if a PML4 cannot be allocated. */
+int  vmm_address_space_create(page_table_t *out);
+
+/* Release a whole address space: every table it owns, and every user page.  The
+ * kernel half is left alone -- those tables are the kernel's.  It is not called by
+ * the scheduler; nothing exits a task yet -- but it is here because the
+ * page-fault handler's "user page" fixup path needs somewhere to put a page and
+ * a reader needs to know that a space can be thrown away. */
+int  vmm_address_space_destroy(page_table_t *tables);
+
+/* Load `tables` into CR3.  The caller is responsible for having flushed CR3's
+ * previous contents if anything it mapped has changed; a context switch between
+ * two address spaces does not need to, because the TLB is tagged with the CR3
+ * value that filled it. */
+void vmm_address_space_switch(page_table_t *tables);
+
+/* One zeroed, user-accessible page: allocate, zero, return its physical address,
+ * or 0 if there is no memory.  The mapping into an address space is the
+ * caller's business -- vmm_map_user() against the tables it wants. */
+uint64_t vmm_user_page_alloc(void);
+void     vmm_user_page_free(uint64_t phys);
+
+/* Where user space lives.  Chosen so a user pointer can never be mistaken for a
+ * kernel one, and so `((uint64_t)ptr >> 47)` is a reliable test: everything
+ * below 0x0000800000000000 is user, everything from 0xffff800000000000 up is
+ * the kernel. */
+#define USER_SPACE_END   0x0000800000000000ull
+#define USER_STACK_TOP    0x00007ffffffff000ull
+#define USER_STACK_SIZE   0x0000000000010000ull   /* 64 KiB */
+#define USER_IMAGE_BASE   0x0000000000400000ull   /* where a PT_LOAD is placed */
+
+static inline bool vmm_is_user_addr(uint64_t addr) {
+    return addr < USER_SPACE_END;
+}
+
 
 /* Map a device register window: uncacheable, present and writable, and not
  * user accessible.  Must be called before vmm_init() for the LAPIC and IOAPIC,

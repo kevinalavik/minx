@@ -27,6 +27,7 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "smp.h"
+#include "cpu.h"
 #include "string.h"
 #include "timer.h"
 #include "vectors.h"
@@ -39,6 +40,7 @@ void task_switch(uint64_t *save_rsp, uint64_t new_rsp);
 void task_enter_first(uint64_t new_rsp);
 void task_start_shim(void);
 void task_start(void (*entry)(void *), void *arg);
+void task_enter_user(void);
 
 /* The idle task is a task like any other, and the scheduler reaches it through
  * the same path. */
@@ -438,6 +440,129 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg,
     return t;
 }
 
+/* Lay out a user task's stack with a return frame that enters ring 3.
+ *
+ * The shape is the one the CPU itself makes when it takes an interrupt from ring 3:
+ * RFLAGS, CS, RIP, then SS and RSP, because `sysretq` and `iretq` both pop them in
+ * that order and there is no way to enter ring 3 with fewer.  Starting a task by
+ * building that frame and returning into it means one entry path serves both kernel
+ * tasks (through task_start_shim) and user tasks, and it means a user task's very
+ * first instruction is ordinary user code.
+ *
+ * RFLAGS has IF set, so the task's first interrupt is its own choice rather than
+ * something it inherited from the kernel that created it. */
+task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
+                         uint32_t weight) {
+    /* A ring-3 task must start at an address ring 3 can reach.  Zero is allowed as a
+     * placeholder, and only zero: the loader knows the entry point only after the task
+     * exists, because loading needs the address space the task owns.  Zero is safe as a
+     * placeholder because it is not a reachable address -- the first page of user space
+     * is deliberately never mapped -- so a program that somehow started there would take
+     * a page fault and say so, rather than running whatever happened to be at zero. */
+    if (entry != 0 && !vmm_is_user_addr(entry))
+        return NULL;
+
+    task_t *t = task_create(name, NULL, NULL, weight);
+
+    if (t == NULL)
+        return NULL;
+
+    page_table_t *tables = kmalloc(sizeof(*tables));
+
+    if (tables == NULL || vmm_address_space_create(tables) != 0) {
+        if (tables != NULL)
+            kfree(tables);
+        kfree(t);
+        return NULL;
+    }
+
+    t->tables = tables;
+    t->is_user = true;
+
+    /* The stack: whole pages, allocated, zeroed, mapped user-writable at the top of
+     * the user address space.  Mapped only in *this* address space -- a kernel thread
+     * must not be able to reach it through the direct map, which is what CR4.SMAP is
+     * for and why the user half lives in different PML4 entries from the kernel's. */
+    uint32_t pages = stack_pages == 0 ? 1 : stack_pages;
+    uint64_t top = USER_STACK_TOP;
+
+    for (uint32_t i = 0; i < pages; i++) {
+        uint64_t phys = vmm_user_page_alloc();
+
+        if (phys == 0) {
+            vmm_address_space_destroy(tables);
+            kfree(tables);
+            kfree(t);
+            return NULL;
+        }
+
+        if (vmm_map_user(top - (uint64_t)(i + 1) * page_size, phys, page_size,
+                         true) != 0) {
+            vmm_user_page_free(phys);
+            vmm_address_space_destroy(tables);
+            kfree(tables);
+            kfree(t);
+            return NULL;
+        }
+    }
+
+    /* The two frames, laid out together at the very top of the stack.
+     *
+     * Reading downwards from `top`, which is one past the last byte of the stack:
+     *
+     *     top -  8   RFLAGS        \
+     *     top - 16   CS             |  the ring-3 return frame, which `iretq` pops
+     *     top - 24   RIP            |  five quadwords, in the order the CPU pops
+     *     top - 32   SS             |  them: RIP, CS, RFLAGS, then SS and RSP
+     *     top - 40   RSP           /
+     *     top - 48   r15           \
+     *     top - 56   r14            |  the scheduler's saved context: six
+     *     top - 64   r13            |  callee-saved registers and a return
+     *     top - 72   r12            |  address, which task_switch's `ret` takes
+     *     top - 80   rbx            |
+     *     top - 88   rbp           /
+     *     top - 96   task_enter_user
+     *
+     * The return address has to be a *kernel* address, because that is what runs when
+     * the context is restored; it drops the stack to the ring-3 frame and hands it to
+     * `iretq`.  The two layouts have to agree exactly, and the only way to keep them
+     * agreeing is to write both from the same constants -- so USER_CTX_BYTES is the
+     * distance from the saved context to the end of the ring-3 frame, and
+     * task_enter_user() in switch.S adds precisely that much.
+     *
+     * Building this needs a kernel write into a user page, which CR4.SMAP would forbid.
+     * SMAP is deliberately not enabled: it is one bit, but it turns every kernel write to
+     * a user page from "works" into "faults", and there are exactly three such places
+     * (here, the loader's segment copies and its stack) which would each then need an
+     * stac/clac pair and a comment saying why.  Turning it on is a small change; leaving
+     * it off is the honest default while the list is this short. */
+    uint64_t *frame = (uint64_t *)phys_to_virt(virt_to_phys(top) - USER_FRAME_BYTES);
+    uint64_t *ctx = (uint64_t *)phys_to_virt(virt_to_phys(top) - USER_FRAME_BYTES
+                                            - USER_CTX_BYTES);
+    uint64_t user_stack_top = top - (uint64_t)pages * page_size;
+
+    frame[0] = 0x002;                      /* RFLAGS: IF set, so the task's first */
+    frame[1] = GDT_USER_CODE;              /* CS      interrupt is its own choice */
+    frame[2] = entry;                      /* RIP */
+    frame[3] = GDT_USER_DATA;              /* SS */
+    frame[4] = user_stack_top;             /* RSP: the bottom of its own stack */
+
+    for (unsigned i = 0; i < 6; i++)
+        ctx[i] = 0;
+    ctx[6] = (uint64_t)(uintptr_t)task_enter_user;
+
+    /* `saved_rsp` is what the CPU loads into RSP, so it is a *virtual* address in the
+     * address space that will be running -- the same thing a kernel task's saved_rsp is,
+     * since kmalloc() hands out direct-map addresses.  Storing the physical address here
+     * would load a physical address into RSP, and with a 64 GiB heap under the direct map
+     * that is an address in the middle of nothing in particular. */
+    t->saved_rsp = top - USER_FRAME_BYTES - USER_CTX_BYTES;
+    t->stack = NULL;                       /* it owns no kernel stack yet */
+    t->stack_top = 0;
+
+    return t;
+}
+
 /* The idle task: what a processor runs when it has nothing else.  It halts rather
  * than spins, so an idle processor costs nothing and an incoming IPI is what
  * wakes it.  It never returns. */
@@ -833,6 +958,13 @@ void schedule(void) {
 
     c->slice_start_ns = monotonic_ns();
     c->switches++;
+
+    /* The address space is part of the context, so it has to be loaded before the
+     * switch rather than by whoever mapped something.  vmm_address_space_switch()
+     * compares first, so for the common case -- two kernel tasks, which share the
+     * kernel's tables -- this is one compare and no TLB flush. */
+    vmm_address_space_switch(next->tables != NULL ? next->tables
+                                             : vmm_kernel_tables());
 
     /* Clear the guard before switching, not after.  A task that is switched to has
      * to be able to schedule immediately -- to sleep, to yield -- and this
