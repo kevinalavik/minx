@@ -1,9 +1,11 @@
 # STATUS
 
-Current phase: 5 (scheduler) — phases 1 to 4 VERIFIED; the scheduler works and its
-six tests pass, but an intermittent multi-processor fault keeps the phase from
-being marked VERIFIED. See "Known bugs / gaps" for exactly what is and is not
-proven, and start there.
+Current phase: 5 (scheduler) — phases 1 to 4 VERIFIED. The scheduler is built and
+its six tests pass, but `make test` is only about 80% clean at `-smp 4` (11 of 14
+runs), so phase 5 is **not** VERIFIED and must not be marked so until it is. The
+fault has been reduced from "an unexplained hang" to two named ones; "Known bugs /
+gaps" says exactly what is known, what is ruled out, and what to try next. Start
+there, not at the top.
 
 ## Phases
 | # | Phase | State | Evidence / command |
