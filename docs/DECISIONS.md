@@ -468,3 +468,82 @@ the kernel can produce. With the guard the same run says
 A weight that is zero, or above `TASK_WEIGHT_MAX`, cannot come from any path that
 creates a task, so the check is not papering over a case the scheduler should allow.
 It converts a fault with no explanation into a report naming what is wrong.
+
+## 2026-10-05 — The syscall door is `int $0x80`, not `syscall`
+Decision: a program reaches the kernel through vector 128 with `int $0x80`, through
+the ordinary interrupt path, and returns with `iretq`.
+Alternatives: `syscall`/`sysretq` with STAR, LSTAR and SFMASK, which is the better
+instruction and is where this should end up.
+Reason: `syscall` derives its CS and SS from STAR[63:48] + 16 and + 8, and `sysretq`
+derives them from R11[47:32] and + 8. That forces the code and data selectors into a
+particular order in the GDT in *both* directions: kernel data eight below kernel code,
+and user code eight below user data. This kernel's GDT has the usual order — kernel
+code below kernel data, user data below user code — so making `syscall` work means
+reordering the GDT around an instruction rather than around a layout that other code
+already assumes.
+
+`int $0x80` costs one interrupt instead of one instruction and gets the TSS's RSP0
+stack switch for free, which is exactly what a syscall needs and which `syscall` does
+not do at all. Reusing the existing stub, dispatcher and frame means the privilege
+transition cannot get subtly wrong in a way that has no test, and the return is
+`iretq`, which is the only return a `regs_t` frame can express.
+
+Revisiting this means reordering the GDT, which is a real piece of work: the descriptors
+are built in `gdt_init()` and the TSS descriptors are per processor and indexed
+alongside them. It is the right change and it is not this phase's.
+
+## 2026-10-05 — A program's pointers are checked by walking, not by faulting
+Decision: `syscall_user_range_ok()` walks the running task's own page tables and checks
+every page of a range — present, user-accessible, and writable for a write — before
+anything dereferences it.
+Alternatives: fault and recover, catching the fault in the handler and re-running the
+copy; a per-address-space region registry to check ranges against instead of tables.
+Reason: a walk is exact. A fault-and-recover needs the fault handler to distinguish "this
+fault was mine, on purpose, on an address I was told to touch" from "a bug in the kernel",
+which is a distinction every future fault handler has to make correctly and forever; and
+it has to re-run the faulting instruction, which for a string copy is a partially
+completed one. The walk is ~10 instructions per page, needs no state, and a range it
+rejects is a range that would have faulted.
+
+This is also why the boundary has no `stac`/`clac` pair in it. Walking the tables does
+not dereference the user address at all, so the one thing SMAP exists to prevent cannot
+happen here — where a syscall actually *writes* to a user buffer is `writev`, and that
+one does need it, and does it later.
+
+## 2026-10-05 — Vectors a ring-3 task can receive are opened to DPL 3
+Decision: the local APIC timer gate and the reschedule and wake IPI gates are DPL 3. The
+exception gates stay DPL 0.
+Alternatives: DPL 3 for everything above 32; a separate "return to user" trampoline per
+vector; leaving them DPL 0 and hoping the timer never fires.
+Reason: a gate's DPL is checked against the privilege level of the *interrupting* code.
+The timer is what catches this out — one millisecond after a ring-3 task starts, the
+LAPIC timer fires, and through a DPL-0 gate that is a #GP, which kills the program and
+reads as a loader bug rather than as a privilege problem. The two IPIs are the ones a
+scheduler sends to a processor that may be running user code.
+
+Exceptions are deliberately left closed. The CPU delivers an exception through a DPL-0
+gate *even when it came from ring 3*, so a user fault still gets to its handler; what DPL
+0 prevents is user code raising a chosen *vector* on demand with a frame it controls.
+That is a real protection, and the syscall door is reachable by `int` because `int`
+deliberately does check DPL — so the syscall gate is opened on purpose and everything
+else is not.
+
+Opening the timer gate means user code can `int $0x30` deliberately. Both handlers are
+safe against a frame it controls: the tick handler counts, charges the current task and
+preempts it, and the reschedule handler drains a per-CPU work slot, and all of that is the
+kernel's own state rather than anything read out of the frame.
+
+## 2026-10-05 — CR4.SMAP is left off, on purpose and with a count
+Decision: `pt_write_cr4()` does not set SMAP. Kernel code builds user page tables and
+writes into user pages through the direct map.
+Alternatives: set SMAP now and put `stac`/`clac` around the three places that need it.
+Reason: SMAP turns every kernel write to a user page from "works" into "faults", and
+there are exactly three such places — the loader's segment copies, its initial stack, and
+`task_create_user()`'s return frame. Each would need an `stac`/`clac` pair and a comment
+explaining why, and the thing SMAP protects against is already handled better: a program's
+pointer never reaches the kernel unchecked, because `syscall_user_range_ok()` refuses it
+before it is dereferenced.
+
+A short list is the argument for turning it off now. The list gets longer as phase 7 adds
+COW, a real heap and a growing stack, and at that point the pairs outnumber the
+protections. The decision to revisit it is written down where the three sites are.
