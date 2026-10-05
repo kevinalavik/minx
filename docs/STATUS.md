@@ -223,6 +223,18 @@ looked like it was working.
 - **Self tests**: thirty-four in-kernel checks (`minx.test=1`) plus a
   host-compiled allocator fuzz test (`make test-host`).
 
+## Framebuffer evidence, this build
+`sh tools/shot.sh build/minx.iso build/run-screen.ppm 22 -smp 4` on this tree: the
+graphical console shows the whole boot -- memory map and direct map, framebuffer at
+1280x800, ACPI tables, LAPIC and IOAPIC, both timers calibrated, per-CPU data for four
+processors, `sched: run queues for 4 processor(s), boot task 1, idle tasks 2`, the
+keyboard reading a scancode, and the shell prompt with its command list.
+
+The lines that look shuffled are the known `kprintf` lock gap, cosmetic and documented
+under "Known bugs / gaps"; they are four processors announcing themselves at once and the
+text is intact, just interleaved. `build/test-screen.png` is the same console after the
+scrolling test, which fills all 109 lines and scrolls correctly.
+
 ## The two remaining failures, exactly
 
 `make test` -> **36 of 38 PASS**, `TEST-READY` reached, clean shutdown, no panic. The two
