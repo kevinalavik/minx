@@ -289,6 +289,41 @@ looked like it was working.
     carrying the run ISO's `limine.conf`, so `minx.test=1` was never passed and
     `make test` sat until the harness timed out reporting "the guest never reached
     TEST-READY". Each ISO now stages into its own.
+  - **The cause, and the reason this entry is long: a preempted task is published to a run
+    queue before its context is finished.** `schedule()` requeues the old task *before* it
+    switches, and between the requeue and the switch there is a window -- a lock
+    acquisition, an address-space load -- in which the old task's saved stack pointer still
+    refers to a frame on the *preempting* processor's stack. A second processor that claims
+    it in that window switches to a context that is not finished: the registers and the stack
+    pointer come from wherever the preemptor had got to. A task running that way resumes
+    with the preemptor's registers, and the first thing anyone notices is a `task_t *` that
+    has become a kernel text address -- which is exactly what `cpu[index].idle` was observed
+    holding, and why the same corruption showed up three different ways (a kernel text
+    address, a heap payload, and a task whose `weight` was zero).
+  - **The fix is known and is not in the tree.** Finish the context *before* publishing the
+    task: split the switch into a save half and a restore half, and order them so that
+    between them the old task is saved, then published, then the new one restored. That is
+    not a cosmetic change to `task_switch` -- it moves the saved context out of the stack and
+    into the task, because a stack-based context is not finished until the instant it is
+    restored from, and the scheduler has to do work in between.
+  - **An attempt at that fix was made, broke the boot, and was reverted.** It is preserved in
+    `git stash` ("save-then-publish scheduler switch"); nothing committed was touched and
+    HEAD boots and reaches the graphical shell. Three mistakes were made in it, recorded here
+    because each is easy to repeat:
+    1. Publishing with a non-claimable `TASK_SWITCHING` state **deadlocks**: no picker will
+       take the task, and it only becomes claimable when it is resumed, which requires being
+       picked.
+    2. Splitting `task_switch` into a save half that *returns* leaves the six saved
+       registers **below** `schedule()`'s stack pointer, where the bookkeeping that follows
+       overwrites them. The context has to live in the task, not on the stack.
+    3. Even with the context in `task_t.regs`, a never-run task needs *both* context forms
+       populated. `task_stack_init()` builds the stack frame for `task_enter_first()`; if
+       `regs[]` is left zero then a restore loads `RSP = 0` and the machine triple-faults on
+       the first instruction -- which is what `-d int,cpu_reset` showed.
+    After (3) the fault moved to `vmm_address_space_switch()` being handed a `task->tables`
+    of `0x542618c3`, so there is at least one more cause behind it that the attempt did not
+    reach. **The next attempt should start from the stash and fix all three together, not one
+    at a time.**
   **Also ruled out, by experiment.**
   - A stack overflow: task and application-processor stacks were raised from 16 KiB to
     32 KiB and the fault did not change. A guard word at the bottom of every task
