@@ -27,6 +27,7 @@
 #include "power.h"
 #include "serial.h"
 #include "smp.h"
+#include "syscall.h"
 #include "task.h"
 #include "string.h"
 #include "test.h"
@@ -577,6 +578,13 @@ static void kmain_stage2(void) {
      * it. */
     if (keyboard_init() != 0)
         kwarn("no keyboard: the graphical console will not accept typing");
+
+    /* The user/kernel boundary, before anything can enter it: the gate has to be
+     * installed with its DPL before a program's first `int $0x80`, and a gate that is
+     * not there yet turns into a #GP that looks like a broken program. */
+    if (syscall_init() != 0)
+        kwarn("syscalls: the syscall gate could not be installed; no program "
+              "will be able to enter the kernel");
 
     /* Interrupts on, before anything that can wait for one.
      *

@@ -35,6 +35,14 @@
 #define VECTOR_IPI_FIRST    VECTOR_IPI_TLB
 #define VECTOR_IPI_LAST     VECTOR_IPI_WAKE
 
+/* The syscall door: reached from ring 3 with `int $0x80`.
+ *
+ * 128 rather than one of the architectural numbers because the low 32 vectors are
+ * the CPU's own, 0x20..0x2f are the remapped device lines, and 0x30..0x37 are this
+ * kernel's local APIC sources.  128 is the traditional Unix syscall vector, it is
+ * outside every one of those, and nothing else claims it. */
+#define VECTOR_SYSCALL     0x80
+
 /* Architectural vectors delivered by the local APIC itself. */
 #define VECTOR_LAPIC_INIT     0xfd
 #define VECTOR_LAPIC_STARTUP  0xfe

@@ -95,6 +95,21 @@ ISR_NOERR 61
 ISR_NOERR 62
 ISR_NOERR 63
 
+/* Vector 128 is the syscall door, reached from ring 3 with `int $0x80`.
+ *
+ * It goes through the ordinary interrupt path -- the same stub, the same dispatcher,
+ * the same frame layout -- and returns with `iretq` like any other interrupt.  That
+ * is a deliberate choice over `syscall`, and the reason is in docs/DECISIONS.md: the
+ * `syscall` instruction derives its CS and SS from STAR[63:48] + 16 and + 8, and
+ * `sysretq` derives them from R11[47:32] and + 8, which forces the code and data
+ * selectors to sit in a particular order in the GDT in *both* directions.  This
+ * kernel's GDT has kernel-code below kernel-data and user-data below user-code, the
+ * usual order, so making `syscall` work would mean reordering the GDT for it.
+ *
+ * `int $0x80` also gets the TSS's RSP0 stack switch for free, which is exactly what
+ * a syscall needs and which `syscall` does not do at all. */
+ISR_NOERR 128
+
 /* Common tail: the stub has already pushed the vector (and error code).  Fill
  * in the remaining registers in exactly the order regs_t declares them, align
  * the stack for the System V ABI, call the dispatcher, and if it returns,

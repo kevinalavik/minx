@@ -10,6 +10,7 @@
 #include "panic.h"
 #include "string.h"
 #include "types.h"
+#include "vectors.h"
 
 typedef struct __attribute__((packed)) {
     uint16_t limit_low;
@@ -413,6 +414,29 @@ void idt_init(void) {
         idt_set_gate(exception_table[i].vector, exception_table[i].handler,
                      exception_table[i].ist, 0);
     }
+
+    /* Vectors a ring-3 task can *receive* must be reachable from ring 3.
+     *
+     * A gate's DPL is checked against the privilege level of the *interrupting* code, and
+     * the timer is the first thing that catches a user program out: one millisecond after
+     * it starts, the LAPIC timer fires, and if its gate is DPL 0 the CPU takes #GP instead
+     * of the tick.  That is not a cosmetic difference -- it kills the program, and it kills
+     * it a millisecond in, so it looks like a loader bug.
+     *
+     * So the timer and the two IPIs a scheduler can send to a processor that might be
+     * running user code are opened to DPL 3.  The exception gates stay at DPL 0 on purpose:
+     * the CPU delivers an exception through a DPL-0 gate even when it came from ring 3, and
+     * leaving them closed means user code cannot raise a *vector* on demand -- only the
+     * architectural `int` instruction, which is how the syscall door works.
+     *
+     * Opening the timer gate to ring 3 means user code can also `int $0x30` deliberately.
+     * Both handlers are safe against a frame it controls: the tick handler counts, charges
+     * the current task and preempts it, and the reschedule handler drains a per-CPU work
+     * slot, all of which are the kernel's own state rather than anything read out of the
+     * frame. */
+    idt_set_gate(VECTOR_LAPIC_TIMER, isr_stub_48, 0, 3);
+    idt_set_gate(VECTOR_IPI_RESCHED, isr_stub_52, 0, 3);
+    idt_set_gate(VECTOR_IPI_WAKE, isr_stub_54, 0, 3);
 
     idt.ptr.limit = sizeof(idt.entries) - 1;
     idt.ptr.base = (uint64_t)idt.entries;
