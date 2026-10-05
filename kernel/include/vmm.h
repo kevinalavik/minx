@@ -137,6 +137,17 @@ int  vmm_release_boot_tables(void);
 /* User-space mappings.  Phase 6 fills these in; they exist now so the layout
  * and the page fault handler's user/kernel split can be tested. */
 int  vmm_map_user(uint64_t virt, uint64_t phys, size_t bytes, bool writable);
+
+/* As vmm_translate(), but into a named address space rather than the running task's. */
+uint64_t vmm_translate_in(page_table_t *tables, uint64_t virt);
+
+/* As vmm_map_user(), but into a named address space rather than the running task's.
+ *
+ * Needed by the ELF loader, which fills in a task's address space before that task has
+ * ever been scheduled: vmm_map_user() would map into the loader's own tables, succeed,
+ * and leave the program with no code at its entry point. */
+int  vmm_map_into(page_table_t *tables, uint64_t virt, uint64_t phys, size_t bytes,
+                  bool writable);
 int  vmm_unmap_user(uint64_t virt, size_t bytes);
 
 /* Total pages mapped, for /proc/meminfo and the phase-11 accounting check. */

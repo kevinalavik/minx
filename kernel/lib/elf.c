@@ -57,8 +57,22 @@ static bool in_range(size_t total, uint64_t off, size_t len) {
  * `.bss`.  The writes go through the direct map, which is a supervisor write to a user
  * page -- exactly what CR4.SMAP would forbid, and deliberately not enabled yet for the
  * reason task_create_user() records. */
-static bool load_segment(const uint8_t *image, uint64_t virt, uint64_t filesz,
-                         uint64_t memsz, bool writable) {
+/* Map a segment's pages into `tables`, not into the address space of whoever happens to
+ * be running.
+ *
+ * `vmm_map_user()` maps through vmm_tables(), which is the *running* task's tables.  For
+ * everything else in the kernel that is the right answer, and it is the reason nothing
+ * has to pass an address space around.  It is the wrong answer here: a program's image
+ * is loaded into the new task's address space, long before that task has ever been
+ * scheduled, so it goes into the loader's own tables instead -- and then the program
+ * starts on page tables that have no code in them and faults on its first instruction,
+ * with a loader that reported success.
+ *
+ * The copy side is done through the direct map of the frame just allocated, which is
+ * reachable from any address space, so only the mapping needed the address space passed
+ * in. */
+static bool load_segment(page_table_t *tables, const uint8_t *image, uint64_t virt,
+                         uint64_t filesz, uint64_t memsz, bool writable) {
     if (memsz == 0)
         return true;
 
@@ -70,10 +84,19 @@ static bool load_segment(const uint8_t *image, uint64_t virt, uint64_t filesz,
     for (size_t off = 0; off < span; off += page_size) {
         uint64_t phys = vmm_user_page_alloc();
 
-        if (phys == 0)
+        /* Every one of these used to be a bare `return false`, so a program that would
+         * not load produced one line saying it would not load and nothing about why.  A
+         * loader that fails silently is indistinguishable from one that was never asked
+         * to load anything. */
+        if (phys == 0) {
+            kprintf("elf: out of frames mapping %#lx+%lu\n", (unsigned long)(virt + off),
+                    (unsigned long)memsz);
             return false;
+        }
 
-        if (vmm_map_user(virt + off, phys, page_size, writable) != 0) {
+        if (vmm_map_into(tables, virt + off, phys, page_size, writable) != 0) {
+            kprintf("elf: could not map %#lx into %p\n",
+                    (unsigned long)(virt + off), (void *)tables);
             vmm_user_page_free(phys);
             return false;
         }
@@ -116,10 +139,61 @@ static bool load_segment(const uint8_t *image, uint64_t virt, uint64_t filesz,
 static bool build_stack(task_t *t, uint64_t entry, const char *path,
                         uint32_t stack_pages, uint64_t *entry_rsp) {
     uint64_t top = USER_STACK_TOP;
-    uint64_t bottom = top - (uint64_t)stack_pages * page_size;
 
-    uint8_t *base = (uint8_t *)phys_to_virt(virt_to_phys(bottom));
+    /* The kernel alias of the stack, which is the only way to reach it: the pages are
+     * mapped in this task's address space alone, so there is nothing in the kernel's own
+     * tables to translate `bottom` through.  `virt_to_phys()` cannot be used on it --
+     * that subtracts the direct-map offset, so applied to a user address it wraps, and
+     * adding the offset back lands in the hole just below the kernel image.  Which is
+     * where this used to write: the argv/envp/auxv block went below the kernel image and
+     * the real stack was never zeroed, so the program was entered with a stack pointer
+     * into a hole. */
+    if (t->user_stack_phys == 0) {
+        kprintf("elf: task %lu has no recorded user stack frame\n",
+                (unsigned long)t->id);
+        return false;
+    }
+
+    uint8_t *base = (uint8_t *)phys_to_virt(t->user_stack_phys);
     uint64_t cap = (uint64_t)stack_pages * page_size;
+
+    /* The top of the stack belongs to the two frames, not to the program.
+     *
+     * task_create_user() put the scheduler's saved context and the ring-3 return frame at
+     * the very top of the stack, and this function lays out argc/argv/envp/auxv and the
+     * argument strings from the top down.  Those two layouts overlap completely: the
+     * strings landed at top-16 and the auxiliary vector at top-144..top-16, straight over
+     * the saved context (top-96..top-40) and over CS, RFLAGS and SS.  Only RIP and RSP are
+     * written again afterwards, by the caller, so the frame ended up half right: `iretq`
+     * popped the right entry point with the CPU's own CS and a selector built out of two
+     * words of auxiliary vector, which is a #GP before the program's first instruction.
+     *
+     * Nothing here is allowed to reach the frames, so the region below them is what gets
+     * laid out and zeroed, and the program's stack pointer starts inside it. */
+    uint64_t frames = USER_FRAME_BYTES + USER_CTX_BYTES;
+    uint64_t usable = cap - frames;
+
+    if (usable == 0 || usable > cap) {
+        kprintf("elf: a %u-page stack is too small for the initial frames\n",
+                (unsigned)stack_pages);
+        return false;
+    }
+
+    /* The alias has to be the frame that is actually mapped at the bottom of this stack,
+     * or everything below writes to one region and the program reads another.  The
+     * difference would show up as a fault in the program's first stack access with
+     * nothing pointing back here, so it is checked against the task's own page table --
+     * which is the only place the mapping is written down.  It cannot be checked through
+     * vmm_translate(), which translates through the *running* task's tables, and the
+     * loader runs long before this task has ever been scheduled. */
+    pte_t leaf = pt_get(t->tables, top - cap);
+
+    if (leaf == 0 || pte_phys(leaf) != t->user_stack_phys) {
+        kprintf("elf: the frame at the bottom of the stack is %s, expected %#lx\n",
+                leaf == 0 ? "not mapped" : "the wrong frame",
+                (unsigned long)t->user_stack_phys);
+        return false;
+    }
 
     size_t path_len = strnlen(path, 4096);
 
@@ -146,20 +220,30 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
 
     /* 256 bytes of slack below the block so a program's first few frames cannot walk
      * off the bottom of the stack into whatever the allocator gave us. */
-    if (block_bytes + strings_bytes + 256 > cap)
+    if (block_bytes + strings_bytes + 256 > usable)
         return false;
 
-    memset(base, 0, cap);
+    memset(base, 0, usable);
 
-    /* The strings, at the top of the stack. */
-    uint8_t *p = base + cap - strings_bytes;
+    /* The strings, at the top of the region the program owns. */
+    uint8_t *p = base + usable - strings_bytes;
     memcpy(p, path, path_len);
     p[path_len] = 0;
 
-    uint64_t argv0_addr = (uint64_t)(uintptr_t)p;
+    /* The *addresses the program will see* are offsets into its own stack, not offsets
+     * into the kernel's alias of it.  These two were computed from the alias, so the
+     * program was entered with a stack pointer into the direct map and an argv[0] pointer
+     * into the direct map -- and `iretq` loading a kernel address into RSP for a ring-3
+     * task is a #GP before the first instruction, with nothing to say which field of a
+     * loader was wrong.
+     *
+     * So the alias is used only to *write*; everything the program will read back is
+     * expressed against the user address of the stack. */
+    uint64_t stack_base = top - cap;
+    uint64_t argv0_addr = stack_base + (uint64_t)(p - base);
 
     /* The block, ending just below the strings. */
-    uint8_t *q = base + cap - strings_bytes;
+    uint8_t *q = base + usable - strings_bytes;
     q -= (uint64_t)naux * 16;
     memcpy(q, auxv, (size_t)naux * 16);
 
@@ -170,8 +254,18 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
 
     /* The ABI wants 16-byte alignment at the first call, so the stack pointer is
      * aligned here rather than where the arithmetic happens to land. */
-    uint64_t sp = (uint64_t)(uintptr_t)q;
+    uint64_t sp = stack_base + (uint64_t)(q - base);
     sp &= ~15ull;
+
+    /* And it has to land inside the program's own region: below the frames, and not off
+     * the bottom of the stack.  The frames occupy [top - frames, top), so the region is
+     * everything under top - frames. */
+    if (sp > top - frames || sp < top - cap) {
+        kprintf("elf: the initial stack pointer %#lx is outside the region the "
+                "program owns ([%#lx, %#lx))\n", (unsigned long)sp,
+                (unsigned long)(top - cap), (unsigned long)(top - frames));
+        return false;
+    }
 
     t->brk = BRK_START;
     t->exit_code = -1;
@@ -238,7 +332,7 @@ elf_load_result_t elf_load(const void *image, size_t image_bytes, task_t *t,
             return (elf_load_result_t){ 0, 0, 0, 0, 0, false };
         }
 
-        if (!load_segment(base + ph->p_offset, ph->p_vaddr, ph->p_filesz,
+        if (!load_segment(t->tables, base + ph->p_offset, ph->p_vaddr, ph->p_filesz,
                           ph->p_memsz, (ph->p_flags & PF_W) != 0))
             return (elf_load_result_t){ 0, 0, 0, 0, 0, false };
 
@@ -258,10 +352,14 @@ elf_load_result_t elf_load(const void *image, size_t image_bytes, task_t *t,
      * succeeds, and the mapping below is the fallback for a link that does not put them
      * there.  Mapping them unconditionally would be simpler and would quietly discard
      * whatever the first segment had put at that address. */
-    if (!vmm_translate(phdr_vaddr) || !syscall_user_range_ok(phdr_vaddr, 16, false)) {
+    /* Asked of *this task's* tables.  Asked of the running task's -- which is the loader's
+     * own -- the answer is always "not mapped", so this fallback always ran, and it maps
+     * over a page the first segment has already put there. */
+    if (!vmm_translate_in(t->tables, phdr_vaddr) ||
+        !syscall_user_range_ok_in(t->tables, phdr_vaddr, 16, false)) {
         size_t phbytes = ALIGN_UP((size_t)eh->e_phnum * ELF64_PHDR_SIZE, page_size);
 
-        if (!load_segment(base + eh->e_phoff, phdr_vaddr,
+        if (!load_segment(t->tables, base + eh->e_phoff, phdr_vaddr,
                           (uint64_t)eh->e_phnum * ELF64_PHDR_SIZE, phbytes, false)) {
             kprintf("elf: could not map the program headers at %#lx\n",
                     (unsigned long)phdr_vaddr);

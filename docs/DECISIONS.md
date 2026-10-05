@@ -661,3 +661,95 @@ above where that address is. One `ret` unwinds the callback and then falls throu
 the saved `r15` and executes it — which kills the machine before the first processor has
 finished announcing itself. Cost: one build-and-run cycle to find, and it is exactly the
 kind of thing that reads as a scheduler bug in the log.
+
+## 2026-10-05 — Six faults in the userspace path, all the same mistake in five places
+Decision: implemented, with one thing deliberately left undone.
+
+The recurring mistake is now identifiable, and naming it is worth more than any single
+fix: **"map or read something in an address space, using the running task's tables."**
+`vmm_tables()` is the running task's, and that is the right answer almost everywhere --
+it is the reason nothing has to pass an address space around. It is the wrong answer
+exactly when the thing being mapped or read belongs to a task that is not running yet,
+or is not the running task. Five places did it:
+
+- `task_create_user()` mapped the new task's stack through `vmm_map_user()`, so the stack
+  went into the creator's address space. The task was created with a stack nothing could
+  reach: its own tables had no entry for the address, and the walk over those tables
+  correctly said nothing was mapped there -- so the first access faulted while the check
+  said everything was fine.
+- `elf.c`'s `load_segment()` did the same with the program's image, so a program was
+  loaded with no code at its entry point.
+- `elf.c`'s `build_stack()` computed its kernel alias with `virt_to_phys()` applied to a
+  *user* address. That subtracts the direct-map offset, so it wraps, and `phys_to_virt()`
+  of the result lands in the hole just below the kernel image. The argv/envp/auxv block
+  was written there, the real stack was never zeroed, and `entry_rsp` handed to `iretq`
+  was a direct-map address.
+- `elf.c`'s `build_stack()` also produced `entry_rsp` and `argv0_addr` in the kernel
+  alias. The program was entered with a stack pointer into the direct map -- which
+  `iretq` rejects with a #GP -- and with `argv[0]` pointing into the kernel.
+- `elf.c`'s program-header fallback asked `vmm_translate()` and
+  `syscall_user_range_ok()` whether the headers were mapped, i.e. asked the *loader's*
+  tables, always got "not mapped", and went on to map over a page the first segment had
+  already placed.
+
+The fix is additive rather than a change of convention: `vmm_map_into()`,
+`vmm_translate_in()` and `syscall_user_range_ok_in()` take the address space, and
+`vmm_map_user()`/`vmm_translate()`/`syscall_user_range_ok()` are now one-line wrappers
+around them that pass the running task's. Nothing that was right before is different, and
+each of the five call sites says why it needs the explicit one.
+
+Three more, which are not that mistake but are worth recording because each produced a
+symptom that pointed somewhere else entirely:
+
+- **The ring-3 return frame was written backwards.** `iretq` pops RIP, CS, RFLAGS, SS and
+  RSP, each one quadword above the last. `task_create_user()` wrote RFLAGS, CS, RIP, SS,
+  RSP and compensated in `task_enter_user()` by advancing %rsp to reach RIP in the middle
+  of the frame. That put RIP in the right slot by coincidence and left CS holding the SS
+  selector, with SS and RSP read from above the frame.
+- **The selectors had RPL 0.** `iretq` takes the new CPL from the RPL of CS, so a frame
+  built with `0x20`/`0x18` does not drop privilege at all: it pops RIP, CS and RFLAGS,
+  stops, and leaves SS and RSP on the stack. The task ran its first instruction in ring 0.
+  `GDT_USER_CODE_RPL3` and `GDT_USER_DATA_RPL3` are the same descriptors at RPL 3; the
+  index used to reach them is `selector >> 3`, so the RPL does not change which entry it is.
+- **The loader's initial stack block was written over both frames.** `build_stack()` lays
+  out argc/argv/envp/auxv and the argument strings from the top of the stack down, and
+  `task_create_user()` had put the saved context and the ring-3 frame at the very top.
+  The two layouts overlapped completely: the strings landed at `top-16` and the auxiliary
+  vector at `top-144..top-16`, over the saved context and over CS, RFLAGS and SS. Only RIP
+  and RSP were rewritten afterwards, so the frame came out half right -- the right entry
+  point with a CS selector built out of two words of auxiliary vector. The frames now own
+  the top of the stack and the program's region is everything below them.
+
+And one design change that the last of those made unavoidable:
+
+**A ring-3 task's context is not a set of callee-saved registers and a return address.**
+A task interrupted in ring 3 has a full return frame -- RIP, CS, RFLAGS, SS, RSP --
+pushed by the CPU above where the handler runs, because the CPU switched to a kernel stack
+first. Resuming that with `ret` pops the ring-3 RIP as a return address and jumps to it in
+ring 0 with the kernel's stack and CS, discarding everything the frame said about SS and
+RSP. So `task_save_publish_and_switch()` records whether the outgoing task was in ring 3 --
+by reading `%cs`, which C cannot do -- and the restore ends in `iretq` or `ret` accordingly.
+`iretq` pops from exactly where `ret` would have taken the first word, so the two cases
+differ by one instruction.
+
+That was hidden by `frame[2] = 0x002`, which read as though it enabled interrupts and
+actually did not: 0x002 is only the reserved bit the CPU forces to one, and IF is bit 2. So
+ring-3 tasks were never preempted, and a task that is never interrupted in ring 3 never has
+a ring-3 context to save. It is 0x202 now, which means the path is actually exercised.
+
+Two costs of this worth stating plainly:
+
+- The flag pointer cannot live in `%r15` past the restore, because the first `popq %r15` is
+  the *chosen* task's %r15 and is zero for a task that has never run. It moves to `%r11`,
+  which the pops do not touch. Getting this wrong faults on the very first switch on the
+  machine, which is at least a memorable symptom.
+- `task_save_publish_and_switch()` now takes seven arguments, so the seventh is on the stack
+  and has to be read before anything moves `%rsp`. Both flags are needed -- the save writes
+  the outgoing task's, the restore reads the incoming task's -- and passing only one
+  compiles, links, boots, and then reads the caller's return address as a pointer.
+
+**Left undone, deliberately:** a user task still has no kernel stack. The kernel runs on
+the user stack for it, and `TSS.RSP0` is its processor's boot stack. That works -- the CPU
+switches to RSP0 on the way in from ring 3 -- but the frames are unguarded, not per-task,
+and every stack trace of a fault inside a syscall is meaningless. It is recorded in
+`docs/STATUS.md` as the first thing phase 6 still needs, not hidden.

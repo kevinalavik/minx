@@ -138,6 +138,33 @@ typedef struct task {
      * what this holds.  It exists because the loader has to patch RIP and RSP into the
      * frame after the ELF is read, and that happens well after the task is created. */
     uint64_t    *user_frame;
+
+    /* The physical address of the *bottom* page of this task's user stack, and how many
+     * pages there are.  Both exist for the same reason as `user_frame`: the stack is
+     * mapped only in this task's address space, so the kernel reaches it through the
+     * direct map of its own frames, and the ELF loader has to zero it and build the
+     * argv/envp/auxv block in it. */
+    uint64_t     user_stack_phys;
+    uint32_t     user_stack_pages;
+
+    /* Whether the context in `saved_rsp` is a ring-3 frame rather than a set of
+     * callee-saved registers and a return address.
+     *
+     * A task interrupted while running in ring 3 gets a *full* return frame pushed by the
+     * CPU -- RIP, CS, RFLAGS, SS, RSP -- above the point the handler runs at, because the
+     * CPU switched to the kernel stack first.  A kernel task gets no such frame: its
+     * callee-saved registers and its own return address are the whole context, and it is
+     * resumed with a `ret`.
+     *
+     * Resuming a user task's context with `ret` pops the ring-3 RIP as though it were a
+     * return address and jumps to it in ring 0, with the kernel's stack, the kernel's CS
+     * and everything the ring-3 frame said about SS and RSP discarded.  The symptom is not
+     * a fault at that address; it is arbitrary behaviour for as long as the next fault
+     * takes to arrive, which is why this needs a flag rather than a check.
+     *
+     * Written by task_save_publish_and_switch() in switch.S, read by nothing but the
+     * restore there -- the C side cannot know the processor's current privilege level. */
+    int32_t      saved_in_user;
 } task_t;
 
 /* The word written at the bottom of every task stack. */

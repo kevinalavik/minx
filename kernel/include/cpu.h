@@ -16,6 +16,21 @@
 #define GDT_USER_DATA   0x18
 #define GDT_USER_CODE   0x20
 
+/* The same two descriptors requested at privilege level 3.
+ *
+ * The selectors above carry RPL 0, which is right for naming a descriptor and wrong for
+ * *entering* one: `iretq` takes the new CPL from the RPL of the CS in the frame, so a
+ * frame built with 0x20 and 0x18 does not drop privilege at all.  It pops RIP, CS and
+ * RFLAGS, stops there, and leaves SS and RSP sitting on the stack -- so the task runs its
+ * first instruction in ring 0, on the stack pointer it had as a kernel task, with two
+ * words of its frame still unconsumed.  Nothing about that looks like a segment problem
+ * until something reads SS.
+ *
+ * The RPL is in the low two bits, so `| 3` names the same GDT entry: the index used to
+ * reach it is `selector >> 3`, which ignores them. */
+#define GDT_USER_DATA_RPL3 (GDT_USER_DATA | 3)
+#define GDT_USER_CODE_RPL3 (GDT_USER_CODE | 3)
+
 /* The first TSS descriptor, and the distance between one processor's descriptor
  * and the next.  A 64-bit TSS descriptor is 16 bytes -- two ordinary 8-byte slots
  * -- and each processor needs its own, so the table has room for all of them. */

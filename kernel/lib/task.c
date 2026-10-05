@@ -93,7 +93,9 @@ typedef struct {
  * here because it takes a sched_cpu_t. */
 void task_save_publish_and_switch(uint64_t *save_rsp, task_t *prev, sched_cpu_t *c,
                                  uint64_t next_rsp,
-                                 const page_table_t *next_tables);
+                                 const page_table_t *next_tables,
+                                 int32_t *prev_saved_in_user,
+                                 int32_t *next_saved_in_user);
 
 static sched_cpu_t cpu[MAX_CPU_COUNT];
 
@@ -513,6 +515,9 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
          * reachable only through the direct map of that page. */
         if (i == 0)
             top_phys = phys;
+        if (i + 1 == pages)
+            t->user_stack_phys = phys;
+        t->user_stack_pages = pages;
 
         if (phys == 0) {
             vmm_address_space_destroy(tables);
@@ -521,8 +526,18 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
             return NULL;
         }
 
-        if (vmm_map_user(top - (uint64_t)(i + 1) * page_size, phys, page_size,
-                         true) != 0) {
+        /* Into *this* task's address space, not the running one's.  vmm_map_user() maps
+         * through vmm_tables(), which is the running task's tables, and a task being
+         * created is not the running task -- so the stack went into the creator's address
+         * space (the boot task's, whose tables are the kernel's), and the task was created
+         * with a stack nothing could reach.  Its own tables had no entry for the address,
+         * so the first access to its stack faulted while the walk over those same tables
+         * correctly reported nothing mapped there.
+         *
+         * The same mistake is in the ELF loader's segment mapping; both are the reason
+         * vmm_map_into() and vmm_translate_in() exist. */
+        if (vmm_map_into(tables, top - (uint64_t)(i + 1) * page_size, phys,
+                         page_size, true) != 0) {
             vmm_user_page_free(phys);
             vmm_address_space_destroy(tables);
             kfree(tables);
@@ -583,10 +598,20 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
      * that exists only in this task's address space, so the direct map of that page's own
      * physical address is the one route to them. */
     frame[0] = entry;                      /* RIP */
-    frame[1] = GDT_USER_CODE;              /* CS   */
-    frame[2] = 0x002;                      /* RFLAGS: IF set, so the task's first
-                                           *   interrupt is its own choice */
-    frame[3] = GDT_USER_DATA;              /* SS   */
+    frame[1] = GDT_USER_CODE_RPL3;         /* CS: RPL 3, which is what makes iretq
+                                           *   actually drop to ring 3 */
+    /* IF set, so the task takes its own interrupts from its first instruction.
+     *
+     * This was 0x002, which is only the reserved bit that the CPU forces to one: IF is
+     * bit 2, so 0x002 has interrupts *off*.  It read as though it were right, and leaving
+     * it off meant a ring-3 task was never preempted -- which hid the whole class of
+     * problem below, because a task that is never interrupted in ring 3 never has a
+     * ring-3 context to save.  Turning it on is what makes this honest.
+     *
+     * The task's own DF and arithmetic flags are left clear, which is what the ABI
+     * requires at a program's first instruction. */
+    frame[2] = 0x202;                      /* RFLAGS: IF set, DF clear */
+    frame[3] = GDT_USER_DATA_RPL3;         /* SS   */
     frame[4] = user_stack_top;             /* RSP: the bottom of its own stack */
 
     for (unsigned i = 0; i < 6; i++)
@@ -1105,7 +1130,8 @@ void schedule(void) {
         task_enter_first(next->saved_rsp);
     } else {
         task_save_publish_and_switch(&prev->saved_rsp, prev, c, next->saved_rsp,
-                                     next_tables);
+                                     next_tables, &prev->saved_in_user,
+                                     &next->saved_in_user);
     }
 
     /* Only reached when this task is switched back into. */

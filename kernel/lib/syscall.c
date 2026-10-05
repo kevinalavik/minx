@@ -116,6 +116,19 @@ static uint64_t arg(regs_t *regs, unsigned n) {
 /* --- checking a program's pointer ---------------------------------------- */
 
 bool syscall_user_range_ok(uint64_t addr, size_t bytes, bool write) {
+    return syscall_user_range_ok_in(vmm_tables(), addr, bytes, write);
+}
+
+/* As syscall_user_range_ok(), but against a named address space rather than the running
+ * task's.
+ *
+ * The running task's is the right answer for a syscall, where the running task *is* the
+ * caller.  It is the wrong answer for the ELF loader, which asks whether an address in a
+ * program that has not started yet is mapped -- and asking its own tables instead reports
+ * that it is not, which sends the loader into a fallback that maps over a page the
+ * program already has. */
+bool syscall_user_range_ok_in(page_table_t *tables, uint64_t addr, size_t bytes,
+                              bool write) {
     if (!vmm_is_user_addr(addr))
         return false;
 
@@ -125,7 +138,8 @@ bool syscall_user_range_ok(uint64_t addr, size_t bytes, bool write) {
     if (bytes != 0 && addr + bytes < addr)
         return false;
 
-    page_table_t *tables = vmm_tables();
+    if (tables == NULL)
+        return false;
 
     for (uint64_t off = 0; off < bytes; off += page_size) {
         pte_t leaf = pt_get(tables, addr + off);

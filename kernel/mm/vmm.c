@@ -73,10 +73,22 @@ page_table_t *vmm_tables(void) {
 /* Translate through the kernel's own tables.  Before vmm_init() there are none,
  * so this falls back to walking CR3, which at that point is the bootloader's. */
 uint64_t vmm_translate(uint64_t virt) {
+    return vmm_translate_in(vmm_tables(), virt);
+}
+
+/* As vmm_translate(), but against a named address space.
+ *
+ * Same reason as syscall_user_range_ok_in(): "is this address mapped" has to be asked of
+ * the address space the address belongs to, and the running task's is only ever the right
+ * one when the running task is the one being asked about. */
+uint64_t vmm_translate_in(page_table_t *tables, uint64_t virt) {
     if (!vmm.active)
         return vmm_walk_translate(virt, NULL);
 
-    pte_t leaf = pt_get(vmm_tables(), virt);
+    if (tables == NULL)
+        return 0;
+
+    pte_t leaf = pt_get(tables, virt);
     if (leaf == 0)
         return 0;
 
@@ -514,7 +526,18 @@ int vmm_set_nx_range(uint64_t virt, size_t bytes, bool nx) {
 }
 
 int vmm_map_user(uint64_t virt, uint64_t phys, size_t bytes, bool writable) {
-    if (!vmm.active)
+    return vmm_map_into(vmm_tables(), virt, phys, bytes, writable);
+}
+
+/* The same thing with the address space named, for callers that are not running in it.
+ *
+ * The ELF loader is the case that makes this necessary: it fills in a task's address
+ * space before that task has ever been scheduled, so `vmm_tables()` -- the running task's
+ * -- is the wrong one, and mapping through it succeeds while the program ends up with no
+ * code mapped at its entry point. */
+int vmm_map_into(page_table_t *tables, uint64_t virt, uint64_t phys, size_t bytes,
+                 bool writable) {
+    if (!vmm.active || tables == NULL)
         return -1;
 
     size_t span = ALIGN_UP(bytes, page_size);
@@ -522,7 +545,7 @@ int vmm_map_user(uint64_t virt, uint64_t phys, size_t bytes, bool writable) {
     if (writable)
         flags |= PTE_WRITE;
 
-    if (!pt_map_range(vmm_tables(), virt, phys, span, flags))
+    if (!pt_map_range(tables, virt, phys, span, flags))
         return -1;
 
     vmm.stats.user_pages += span / page_size;

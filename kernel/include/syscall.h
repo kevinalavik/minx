@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include "cpu.h"
+#include "pagetables.h"
 
 /* --- call numbers ------------------------------------------------------- */
 
@@ -114,6 +115,11 @@ const char *syscall_name(unsigned nr);
  * is exact, needs no recovery, and a range it rejects is a range that would have
  * faulted. */
 bool syscall_user_range_ok(uint64_t addr, size_t bytes, bool write);
+
+/* As above, against a named address space.  For callers that are not the running task --
+ * the ELF loader, filling in a program that has not started. */
+bool syscall_user_range_ok_in(page_table_t *tables, uint64_t addr, size_t bytes,
+                              bool write);
 
 /* Copy out of / into user memory.  These are the only ways a program-supplied address
  * should ever be dereferenced, and both check before touching. */
