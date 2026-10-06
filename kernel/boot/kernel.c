@@ -359,6 +359,54 @@ static void cpu_interrupts_init(void) {
     } else {
         boot_info.have_vmm = true;
 
+        /* Now that the image's physical base is known, write the boot processor's TSS
+         * descriptor properly.
+         *
+         * gdt_init() ran first in kmain() -- deliberately, so that a fault is reportable
+         * from the first instruction -- and it has to write that descriptor, but at that
+         * point nothing knows where the image is in physical memory.  Writing it then
+         * meant guessing: `virt_to_phys()`, which subtracts the direct-map offset and is
+         * therefore wrong for a kernel-image address, giving 0x00008000xxxx_xxxx -- a
+         * plausible-looking low physical address with no page behind it.
+         *
+         * A TSS descriptor's base is a physical address; the CPU fetches the TSS contents
+         * from it directly and the TSS is not subject to paging even in long mode.  So the
+         * CPU was reading RSP0, the IST pointers and iomap_base out of nowhere.  Nothing
+         * about that shows up until something switches stacks: an exception at CPL 0 needs
+         * no switch, so phases 1 to 5 all pass, and the first interrupt out of ring 3 loads
+         * a garbage RSP0, the push faults, and the resulting #DF is reported at the
+         * *original* privilege level with the *original* instruction pointer.
+         *
+         * It has to be after vmm_init() rather than after hhdm_init(), because it is
+         * vmm_init() that resolves the image's physical base by walking the bootloader's
+         * tables.
+         *
+         * And it has to reload the task register afterwards, which is the half that is easy
+         * to leave out.  `ltr` does not just read the descriptor: it *caches* the base,
+         * limit and attributes inside the processor, and thereafter the CPU fetches the TSS
+         * from that cache.  Rewriting the GDT entry changes the bytes in the table and
+         * nothing else.  So gdt_init()'s `ltr` cached the base it was handed -- and at that
+         * point vmm_kernel_phys() correctly refused to answer, because the image's physical
+         * base was not yet known -- which is physical zero.  Confirming that from QEMU's
+         * register dump after a ring-3 fault: `TR =0028 0000000000000000 0000006b`, base
+         * zero, limit correct.  A limit that is right is the misleading part: it looks like
+         * the descriptor was written.
+         *
+         * tss_reload_for() rather than gdt_reload_for(): the latter would also reload %gs
+         * from the table, and the per-CPU base is in MSR_GS_BASE, so that turns
+         * percpu_self() into a NULL dereference in the first timer tick. */
+        gdt_write_tss_descriptor(0, vmm_kernel_phys((uint64_t)&kernel_tss[0]),
+                                 sizeof(kernel_tss[0]) - 1);
+        tss_reload_for(0);
+
+        /* And map that page at its own physical address, so the processor can get to
+         * the TSS by the address the descriptor names.  See vmm_map_identity(). */
+        if (vmm_map_identity(vmm_kernel_phys((uint64_t)&kernel_tss[0]) & ~(page_size - 1),
+                             page_size) != 0) {
+            panic("could not map the TSS page at its physical address; no "
+                  "interrupt out of ring 3 could switch stacks");
+        }
+
         /* Hand the heap real frames now that there is a physical allocator;
          * the 4 MiB static arena stays as the floor so a failed pmm_init() is
          * survivable rather than fatal. */
@@ -692,8 +740,6 @@ void kmain(void) {
      * is to move gdt_init() after hhdm_init(), which delays the descriptor tables -- the
      * first thing kmain() installs precisely so that a fault is reportable -- for no gain.
      */
-    gdt_write_tss_descriptor(0, virt_to_phys((uint64_t)&kernel_tss[0]),
-                             sizeof(kernel_tss[0]) - 1);
 
     kmalloc_init();
     parse_cmdline();

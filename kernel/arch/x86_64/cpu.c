@@ -5,6 +5,7 @@
  * (TSS.rsp0) and double-fault/NMI want their own IST stacks.
  */
 #include "cpu.h"
+#include "vmm.h"
 
 #include "io.h"
 #include "panic.h"
@@ -337,7 +338,7 @@ void gdt_init(void) {
      * the struct rather than asking the CPU, so it passes throughout.
      *
      * Same trap in smp_cpu_entry() for the application processors. */
-    gdt_write_tss_descriptor(0, virt_to_phys((uint64_t)&kernel_tss[0]),
+    gdt_write_tss_descriptor(0, vmm_kernel_phys((uint64_t)&kernel_tss[0]),
                              sizeof(kernel_tss[0]) - 1);
     gdt_set_kernel_table();
     boot_trace('|');
@@ -399,6 +400,36 @@ void gdt_reload(void) {
  * same entry is refused with #GP and the selector as the error code. */
 void gdt_reload_for(unsigned index) {
     gdt_reload();
+    ltr(gdt_tss_selector(index));
+}
+
+/* Re-load processor `index`'s task register, and nothing else.
+ *
+ * Needed when a TSS descriptor is rewritten after `ltr` has already cached it.  The CPU
+ * takes the base, limit and attributes into a cache inside the processor when `ltr` runs
+ * and fetches the TSS from there from then on, so changing the bytes in the GDT does
+ * nothing until `ltr` runs again.
+ *
+ * Deliberately *not* gdt_reload_for(): that also reloads the data segments, and reloading
+ * %gs re-reads the GS base from the descriptor -- zeroing the per-CPU base this kernel
+ * installs with wrmsr, and leaving percpu_self() to return NULL.  The symptom is a fault
+ * in the first timer tick, reading address zero, which points at the timer rather than at
+ * the segment reload that caused it.  Reloading LTR with an already-busy TSS is allowed:
+ * the busy bit only refuses a *different* processor from claiming this one. */
+void tss_reload_for(unsigned index) {
+    if (index >= MAX_CPU_COUNT)
+        return;
+
+    /* The descriptor is rewritten as well as re-loaded, and that is not tidiness.
+     *
+     * `ltr` on a TSS that is already busy fails with #GP reporting the selector --
+     * confirmed here: error code 0x28, which is the TSS selector itself.  So a second
+     * `ltr` on the same entry cannot work, and the way to refresh the processor's
+     * cached copy is to write the descriptor again, which clears the busy bit that
+     * `ltr` set, and then load it.  The base is the same one that is already there;
+     * only the busy bit changes. */
+    gdt_write_tss_descriptor(index, vmm_kernel_phys((uint64_t)&kernel_tss[index]),
+                             sizeof(kernel_tss[0]) - 1);
     ltr(gdt_tss_selector(index));
 }
 

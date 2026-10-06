@@ -540,7 +540,7 @@ static void smp_cpu_entry(unsigned index) {
     tss_init_for(index, ap_slot[index].ist1_top, ap_slot[index].ist2_top);
     /* A TSS descriptor's base is a physical address, not a virtual one -- see the note
      * at the boot processor's call site. */
-    gdt_write_tss_descriptor(index, virt_to_phys((uint64_t)&kernel_tss[index]),
+    gdt_write_tss_descriptor(index, vmm_kernel_phys((uint64_t)&kernel_tss[index]),
                              sizeof(kernel_tss[0]) - 1);
     gdt_reload_for(index);
 

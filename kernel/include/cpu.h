@@ -53,6 +53,14 @@ void gdt_set_user_table(void);
 void gdt_reload(void);
 void gdt_reload_for(unsigned index);
 
+/* Re-load processor `index`'s TSS from its (just rewritten) descriptor.
+ *
+ * `ltr` caches the TSS's base, limit and attributes inside the processor, so a descriptor
+ * rewritten afterwards is not seen until this runs.  Unlike gdt_reload_for() this leaves
+ * %gs alone, which matters because the per-CPU base here lives in MSR_GS_BASE and loading
+ * %gs from the table would zero it. */
+void tss_reload_for(unsigned index);
+
 /* Publish processor `index`'s TSS in the table, so `gdt_reload_for()` can load
  * it.  Called with the TSS already programmed. */
 void gdt_write_tss_descriptor(unsigned index, uint64_t base, uint32_t limit);
@@ -91,24 +99,44 @@ static inline void lidt(const dt_ptr_t *p) {
 
 /* ---------------------------------------------------------------- TSS --- */
 
-/* The 64-bit TSS, at the offsets the hardware actually reads them from.
+/* The 64-bit TSS, at the offsets the processor actually reads them from.
  *
- * The four bytes at 0x04 look spare -- that is where a 32-bit TSS puts SS:0 --
- * but leaving them out shifts every field that follows down by one quadword, and
- * the CPU does not shift with them: RSP0 then reads as zero, the IST entries
- * pick up the wrong eight bytes, and the I/O map base lands where a reserved word
- * belongs.  All three fail silently, the last two only when something faults or
- * ports.
- */
+ * There is *one* reserved quadword at the top and the first stack pointer is at
+ * 0x04, not 0x08.  It looks like the 32-bit TSS's `esp0` slot widened to 64 bits,
+ * because it is: the 32-bit TSS puts `esp0` at 0x04 and `ss0` at 0x08, and the
+ * 64-bit TSS keeps the `esp0` position and spends the next eight bytes on the ring-1
+ * pointer that the 32-bit layout spends on `ss0`.  Linux's `struct x86_hw_tss` says
+ * the same thing (`u32 reserved1; u64 sp0; u64 sp1; u64 sp2;`), and it is the
+ * authority here: Linux takes a ring-3 stack switch on every syscall on every
+ * machine anyone runs it on.
+ *
+ * Adding a second reserved dword "for symmetry" is the mistake this layout is
+ * written to prevent, and it is worth spelling out what it costs, because it costs
+ * it silently.  Every field after the top moves up four bytes, and a TSS is a
+ * flat struct of offsets rather than a structure of pointers, so nothing notices:
+ *
+ *   - RSP0 reads as the *reserved* word, which is zero, so the first interrupt out
+ *     of ring 3 pushes onto address zero.  That is a #PF at 0xfffffff8 and then a
+ *     #DF, reported at the *original* privilege level and RIP -- so a user program
+ *     that makes a syscall appears to fault twice at its own entry point, and the
+ *     kernel never gets to look at it.
+ *   - IST1 reads as the low half of `reserved2`, also zero, so the double-fault
+ *     handler has no stack either and #DF becomes a triple fault.  Everything from
+ *     phase 1 onwards passes regardless, because an exception at CPL 0 needs no
+ *     stack switch: the CPU pushes onto the stack it is already on.
+ *   - iomap_base lands on a reserved word, which happens to still mean "no bitmap",
+ *     so even the test that checks it passes.
+ *
+ * That is three separate failures that all read as "the ring-3 boundary does not
+ * work yet", which is why this comment used to assert the opposite. */
 typedef struct __attribute__((packed)) {
     uint32_t reserved0;    /* 0x00 */
-    uint32_t reserved1;    /* 0x04 */
-    uint64_t rsp[3];       /* 0x08 ring 0, ring 1, ring 2 stacks */
-    uint64_t reserved2;    /* 0x20 */
-    uint64_t ist[7];       /* 0x28 ist1 .. ist7 */
-    uint64_t reserved3;    /* 0x60 */
-    uint16_t reserved4;    /* 0x68 */
-    uint16_t iomap_base;   /* 0x6A */
+    uint64_t rsp[3];       /* 0x04 ring 0, 0x0C ring 1, 0x14 ring 2 */
+    uint64_t reserved2;    /* 0x1C */
+    uint64_t ist[7];       /* 0x24 ist1 .. ist7 */
+    uint64_t reserved3;    /* 0x5C */
+    uint16_t reserved4;    /* 0x64 */
+    uint16_t iomap_base;   /* 0x66 */
 } __attribute__((packed)) tss_t;
 
 /* One TSS per processor, indexed the same way the per-CPU slots are.
@@ -126,6 +154,7 @@ void tss_init(void);                              /* this processor's */
 void tss_init_for(unsigned index, uint64_t ist1, uint64_t ist2);
 void tss_set_rsp0(uint64_t rsp);
 void tss_set_rsp0_for(unsigned index, uint64_t rsp);
+void tss_report(unsigned index);
 void tss_set_ist(int ist, uint64_t rsp);
 
 /* ---------------------------------------------------------------- IDT --- */
