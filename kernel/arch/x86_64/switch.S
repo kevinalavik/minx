@@ -48,7 +48,8 @@ task_switch:
  *                                   const page_table_t *next_tables,
  *                                   int32_t *prev_saved_in_user,
  *                                   int32_t *next_saved_in_user,
- *                                   int32_t from_user)
+ *                                   int32_t from_user,
+ *                                   const uint64_t *out_ring3)
  *
  * Save the running task's context, publish it to a run queue, load another task's address
  * space, and switch to it, without ever returning to C.  Never returns.
@@ -113,15 +114,38 @@ task_save_publish_and_switch:
      * is zero for a task that has never run. */
     movq    8(%rsp), %r15       /* &next->saved_in_user */
     movq    16(%rsp), %r11      /* from_user: passed in, not derived from %cs */
+    movq    24(%rsp), %r14      /* out_ctx: the outgoing ring-3 context, or NULL */
     pushq   %rbp
     pushq   %rbx
     pushq   %r12
     pushq   %r13
     pushq   %r14
     pushq   %r15
-    movq    %rsp, (%rdi)        /* final: from here on another processor may run it */
+    /* Save *what the task resumes from*.
+     *
+     * A kernel task resumes from the six quadwords just pushed, and the restore pops
+     * them and returns.  A ring-3 task resumes from somewhere else entirely: from the
+     * interrupt frame the CPU pushed, which is above those six, in the block
+     * isr_common() handed to isr_dispatch().  That block is contiguous and already holds
+     * everything a return needs -- the fifteen general registers in the order they were
+     * pushed, then the vector and error code, then the five words `iretq` consumes -- so
+     * it is saved whole, by pointer, and nothing is copied.
+     *
+     * The nine registers that are not callee-saved are why.  An earlier version here
+     * saved the six and then copied the *frame* -- RIP, CS, RFLAGS, RSP, SS -- to just
+     * above them, which is a complete ring-3 frame and still not a complete ring-3
+     * context: %rax, %rbx, %rcx, %rdx, %rsi, %rdi, %rbp and %r8 to %r12 came back as
+     * whatever the *switching* task left in them.  A ring-3 program then carried a kernel
+     * address in a register across a preemption and dereferenced it, which looks like a
+     * wild pointer in the program and is entirely the kernel's. */
+    movq    %rsp, %rax
+    testq   %r14, %r14
+    jz      1f
+    movq    %r14, %rax
+1:  movq    %rax, (%rdi)        /* final: from here on another processor may run it */
     movq    %rcx, %r12          /* prev's %r12 is saved above; the slot is now free */
     movq    %r8, %r13           /* likewise prev's %r13 */
+
     /* Record whether the outgoing context is a ring-3 frame rather than a set of
      * callee-saved registers and a return address.  The answer arrives as an argument.
      *
@@ -148,20 +172,42 @@ task_save_publish_and_switch:
      * That faulted on the very first switch on the machine, which is at least a memorable
      * symptom for a mistake that is otherwise invisible. */
     movq    %r15, %r11
+    cmpl    $0, (%r11)
+    je      2f
+
+    /* A ring-3 task resumes from the interrupt frame, whole.
+     *
+     * This is isr_common()'s tail with the dispatcher's own return address left off: the
+     * fifteen registers in the order they were pushed, the vector and the error code
+     * skipped, and then `iretq`, which pops the five words at the end of the block and
+     * returns to CPL 3.  isr_common()'s tail does not run for this task, because the
+     * handler it was in was abandoned when the scheduler switched away -- which is the
+     * whole reason this path exists, and why the two tails have to stay in step. */
     popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rbp
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rbx
+    popq    %rax
+    addq    $16, %rsp            /* the vector and the error code */
+    iretq
+
+2:  popq    %r15
     popq    %r14
     popq    %r13
     popq    %r12
     popq    %rbx
     popq    %rbp
-    /* %rsp now points at the chosen task's resume point: a plain return address for a
-     * task that was running in the kernel, and the CPU's own ring-3 frame for one that was
-     * not.  `iretq` pops RIP, CS, RFLAGS, SS and RSP from exactly where `ret` would have
-     * taken the first of them, so the two cases differ by one instruction. */
-    cmpl    $0, (%r11)
-    je      2f
-    iretq
-2:      ret
+    ret
 .size task_save_publish_and_switch, .-task_save_publish_and_switch
 
 /* void task_restore_context(uint64_t new_rsp)

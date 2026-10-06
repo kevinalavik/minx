@@ -60,6 +60,19 @@ typedef struct {
      * ring-3 context as far as the scheduler is concerned, and every nested handler in
      * between sees CS 0x08 -- so this stays set until a save consumes it. */
     volatile int32_t from_user;
+
+    /* The ring-3 context the CPU pushed, or NULL.
+     *
+     * `from_user` alone says a ring-3 context exists but not where it is, and the
+     * scheduler cannot find it: by the time schedule() runs, the handler that was
+     * entered has already built several frames of its own below it, and nothing in
+     * those frames says how deep the CPU's frame is.
+     *
+     * It is the `regs` the stub passed to isr_dispatch(), which is the whole of it: the
+     * fifteen general registers in push order, the vector and error code, and then the
+     * five words `iretq` consumes.  Saving that block by pointer is what carries the
+     * registers that are not callee-saved across a preemption. */
+    void *user_frame;
 } percpu_t;
 
 typedef struct {

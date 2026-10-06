@@ -27,11 +27,14 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "smp.h"
-#include "cpu.h"
 #include "string.h"
 #include "timer.h"
 #include "vectors.h"
 #include "vmm.h"
+
+
+
+
 
 /* Provided by kernel/arch/x86_64/switch.S.  task_start_shim is jumped to by the
  * `ret` at the end of a first switch onto a task; it reads the entry point and
@@ -96,7 +99,8 @@ void task_save_publish_and_switch(uint64_t *save_rsp, task_t *prev, sched_cpu_t 
                                  const page_table_t *next_tables,
                                  int32_t *prev_saved_in_user,
                                  int32_t *next_saved_in_user,
-                                 int32_t from_user);
+                                 int32_t from_user,
+                                 const void *out_ctx);
 
 static sched_cpu_t cpu[MAX_CPU_COUNT];
 
@@ -1188,11 +1192,21 @@ void schedule(void) {
          * switched to CPL 0, so the current CS cannot say.  Consuming it here is what
          * stops it leaking into a later save that really was from the kernel. */
         int32_t from_user = self->from_user;
+
+        /* The ring-3 context itself, if there is one: the whole block the interrupt
+         * entry was handed, recorded there and consumed here together with the flag.
+         * The handler that pushed it has built frames of its own below it by now, so
+         * schedule() cannot find it any other way -- and saving the block whole is what
+         * carries the nine general registers that are not callee-saved across the
+         * switch.  See task_save_publish_and_switch(). */
+        const void *out_ctx = self->user_frame;
+
         self->from_user = 0;
+        self->user_frame = NULL;
 
         task_save_publish_and_switch(&prev->saved_rsp, prev, c, next->saved_rsp,
                                      next_tables, &prev->saved_in_user,
-                                     &next->saved_in_user, from_user);
+                                     &next->saved_in_user, from_user, out_ctx);
     }
 
     /* Only reached when this task is switched back into. */

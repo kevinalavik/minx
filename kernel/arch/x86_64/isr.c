@@ -116,8 +116,10 @@ void isr_dispatch(regs_t *regs) {
     /* Did this arrive from ring 3?  The scheduler needs to know, and it cannot find out
      * for itself: the CPU has already switched to CPL 0, so the frame it pushed is a
      * ring-3 frame while the CS in hand belongs to the kernel.  See percpu_t.from_user. */
-    if ((regs->cs & 3) != 0)
+    if ((regs->cs & 3) != 0) {
         percpu_self()->from_user = 1;
+        percpu_self()->user_frame = regs;
+    }
 
 
     /* The remapped 8259 IRQs land on vectors 32..47, and the IOAPIC redirects
@@ -151,6 +153,18 @@ void isr_dispatch(regs_t *regs) {
     isr_handler_t handler = vector < 256 ? handlers[vector] : NULL;
     if (handler != NULL) {
         handler(regs);
+
+        /* Clear the ring-3 marker on the way out, because nothing in this path ever
+         * reaches the scheduler to consume it.
+         *
+         * Only the interrupt paths do: the tick and the IRIs all end in schedule(),
+         * which takes the marker and resets it.  The syscall door ends here, and the
+         * door clears IF for its whole length, so a tick cannot arrive inside it and
+         * there is nothing to preempt -- which means leaving the marker set would hand
+         * the *next* save a ring-3 frame that is not there, and the task would resume
+         * through `iretq` off whatever the handler left on its stack. */
+        percpu_self()->from_user = 0;
+        percpu_self()->user_frame = NULL;
         return;
     }
 
