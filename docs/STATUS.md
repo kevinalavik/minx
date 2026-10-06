@@ -1,6 +1,9 @@
 # STATUS
 
-Current phase: 7 (processes) — **phases 1 to 6 VERIFIED.** `make test` reports
+Current phase: 7 (processes) — **phases 1 to 6 VERIFIED.** Phase 7 has a working start
+(see "Phase 7, where it got to" below) which is **not committed**, because `make test`
+does not pass with it and a commit that breaks the suite is worse than no commit. The
+diff is in `build/phase7-wip.patch` (1052 lines, untracked). `make test` reports
 **`run-tests: PASS`, 38 of 38 checks**, the guest shuts down cleanly, the tally is readable
 and the framebuffer dump is captured. A ring-3 program runs: `hello` reports its own `argc`
 and `argv[0]` off the stack the loader built, writes to descriptor 1 through `int $0x80`,
@@ -369,6 +372,61 @@ digits are `22 - i` — one NUL too many, invisible on a terminal, and enough to
 tally `grep` in `tools/run-tests.sh` treat the serial log as binary and decline to report
 what it found, which failed the whole suite for a reason that had nothing to do with the
 kernel.
+
+## Phase 7, where it got to
+
+`fork` with copy-on-write, `wait`, and the ELF loader's handling of two segments sharing a
+page are written and build warning-free. They are **not** committed: `hello` forking makes
+a page fault the kernel cannot account for, and the run never finishes. The patch is
+`build/phase7-wip.patch`.
+
+Two of the three pieces are finished and verified, and the third is one fault away:
+
+**Fixed, and worth keeping whatever happens to the rest.** `load_segment()` allocated a
+fresh frame for every page of every segment, and `pt_map_page()` deliberately refuses to
+replace a different frame — so the second segment to reach a page the first had mapped
+failed to load, with `elf: could not map 0x4022ae` as the entire report. A loader that
+cannot map a page another segment already mapped is not a loader. It had been latent
+because `hello`'s text fitted in one page until the fork section pushed it to three, at
+which point text and `rodata` shared two pages. The loader now maps whole pages, fills in
+a page that is already there, and takes the *union* of what the two segments ask for — a
+page one segment calls read-only and another calls writable has to end up writable, or the
+second segment faults on its own data.
+
+**Written, and correct by inspection but never observed working.** `vmm_fork_aspace()`
+shares every read-only leaf outright and duplicates the tables that hold writable ones;
+`vmm_cow_fault()` resolves a write fault by copying the page and restoring the recorded
+leaf entry — the *entry*, not a "writable" flag, because the loader maps data writable and
+text not and a copy-on-write fault that made text writable would be a security bug. The
+scheduler's ring-3 save already carries everything a forked child needs to resume, which is
+what makes `fork` a copy of one frame with `%rax` changed rather than a second loader.
+
+**The fault that is left.** Two design mistakes were found and fixed on the way, both of
+them invisible rather than crashing, and both worth recording because they are the kind
+that produce a panic a long way from the mistake:
+
+- The child's new leaf table pointer was written into the **parent's** page directory,
+  because the two share a directory pointer table and nothing had needed to differ yet.
+  The parent then adopted the child's read-only copy, lost its own writable table, and had
+  no copy-on-write list to consult — so its first write faulted with nothing to resolve it.
+  The page *directory* has to be duplicated too, whenever anything under it is writable.
+- Write permission was taken away from the twin only, not from both sides. The two leaf
+  tables are separate frames naming the same physical pages, so clearing the bit only in
+  the child's copy leaves the parent writing straight through to the shared frame and the
+  child's copy never being made. A scheme that protects only the child is not a scheme.
+  This one needs the *parent* to have a list as well — and, if the parent is itself a
+  forked child, to have the new entries **added** to the list it already has, because a
+  task's list is every page it has given up and a fork gives up more.
+
+After both fixes a page fault still arrives that no list accounts for. The next thing to
+do is to read `CR2` for it rather than to guess again — the serial log truncates at the
+panic, so it needs `-d int` and the fault address, and the useful narrowing is to print
+which virtual address the fault is at against the contents of the running task's list.
+
+`sys_wait` and the child-exit path are written and unused by anything yet: `sys_exit`
+records the status, publishes it before the flag that says it is there, and wakes the
+parent, which is the first thing in this kernel where one task's progress depends on
+another task finishing.
 
 ## The two remaining failures, exactly
 
