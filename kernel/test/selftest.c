@@ -1200,11 +1200,24 @@ static void test_lock_contention(void) {
 typedef struct {
     ticket_lock_t lock;
     uint32_t      turns[MAX_CPU_COUNT];
+    uint32_t      seen;
     uint32_t      served;
 } fair_t;
 
 static void fair_worker(void *arg) {
     fair_t *f = arg;
+
+    /* Indexed by *processor*, and deliberately so: a worker's turns belong to whoever
+     * happened to be holding the lock, which is what fairness is about.  Per-*task* counts
+     * would say only that every task finished, which is a liveness property the scheduler
+     * provides on its own.
+     *
+     * The assertion below then cannot be per-CPU, though, and this is why: the workers are
+     * tasks and the scheduler steals work, so a worker pinned to processor 2 can spend its
+     * rounds on processors 0 and 1 and end with processor 2 having taken the lock not at
+     * all.  So the per-processor figures are recorded here and summed, and the property
+     * asserted is that no waiter was starved -- every worker completed every round, and
+     * every acquisition of the lock was accounted for exactly once. */
     unsigned index = percpu_self_index();
 
     /* Many rounds each, not one.  A single round cannot tell a fair lock from an
@@ -1215,6 +1228,7 @@ static void fair_worker(void *arg) {
         ticket_lock(&f->lock);
         if (index < MAX_CPU_COUNT)
             f->turns[index]++;
+        f->seen++;   /* inside the critical section, so a plain store */
         f->served++;
         ticket_unlock(&f->lock);
     }
@@ -1227,29 +1241,37 @@ static void test_lock_fairness(void) {
 
     ticket_lock_init(&f.lock);
     memset(f.turns, 0, sizeof(f.turns));
+    f.seen = 0;
     f.served = 0;
     atomic_init(&done, 0);
 
     fanout_every_cpu(fair_worker, &f, &done);
 
-    /* Every processor took the lock FAIR_ROUNDS times, and the total is exactly
-     * that.  A lock that starves a processor shows up as one index below the
-     * count; a lock that lets two processors into the critical section shows up
-     * as a total above it. */
-    uint32_t total = 0;
-    for (unsigned i = 0; i < online; i++) {
-        if (f.turns[i] != FAIR_ROUNDS) {
-            test_fail("phase4-lockfair", "processor %u took the lock %u times, "
-                      "expected %u", i, f.turns[i], FAIR_ROUNDS);
-            return;
-        }
-        total += f.turns[i];
+    /* Every worker got every round -- that is the no-starvation half, and it is the half
+     * that was being asserted per processor, where work stealing made it unfalsifiable:
+     * a run where one processor's tasks all migrated elsewhere failed on "processor 0
+     * took the lock 0 times" while the lock had in fact behaved perfectly. */
+    uint32_t counted = 0;
+    for (unsigned i = 0; i < MAX_CPU_COUNT; i++)
+        counted += f.turns[i];
+
+    uint32_t expected = online * FAIR_ROUNDS;
+
+    if (f.seen != expected) {
+        test_fail("phase4-lockfair", "the workers recorded %u acquisitions, expected "
+                  "%u: a waiter was starved", f.seen, expected);
+        return;
     }
 
-    if (total != online * FAIR_ROUNDS || f.served != total) {
-        test_fail("phase4-lockfair", "the turns add up to %u and the counter "
-                  "reached %u, expected %u", total, f.served,
-                  online * FAIR_ROUNDS);
+    /* And every acquisition was inside the critical section, exactly once: `counted` is
+     * the sum of the per-processor tallies and `served` the number of times a worker held
+     * the lock.  The two agreeing at `expected` is mutual exclusion; `served` running
+     * ahead of `counted` would mean a worker was inside without the counter moving, and
+     * the other way round would mean a counter without a holder. */
+    if (counted != expected || f.served != expected) {
+        test_fail("phase4-lockfair", "the per-processor turns add up to %u and the "
+                  "counter reached %u, expected %u of each", counted, f.served,
+                  expected);
         return;
     }
 
@@ -2327,8 +2349,15 @@ static void test_smp_tss(void) {
          * mode.  This test asserted the virtual address, so it agreed with a kernel that
          * had the CPU reading its TSS out of physical 0xffffffff80xxxxxx -- and the CPU
          * was, which is why nothing about the TSS worked from ring 3 and nothing here
-         * noticed. */
-        if (base != virt_to_phys((uint64_t)&kernel_tss[i])) {
+         * noticed.
+         *
+         * It then asserted virt_to_phys(), which is the second half of the same mistake: the
+         * kernel image is not in the direct map, so that conversion is wrong for an image
+         * address too, and the test would have agreed with a second broken kernel.  Hence
+         * vmm_kernel_phys(), which is the one conversion that is defined for an image
+         * address -- and this test's real lesson is that both times it "passed", it was
+         * measuring the kernel against itself. */
+        if (base != vmm_kernel_phys((uint64_t)&kernel_tss[i])) {
             test_fail("phase4-tss", "processor %u's descriptor points at %#lx, "
                       "not at its own TSS at %p", i, (unsigned long)base,
                       (void *)&kernel_tss[i]);
@@ -2347,11 +2376,11 @@ static void test_smp_tss(void) {
             }
         }
 
-        /* The limit has to reach the I/O map base at 0x6a, or `ltr` is refused
+        /* The limit has to reach the I/O map base at 0x66, or `ltr` is refused
          * with #TS. */
-        if (limit < 0x6a) {
+        if (limit < 0x66) {
             test_fail("phase4-tss", "processor %u's TSS limit is %#x, which does "
-                      "not cover the I/O map base at 0x6a", i, limit);
+                      "not cover the I/O map base at 0x66", i, limit);
             return;
         }
 
@@ -2362,14 +2391,49 @@ static void test_smp_tss(void) {
             return;
         }
 
-        /* Two more field offsets the CPU reads and nothing checks.  RSP0 lives
-         * at 0x08, not 0x04 -- the 32-bit TSS's SS:0 slot is there -- and IST 1
-         * at 0x28, not 0x24.  Both wrong just means a fault finds no stack. */
-        if (kernel_tss[i].reserved1 != 0 || kernel_tss[i].reserved2 != 0) {
+        /* The field offsets, which is the part of a TSS that has to be right and
+         * which reading the struct cannot possibly notice.
+         *
+         * This test used to read `reserved1` and `reserved2` and check they were
+         * zero, and it passed for the whole of phase 6 with the TSS shifted up four
+         * bytes -- because a struct full of zeros checks out as a struct full of
+         * zeros however it is laid out.  What the processor reads is not the struct,
+         * it is the byte at a fixed offset, so that is what has to be asserted.
+         *
+         * RSP0 at 0x04 and IST 1 at 0x24 are what the 64-bit TSS actually uses --
+         * Linux's `struct x86_hw_tss` and QEMU's `get_rsp_from_tss()` (index
+         * `8 * level + 4`) agree on that.  Getting them wrong is invisible from
+         * ring 0 and fatal from ring 3: an exception at CPL 0 needs no stack switch,
+         * so phases 1 to 5 pass, and then the first syscall pushes onto whatever the
+         * reserved word holds. */
+        if (offsetof(tss_t, rsp[0]) != 0x04 ||
+            offsetof(tss_t, rsp[1]) != 0x0c ||
+            offsetof(tss_t, rsp[2]) != 0x14 ||
+            offsetof(tss_t, ist[0]) != 0x24 ||
+            offsetof(tss_t, ist[6]) != 0x54 ||
+            offsetof(tss_t, iomap_base) != 0x66) {
+            test_fail("phase4-tss", "tss_t is laid out at rsp0=%#x rsp1=%#x "
+                      "rsp2=%#x ist1=%#x ist7=%#x iomap=%#x, expected "
+                      "0x04/0x0c/0x14/0x24/0x54/0x66",
+                      (unsigned)offsetof(tss_t, rsp[0]),
+                      (unsigned)offsetof(tss_t, rsp[1]),
+                      (unsigned)offsetof(tss_t, rsp[2]),
+                      (unsigned)offsetof(tss_t, ist[0]),
+                      (unsigned)offsetof(tss_t, ist[6]),
+                      (unsigned)offsetof(tss_t, iomap_base));
+            return;
+        }
+
+        /* And the reserved words the processor reads *instead* of the stack
+         * pointers, when the layout above is wrong: they have to be zero so that a
+         * fault at least fails loudly rather than stacking onto a number. */
+        if (kernel_tss[i].reserved0 != 0 || kernel_tss[i].reserved2 != 0 ||
+            kernel_tss[i].reserved3 != 0) {
             test_fail("phase4-tss", "processor %u's TSS reserved words are "
-                      "not zero (%#lx, %#lx)", i,
-                      (unsigned long)kernel_tss[i].reserved1,
-                      (unsigned long)kernel_tss[i].reserved2);
+                      "not zero (%#lx, %#lx, %#lx)", i,
+                      (unsigned long)kernel_tss[i].reserved0,
+                      (unsigned long)kernel_tss[i].reserved2,
+                      (unsigned long)kernel_tss[i].reserved3);
             return;
         }
 
