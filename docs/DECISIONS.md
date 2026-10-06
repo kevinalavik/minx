@@ -827,3 +827,132 @@ written backwards, the frame's SS and RSP swapped, the TSS base wrong) all prese
 itself and the hardware was being asked the wrong question -- or the question was right and
 the answer was not being read. `docs/STATUS.md` records, for each, the measurement that
 settled it rather than the argument that did not.
+
+---
+
+## 2026-10-06: the 64-bit TSS has one reserved quadword, not two, and its stack pointers start at 0x04
+
+`tss_t` carried `reserved0` and `reserved1`, so every field after the top sat four bytes
+above where the processor reads it. RSP0 came out of the reserved word (zero), IST1 came
+out of `reserved2` (zero), and `iomap_base` landed on a reserved word — which still means
+"no I/O bitmap", so the test that checks it passed.
+
+The offsets are `reserved0` 0x00, `rsp[0..2]` 0x04/0x0C/0x14, `reserved2` 0x1C,
+`ist[0..6]` 0x24..0x54, `reserved3` 0x5C, `reserved4` 0x64, `iomap_base` 0x66. The size is
+0x68.
+
+**Where the offsets came from.** Two independent implementations, both read rather than
+recalled:
+
+- QEMU's `get_rsp_from_tss()` computes the offset as `8 * level + 4`, and is called with
+  `level = dpl` for a privilege change and `level = ist + 3` for an IST — which puts IST1
+  at 0x24. The same 4-byte-short shape appears in `switch_tss_ra()`'s 32-bit branch.
+- Linux's `struct x86_hw_tss` is `{ u32 reserved1; u64 sp0; u64 sp1; u64 sp2; u64
+  reserved2; u64 ist[7]; u32 reserved3; u32 reserved4; u16 reserved5; u16
+  io_bitmap_base; } __attribute__((packed))`, so `sp0` is at offset 4 and
+  `io_bitmap_base` at 0x66 — and Linux takes a ring-3 stack switch on every syscall on
+  every machine anyone runs it on.
+
+The 64-bit TSS is the 32-bit TSS's `esp0` slot widened to 64 bits: it keeps the 32-bit
+layout's `esp0` position and spends the next eight bytes on the ring-1 pointer that the
+32-bit layout spends on `ss0`. Adding a second reserved dword "for symmetry" is exactly
+the mistake the comment in `kernel/include/cpu.h` now warns about.
+
+**Why nothing noticed for five phases.** An exception at CPL 0 needs no stack switch — the
+CPU pushes onto the stack it is already on — so every fault test from phase 1 onward
+passes with a completely unusable TSS. Nothing about the ring-3 boundary works until
+something switches stacks, and `phase6-user`'s first syscall is the first thing that does.
+
+**The test is the other half of this.** `phase4-tss` used to check `reserved1 == 0 &&
+reserved2 == 0`, which a struct full of zeros satisfies however it is laid out. It now
+asserts `offsetof(tss_t, rsp[0]) == 0x04` and friends. The processor reads a byte at a
+fixed offset; asserting a field by name asks a different question, and this one had the
+same answer either way.
+
+## 2026-10-06: the TSS descriptor's base is a physical address, and it has to be mapped there too
+
+A TSS descriptor's base is fetched by physical address; the TSS is not subject to paging
+even in long mode. Two things follow, and both bit.
+
+**`virt_to_phys()` is not the conversion.** It subtracts the direct-map offset and is only
+correct for an address *in* the direct map. The kernel image is not in the direct map — it
+is mapped once, at `__kernel_start`, from whatever physical base the bootloader chose — so
+converting an image address that way gives `0x00008000xxxx_xxxx` for `0xffffffff80xxxxxx`,
+which reads like a plausible low physical address and has nothing behind it.
+`vmm_kernel_phys()` asks `vmm_init()`, which gets the image's physical base by walking the
+bootloader's own tables. It asks rather than derives: `virt - 0xffffffff80000000` is zero
+only if the bootloader happened to load at physical zero, and it does not, because the
+firmware memory map has no entry covering physical page zero at all.
+
+**On QEMU the fetch goes through the page tables, so the address must also be mapped.**
+The diagnostic was a `#PF` whose `CR2` sat exactly four bytes past the descriptor's base —
+an address nothing in the kernel had, four bytes into a page that was mapped nowhere.
+
+Linux never meets this because its per-CPU area — which is where its TSS lives — sits in a
+region it maps at its own physical address, which is what `vmm_map_identity()` does here
+for one page: in the kernel's tables, and again in every address space created afterwards.
+
+The intermediate tables for that mapping must be **user-accessible while the leaf is not**.
+The TSS page holds the kernel's stack pointers and ring 3 must not reach it, and it lands
+in PML4 slot 0 — the slot every user mapping below 512 GiB also goes through. With the
+intermediates marked supervisor-only, `walk_to_leaf()` refused every user mapping in that
+slot and the ELF loader failed with `elf: could not map 0x3ff000`. Hence
+`pt_map_supervised_range()`: walkable intermediates, locked leaf.
+
+Each address space gets its own tables for it, walked from its own PML4 rather than
+pointing at the kernel's, so a process mapping anything nearby cannot disturb the kernel's
+copy and `vmm_address_space_destroy()` frees only what that space owns.
+
+## 2026-10-06: `ltr` caches the TSS, and a second `ltr` is refused
+
+`ltr` reads the descriptor and *caches* the base, limit and attributes inside the
+processor; from then on the TSS is fetched from that cache. Rewriting the GDT entry changes
+the bytes in the table and nothing else.
+
+So `gdt_init()`'s `ltr` — which runs first in `kmain()`, deliberately, so a fault is
+reportable from the first instruction — cached base zero, because at that point
+`vmm_kernel_phys()` correctly refused to answer. The correct descriptor installed after
+`vmm_init()` was never seen. QEMU's register dump says so plainly: `TR =0028
+0000000000000000 0000006b` — base zero, limit correct, and a right-looking limit is the
+misleading part.
+
+Two consequences, both confirmed by experiment rather than reasoned about:
+
+- Refreshing the cache means `ltr` again — but **not** `gdt_reload_for()`, which also
+  reloads the data segments and so re-reads `%gs`'s base from the table. The per-CPU base
+  lives in `MSR_GS_BASE`, so that turns `percpu_self()` into a NULL dereference in the
+  first timer tick: a fault that points at the timer and not at the segment reload that
+  caused it. `tss_reload_for()` is the `ltr`-only version, and it exists for that reason.
+- A second `ltr` on a TSS that is already busy fails with `#GP` reporting the selector
+  (error code `0x28`, the TSS selector itself). So `tss_reload_for()` writes the descriptor
+  again first — which clears the busy bit that `ltr` set — and *then* loads it. Only one
+  identity-mapped region is tracked, and a second different one is refused rather than
+  silently displacing the first.
+
+## 2026-10-06: a preempted ring-3 task is saved as the interrupt frame, whole
+
+The scheduler's switch saved six callee-saved registers and a return address. For a task
+interrupted in ring 3 it additionally copied the five words `iretq` consumes — RIP, CS,
+RFLAGS, RSP, SS — to just above them.
+
+That is a complete ring-3 *frame* and not a complete ring-3 *context*. `%rax`, `%rbx`,
+`%rcx`, `%rdx`, `%rsi`, `%rdi`, `%rbp` and `%r8`–`%r12` came back as whatever the
+*switching* task left in them. `hello` resumed holding a `page_table_t` pointer in `%r8` and
+dereferenced it, which reads as a wild pointer in the program and was entirely the kernel's.
+
+The fix is smaller than the workaround it replaces. `regs_t` — the block `isr_common()`
+already hands `isr_dispatch()` — is contiguous and *ends* in the five words `iretq` wants,
+so a ring-3 context is saved as that block, by pointer, and restored by `isr_common()`'s own
+tail with the dispatcher's return address left off. Nothing is copied and all fifteen
+registers come back.
+
+This also removed a condition rather than adding one. The copy version had to write *above*
+`%rsp`, into the frame chain of whoever called `schedule()`, which is only safe because
+that task will resume by `iretq` and never come back up that stack. Saving a pointer has no
+such condition — and the two tails having to stay in step is now the only thing to remember.
+
+`percpu_t.from_user` says a ring-3 context exists; `percpu_t.user_frame` says where. Both
+are recorded by `isr_dispatch()` and both consumed by `schedule()`. The marker is cleared on
+the syscall path too, because that path never reaches the scheduler — the door holds IF
+clear for its whole length, so a tick cannot arrive inside it and there is nothing to
+preempt, which would otherwise leave the marker set for the *next* save to misread.

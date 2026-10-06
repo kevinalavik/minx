@@ -174,3 +174,32 @@ exists because reading `%gs` twice to check that GS is self-consistent looks lik
 consistency check and is not one — a task can be migrated between the two reads, and
 the report then says GS points at the wrong state when it pointed at the right one and
 the task simply moved.
+
+### And a fifth, for ring-3 contexts
+
+The fourth rule above is about *when* a saved context becomes visible. This one is about
+*what* is saved, and it was wrong for the whole of phase 6 while every lock in the tree
+behaved:
+
+> **A ring-3 task's saved context is the interrupt frame, whole — not six callee-saved
+> registers with a copy of the `iretq` words attached.**
+
+`regs_t` is contiguous and ends in the five words `iretq` consumes, so it is saved by
+pointer and restored by `isr_common()`'s own tail. Anything less is not a smaller save, it
+is a different one: reconstructing the frame alone leaves `%rax`, `%rbx`, `%rcx`, `%rdx`,
+`%rsi`, `%rdi`, `%rbp` and `%r8`–`%r12` to be whatever the *switching* task left in them,
+and a ring-3 program resumes holding kernel data in registers it is entitled to trust.
+
+Two things about the save are load-bearing and neither is obvious:
+
+- **`percpu_t.from_user` and `percpu_t.user_frame` are set together and consumed
+  together.** The flag says a ring-3 context exists; the pointer says where. `schedule()`
+  cannot find the frame itself, because by then the handler that was entered has built
+  frames of its own *below* it. The syscall path clears both on the way out, because it
+  never reaches `schedule()` — the door holds IF clear for its whole length — and a
+  marker left set would be misread by the next save.
+- **A kernel-context save writes nothing above `%rsp`.** The earlier version copied five
+  words to `saved_rsp + 48`, which is inside the frame chain of whoever called
+  `schedule()`. That is only safe because the same task will resume by `iretq` and never
+  come back up that stack, so those frames are already abandoned. Saving a pointer removes
+  the condition rather than documenting it.

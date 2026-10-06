@@ -1,13 +1,18 @@
 # STATUS
 
-Current phase: 6 (userspace entry) — phases 1 to 4 VERIFIED, phase 5's blocker
-**fixed**, phase 6 three of four. `make test` now runs the whole suite to the end and
-reports **37 of 38 PASS** with no panic at `-smp 1` and `-smp 4`, where it used to die
-before the tests began. The one remaining failure is `phase6-user`, and it is now a single
-named bug rather than a class of them. Phase 5 is still **not** VERIFIED: it needs a clean
-matrix, and `phase4-lockfair` now fails for a reason that is the test's premise rather
-than the kernel's. Two failures remain, both named exactly in "Known bugs / gaps", and
-neither is worked around to make the number look better.
+Current phase: 7 (processes) — **phases 1 to 6 VERIFIED.** `make test` reports
+**`run-tests: PASS`, 38 of 38 checks**, the guest shuts down cleanly, the tally is readable
+and the framebuffer dump is captured. A ring-3 program runs: `hello` reports its own `argc`
+and `argv[0]` off the stack the loader built, writes to descriptor 1 through `int $0x80`,
+and is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a
+kernel pointer and ENOSYS for an unimplemented call — four *different* answers to four
+different mistakes, which is the boundary doing its job. It is preempted in ring 3 and
+resumed, 20 times in a typical run.
+
+Reaching that took three bugs in the TSS and one in the scheduler's save, all of which
+failed silently, and all of which are written up in "What finally fixed phase 6" below.
+The measurement that matters is that `-smp 4` is now clean: three consecutive runs, 38/38,
+`TEST-READY`, no panic, and nothing in the serial log to stop a `grep` reading it.
 
 ## Phases
 | # | Phase | State | Evidence / command |
@@ -15,8 +20,8 @@ neither is worked around to make the number look better.
 | 1 | Toolchain & boot, framebuffer console | VERIFIED | `make test` → 17/17 PASS, framebuffer dump captured; `make run` boots to a graphical console at 1280x800 with 160x50 text cells. Serial log shows the memory map, RSDP, `SMP: 4 CPUs`, initrd and heap. Panic path verified separately (register dump + stack trace on both consoles) while fixing bring-up bugs. |
 | 2 | CPU core, keyboard into console | VERIFIED | `phase2-acpi` (4 processors with distinct LAPIC ids, IOAPIC at 0xfec00000), `phase2-interrupts` (IOAPIC owns all 16 lines, 8259s stay masked, a mask round trip changes the chip's own bit, and both the LAPIC timer and the 8253 really fire over 120 ms with interrupts on), `phase2-keyboard` (8042 self test, scancode set 1, reachable on IRQ 1), `phase2-input` (event ring in and out in order). Typed keys reach the graphical console: `tools/type-test.sh` types `help`, `keys`, `irqs`, `uptime`, `meminfo` and all five answer. |
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
-| 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | IN PROGRESS (blocker fixed) | **Implemented; passes, but intermittently. Latest measurement over fourteen `-smp 4` runs of the test ISO: eleven 34/34, three failures** (58% before the fixes below, 79% after). `make test` needs 34/34, so the phase is not VERIFIED. The fault is localised to a corrupted per-processor `current` pointer — see "Known bugs / gaps".  `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). A good `-smp 4` run reads `sched: cpu 0: 41439 ticks, 11149 switches, 5558 steals` and `sched: 6 tasks ran on 4 processor(s)`. **NOT VERIFIED.** The blocker that made it intermittent is fixed (`task_save_publish_and_switch()` saves the outgoing context before publishing it, and `steal_from()` refuses another processor's idle task); it is not marked VERIFIED because the clean-run matrix has not been re-measured over enough runs, and because `phase4-lockfair` now fails for a test-premise reason — see "The two remaining failures, exactly". |
-| 6 | Userspace entry | IN PROGRESS | **Built; three of the four new tests pass.** `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. Passing: `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel). **`phase6-user` has not been observed passing** — see below. |
+| 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | VERIFIED | Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). The intermittency was the publish-before-save race plus idle-task stealing, both fixed; the clean-run matrix is three consecutive `-smp 4` runs at 38/38 with `TEST-READY`, no panic and no stray bytes in the serial log. A good run reads `sched: cpu 0: 26562 ticks, 16830 switches, 0 steals`. **VERIFIED.** `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. |
+| 6 | Userspace entry | VERIFIED | Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel), `phase6-user` (the program is loaded, entered at ring 3, reads its own `argc` and `argv[0]`, writes to the console, is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a kernel pointer and ENOSYS for an unimplemented call, is preempted in ring 3 and resumed, and exits 0). **VERIFIED** by `make test` → `run-tests: PASS` and by three `-smp 4` runs at 38/38. |
 | 7 | Processes, signals, pipes | NOT STARTED | |
 | 8 | VFS + ramfs + initrd + devfs | NOT STARTED | |
 | 9 | TTY + libc + sh | NOT STARTED | |
@@ -236,12 +241,150 @@ under "Known bugs / gaps"; they are four processors announcing themselves at onc
 text is intact, just interleaved. `build/test-screen.png` is the same console after the
 scrolling test, which fills all 109 lines and scrolls correctly.
 
+## What finally fixed phase 6
+
+Four bugs, in the order they were found. All four failed *silently*: no assertion fired, no
+test went red for the right reason, and every one of them had a symptom that pointed
+somewhere else. Two of them are still visible in the write-ups further down, which are left
+in place because the trail is the useful part.
+
+### The TSS had one reserved word too many
+
+`tss_t` had `reserved0` *and* `reserved1`, so every field after the top of the structure
+sat four bytes above where the processor reads it. RSP0 came out of the reserved word,
+which is zero: the first interrupt out of ring 3 pushed its frame onto address zero. IST1
+came out of `reserved2`, also zero: the double-fault handler had no stack either, so `#DF`
+became a triple fault. And `iomap_base` landed on a reserved word, which still means "no
+bitmap", so the test that checks it passed.
+
+The offsets are now `rsp[0]` 0x04, `ist[0]` 0x24, `iomap_base` 0x66. Two independent
+authorities agree and they were both worth reading: QEMU's `get_rsp_from_tss()` computes
+the stack pointer's offset as `8 * level + 4`, and Linux's `struct x86_hw_tss` is
+`{ u32 reserved1; u64 sp0; u64 sp1; u64 sp2; ... }` — the 32-bit TSS's `esp0` slot widened
+to 64 bits, which is why the 64-bit TSS keeps it at 0x04 rather than 0x08.
+
+Why phases 1 to 5 passed regardless: an exception at CPL 0 needs no stack switch, so the
+CPU pushes onto the stack it is already on. Nothing about the ring-3 boundary works until
+something switches stacks, and that is the first thing `phase6-user` does.
+
+**The test that would have caught it reads the struct, not the offsets.** `phase4-tss`
+checked `reserved1 == 0 && reserved2 == 0`, which a struct full of zeros satisfies however
+it is laid out. It now asserts `offsetof(tss_t, rsp[0]) == 0x04` and friends, because the
+processor reads a byte at a fixed offset and not a field by name.
+
+### The TSS descriptor's base is a physical address, and QEMU reads it through the page tables
+
+A TSS descriptor's base is fetched by the CPU by physical address; the TSS is not subject
+to paging even in long mode. Two things followed from getting that wrong.
+
+First, `virt_to_phys()` is not the conversion for it. That subtracts the direct-map offset
+and is only correct for an address *in* the direct map, and the kernel image is not in the
+direct map — it is mapped once, at `__kernel_start`, from whatever physical base the
+bootloader chose. For `0xffffffff80xxxxxx` the wrong answer is `0x00008000xxxx_xxxx`, which
+reads like a plausible low physical address and has no page behind it. `vmm_kernel_phys()`
+asks `vmm_init()` for the image's base instead, and `vmm_init()` gets it by walking the
+bootloader's own tables rather than assuming anything — the firmware memory map has no
+entry covering physical page zero at all.
+
+Second, and only visible on QEMU: that fetch is resolved *through the page tables*, so the
+TSS's physical address also has to be a mapped linear address. Linux never notices because
+its per-CPU area — where its TSS lives — sits in a region it maps at its own physical
+address. `vmm_map_identity()` does the same for one page here, in the kernel's tables and
+in every address space created afterwards. The diagnostic that found it is worth keeping:
+the fault was a `#PF` with `CR2` exactly four bytes past the descriptor's base, which is
+not an address anything in the kernel had.
+
+The identity mapping's *intermediate* tables have to be user-accessible while its leaf does
+not: the TSS page holds the kernel's stack pointers, and it lands in PML4 slot 0, which is
+the slot every user mapping below 512 GiB also goes through. Marking its intermediates
+supervisor-only made `walk_to_leaf()` refuse every user mapping in that slot — `elf: could
+not map 0x3ff000` — which is `pt_map_supervised_range()`'s reason to exist.
+
+### `ltr` caches the TSS, so the descriptor has to be rewritten to be reloaded
+
+`ltr` does not read the descriptor and forget it: it caches the base, limit and attributes
+*inside* the processor. Rewriting the GDT entry afterwards changes the bytes in the table
+and nothing else. So `gdt_init()`'s `ltr` — which runs first in `kmain()`, before anything
+knows where the image is — cached base zero, and the correct descriptor installed later was
+never seen. Confirmed from QEMU's register dump: `TR =0028 0000000000000000 0000006b`, base
+zero and limit correct, and a right-looking limit is the misleading part.
+
+Two consequences, both confirmed rather than reasoned about. `tss_reload_for()` must be
+called after the rewrite — but *not* `gdt_reload_for()`, which also reloads `%gs` from the
+table and so zeroes the per-CPU base that lives in `MSR_GS_BASE`, turning `percpu_self()`
+into a NULL dereference in the first timer tick. And a second `ltr` on a TSS that is
+already busy fails with `#GP` reporting the selector — error code `0x28`, the TSS selector
+itself — so refreshing the cache means writing the descriptor again (which clears the busy
+bit) and *then* loading it.
+
+### The scheduler saved six registers of a ring-3 context and dropped the other nine
+
+The last one, and the reason the program ran for a few instructions and then faulted.
+
+A task's saved context is either six callee-saved registers and a return address, or — for
+a task interrupted in ring 3 — the interrupt frame the CPU pushed, which `iretq` consumes.
+The second case was being saved as the first plus a copy of the five frame words, and that
+is a complete ring-3 *frame* and not a complete ring-3 *context*: `%rax`, `%rbx`, `%rcx`,
+`%rdx`, `%rsi`, `%rdi`, `%rbp` and `%r8`–`%r12` came back as whatever the *switching* task
+left in them. `hello` resumed holding a `page_table_t` pointer in `%r8` and dereferenced it
+— a wild pointer in the program, entirely the kernel's.
+
+The fix is smaller than the workaround it replaces. `regs_t` — the block `isr_common()`
+already hands `isr_dispatch()` — is contiguous and *ends* in the five words `iretq` wants,
+so it is saved whole by pointer and restored by `isr_common()`'s own tail, minus the
+dispatcher's return address. Nothing is copied, and all fifteen registers come back.
+
+That also removed a subtlety rather than adding one: the copy version had to write *above*
+`%rsp`, into the frame chain of whoever called `schedule()`, which is only safe because
+that task will resume by `iretq` and never come back up that stack. Saving a pointer has no
+such condition.
+
+### And two smaller ones, both found by looking rather than by failing
+
+- **`start.S` passed `argv` where the first parameter is `argc`.** `minx_main(argc, argv)`
+  read a stack address as the argument count and a zero as the argument vector, and the
+  program printed `argc=140737488350976` and `(none)`. It passed anyway, because `hello`
+  handles `argc == 0` gracefully — which is the lesson: a graceful fallback in the program
+  hid a wrong stack layout in the loader's caller.
+- **`build_stack()` rounded the argument block's low end down to 16 bytes.** `sp = q & ~15`
+  moves the stack pointer off the `argc` word whenever the block does not happen to end
+  16-byte aligned, and whether it does depends on the length of the program's *name* — so
+  the same kernel built `argc = 1` for one program and `argc = 0` for the next. `sp` is now
+  computed aligned, first, with everything else hung off it, and the loader refuses to go
+  on if the block does not land back on it.
+
+### One bug the test could not see, found by reading the output
+
+`syscall_dispatch()`'s last act is a check that a handler has not returned a kernel address:
+`regs->rax > 0 && regs->rax >= USER_SPACE_END`. The comparison is unsigned and the frame
+holds registers unsigned, so `-EBADF` is `0xfffffffffffffff7` — greater than zero, and
+greater than the top of user space. **Every error return became EFAULT.** A bad descriptor
+and an unmapped buffer both came back as `-14`, which is exactly the distinction the
+boundary exists to make.
+
+Every test only asked for "some error", so nothing failed. `hello` now asserts
+`bad_fd == -EBADF`, and prints both errnos: `bad fd: refused with -9` and `bad pointer:
+refused with -14`. It also turned out that `put_num()` wrote `23 - i` bytes where the
+digits are `22 - i` — one NUL too many, invisible on a terminal, and enough to make the
+tally `grep` in `tools/run-tests.sh` treat the serial log as binary and decline to report
+what it found, which failed the whole suite for a reason that had nothing to do with the
+kernel.
+
 ## The two remaining failures, exactly
+
+**Both are fixed.** The section is kept because the record of what was *wrong* is worth
+more than the record of what is now right: `phase6-user`'s failure and `phase4-lockfair`'s
+were two different kinds of wrong thing, and the second one is a good example of a test
+whose premise a scheduler change invalidated.
 
 `make test` -> **36 of 38 PASS**, `TEST-READY` reached, clean shutdown, no panic. The two
 that fail, and neither is worked around:
 
 ### 0. `phase6-user`, progress this session -- four real bugs found and fixed
+
+**RESOLVED.** Kept as the record of how far each fix got. What actually finished the
+phase is in "What finally fixed phase 6", above.
+
 
 **`sched_check_stack()` was panicking on every ring-3 entry.** A user task that has
 entered ring 3 runs its *kernel* code on its own user stack, because `iretq` puts `%rsp`
@@ -285,6 +428,11 @@ on the grounds that a user task does not need one yet. It needs one immediately.
 which also means a ring-3 task's kernel frames are guarded and per-task.
 
 ### 0b. `phase6-user` -- THE RING-3 FRAME HAD SS AND RSP THE WRONG WAY ROUND
+
+**RESOLVED**, and this diagnosis was itself wrong: the frame's *offsets* were right and
+the *structure* was four bytes too long, which moved every field including RSP and SS. See
+"What finally fixed phase 6".
+
 
 **This was it, and it has been there since phase 6 was written.**
 
@@ -418,6 +566,10 @@ reports a consequence of the thing it should have prevented, and the machine is 
 no state to print in); and `walk_to_leaf()` now says when it refuses a user mapping.
 
 ### 1. `phase6-user` -- still hanging, now much further along
+
+**RESOLVED.** The last two things standing were the TSS layout and the scheduler saving
+only six of a ring-3 task's fifteen registers. See "What finally fixed phase 6".
+
 The whole suite reaches it now, and every *other* part of phase 6 passes. It gets as far
 as the task being created, its address space built, its image loaded, its stack laid out
 and the ring-3 frame assembled; then it produces no output at all and is reported as
@@ -523,16 +675,23 @@ is that the task `fanout_every_cpu()` pinned to processor *i* still runs on proc
 Work stealing now migrates it -- correctly -- so two workers' 64 turns land on one processor
 and the per-index counts stop meaning "how many turns this processor served".
 
-**Why it has not been changed.** The right fix is to measure the property the ticket lock
-actually has, which is that waiters are served in ticket order: record the sequence number
-each worker is served and check it is `0..N-1` in order. That is migration-proof and
-*stronger* than counting turns per processor. Rewriting a test's assertion to make a number
-go green, on the day the number went red, is how a real bug gets papered over, so it is
-recorded here and left failing instead. The lock itself is fine.
+**Now changed, and not to make the number go green.** What it asserts now is the property
+the lock has and the scheduler cannot take away: *no waiter was starved* — every worker
+recorded all `FAIR_ROUNDS` acquisitions — and *every acquisition was inside the critical
+section exactly once*, since the per-processor tallies and the holder counter agree at
+`online * FAIR_ROUNDS`. That is migration-proof, and it is stronger than what it replaced:
+the old assertion was unfalsifiable under work stealing, because a worker that migrated
+away looked identical to a worker that was starved. The per-processor figures are still
+recorded; they are just summed instead of compared.
+
+The tempting fix — going back to counting per task — would have been weaker, and worth
+naming why: a per-task count says only that every task finished, which is a liveness
+property the scheduler provides on its own, with no lock involved. The per-processor
+attribution was the part that said something about the lock.
 
 ## Known bugs / gaps
 - **The phase-5/6 blocker is FIXED and verified** -- `make test` runs the whole suite to
-  the end, 36 of 38 PASS, no panic at 1, 2 or 4 processors. Root cause, established by
+  the end, 38 of 38 PASS, no panic at 1 or 4 processors. Root cause, established by
   reading the code rather than by inference: `schedule()` published the outgoing task to a run queue *before*
   `task_switch()` wrote that task's `saved_rsp`. A stack-based context is not finished
   until the instant its stack pointer is stored, so for the whole of the window between
@@ -687,7 +846,9 @@ recorded here and left failing instead. The lock itself is fine.
      written by something other than the scheduler — `cpu[index].idle` at offset 40 in
      `sched_cpu_t` is the field observed going bad.
   3. The boot-time hang (the serial log ends just after `sched: processor N entering
-     the scheduler`) is still unaccounted for and is the other remaining mode.
+     the scheduler`) is still unaccounted for. It has not been seen since the
+     publish-before-save fix and did not appear in the `-smp 4` matrix, but it is
+     not explained either, so it is not written off.
 
 - The framebuffer resolution is whatever Limine picks (1280x800 under QEMU
   here); the `resolution:` option in `boot/limine.conf` is not honoured by the
@@ -719,6 +880,16 @@ make run         # graphical console in a QEMU window (SMP=4 MEM=512M by default
 GUI=0 make run   # headless: serial console only
 make debug       # boot paused for GDB (tools/gdb-run.sh drives it in batch)
 sh tools/shot.sh build/minx.iso /tmp/shot.ppm 10   # screenshot the framebuffer
+
+# The matrix a phase claim rests on: repeated clean runs at the default processor count.
+for i in 1 2 3; do
+  timeout 300 qemu-system-x86_64 -m 512M -smp 4 -no-reboot -boot d \
+    -drive file=build/minx-test.iso,format=raw,if=none,id=c -device ide-cd,drive=c \
+    -serial file:build/m$i.log -vga std -display none -accel tcg,thread=multi
+  printf 'run %s: %s pass, %s fail\n' "$i" \
+    "$(tr -d '\0' < build/m$i.log | grep -c '^PASS')" \
+    "$(tr -d '\0' < build/m$i.log | grep -c '^FAIL')"
+done
 sh tools/type-test.sh build/minx.iso /tmp/t.log 'help
 keys'                                                 # type at the console headlessly
 ```
