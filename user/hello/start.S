@@ -1,10 +1,9 @@
 /* minx user program entry.
  *
- * The ABI hands a program argc in RDI and argv at [RSP], and nothing else.  RCX and R11
- * are undefined -- the kernel does not promise anything about them across a process
- * start -- so this clears them before any C code can assume anything, and puts the
- * stack pointer into a register so the frame below is 16-byte aligned as the ABI
- * requires at the first `call`.
+ * RCX and R11 are undefined -- the kernel does not promise anything about them across a
+ * process start -- and the `int $0x80` in every call below clobbers them, which is why
+ * they are in each inline asm's clobber list.  The stack is aligned to 16 bytes here, as
+ * the ABI requires at the first `call`.
  *
  * `xor %ebp, %ebp` is not decoration: it is the frame-pointer chain terminator, so a
  * debugger or a crash report walking it stops here instead of walking into whatever the
@@ -15,9 +14,20 @@
 .type _start, @function
 _start:
     xorl    %ebp, %ebp
-    movq    %rsp, %rdi          /* argv, which is also at [rsp] */
-    xorl    %esi, %esi          /* no envp yet, and say so     */
-    xorl    %edx, %edx          /* neither is AT_*             */
+    /* The loader builds the entry stack the SysV ABI describes: at the stack pointer,
+     * `argc`; above it `argv[0]`, the NULL that ends argv, then envp, then the
+     * auxiliary vector.  So the two arguments are two *different* words of it -- the one
+     * at the stack pointer, and the eight bytes above that.
+     *
+     * Reading only the first and calling it argv is the mistake this comment replaces:
+     * `minx_main(argc, argv)` then took a stack address as the argument count and a
+     * zero as the argument vector, so the program reported an argc of 140737488350976
+     * and `(none)` for argv[0] -- and passed, because the program handles argc == 0
+     * gracefully.  A graceful fallback in the program hid a wrong stack layout in the
+     * loader's caller. */
+    movq    (%rsp), %rdi         /* argc */
+    leaq    8(%rsp), %rsi        /* argv */
+    xorl    %edx, %edx           /* auxv is AT_NULL, not a descriptor */
     andq    $-16, %rsp
     call    minx_main
 

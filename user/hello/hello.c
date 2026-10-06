@@ -30,7 +30,15 @@ static void put_num(unsigned long v) {
         buf[i--] = (char)('0' + (v % 10));
         v /= 10;
     }
-    minx_write(1, &buf[i + 1], (unsigned long)(23 - i));
+    /* The digits are buf[i+1 .. 22], which is `22 - i` of them -- not `23 - i`.
+     *
+     * The off-by-one sends the terminator as well, and it is invisible here: a NUL
+     * printed to a terminal moves nothing, so the numbers all read correctly while the
+     * program is quietly writing bytes nobody asked for.  It was not invisible to
+     * `make test`, whose tally grep reads the serial log and treats a file with NULs in
+     * it as binary and declines to report what it found -- so four correct-looking
+     * numbers failed the whole suite. */
+    minx_write(1, &buf[i + 1], (unsigned long)(22 - i));
 }
 
 int minx_main(unsigned long argc, char **argv);
@@ -61,6 +69,15 @@ int minx_main(unsigned long argc, char **argv) {
     long bad_fd = minx_write(99, "should not appear\n", 18);
     if (bad_fd >= 0) {
         put("open fd: FAILED, the kernel accepted a bad descriptor\n");
+        return 1;
+    }
+    /* And it has to be *this* error.  "Some error" was all this asked for until the
+     * kernel started answering EBADF with EFAULT: every negative return was being
+     * compared unsigned against the top of user space, which a negative number passes,
+     * so the boundary's own sanity check was rewriting one error into another and no
+     * test here could see it. */
+    if (bad_fd != -EBADF) {
+        put("open fd: FAILED, expected EBADF\n");
         return 1;
     }
     put("bad fd: refused with -");

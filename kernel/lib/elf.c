@@ -137,6 +137,41 @@ static bool load_segment(page_table_t *tables, const uint8_t *image, uint64_t vi
  *
  * which is the order the ABI specifies, and putting `sp` at the bottom of it is what
  * makes `_start` fall out with argc in RDI and argv at [rsp]. */
+/* Write one quadword into a task's user stack.
+ *
+ * Through the direct map of whatever frame backs that particular address, because the
+ * stack's pages are not physically contiguous -- see build_stack().
+ */
+static void stack_put(task_t *t, uint64_t vaddr, uint64_t value) {
+    uint64_t phys = vmm_translate_in(t->tables, vaddr & ~(page_size - 1));
+
+    if (phys == 0)
+        return;
+    *(uint64_t *)phys_to_virt(phys + (vaddr & (page_size - 1))) = value;
+}
+
+/* Write `n` bytes into a task's user stack, crossing page boundaries as needed. */
+static void stack_write(task_t *t, uint64_t vaddr, const void *src, size_t n) {
+    const uint8_t *from = (const uint8_t *)src;
+
+    while (n != 0) {
+        uint64_t page = vaddr & ~(page_size - 1);
+        size_t off = (size_t)(vaddr - page);
+        size_t chunk = page_size - off;
+        uint64_t phys = vmm_translate_in(t->tables, page);
+
+        if (phys == 0)
+            return;
+        if (chunk > n)
+            chunk = n;
+
+        memcpy((void *)(phys_to_virt(phys) + off), from, chunk);
+        from += chunk;
+        vaddr += chunk;
+        n -= chunk;
+    }
+}
+
 static bool build_stack(task_t *t, uint64_t entry, const char *path,
                         uint32_t stack_pages, uint64_t *entry_rsp) {
     uint64_t top = USER_STACK_TOP;
@@ -155,7 +190,6 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
         return false;
     }
 
-    uint8_t *base = (uint8_t *)phys_to_virt(t->user_stack_phys);
     uint64_t cap = (uint64_t)stack_pages * page_size;
 
     /* The top of the stack belongs to the two frames, not to the program.
@@ -221,15 +255,64 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
 
     /* 256 bytes of slack below the block so a program's first few frames cannot walk
      * off the bottom of the stack into whatever the allocator gave us. */
-    if (block_bytes + strings_bytes + 256 > usable)
+    if (block_bytes + strings_bytes + 256 + 16 > usable)
         return false;
 
-    memset(base, 0, usable);
+    /* Zero every page of the stack, one page at a time, through the direct map of each
+     * page's *own* frame.
+     *
+     * The obvious spelling of this -- take the bottom page's frame and memset `usable`
+     * bytes from it -- is wrong, and wrong in a way that took the whole phase-6 boundary
+     * with it.  The pages of a task's stack are **not physically contiguous**: they come
+     * from the same allocator as the page tables, so the frames the loader allocated
+     * afterwards land *between* them.  Measured on this kernel: the eight stack pages are
+     * 0x513d000, 0x5141000, 0x5142000 ... 0x5147000 -- with page directories, a PDPT and a
+     * leaf frame in the gaps.  A memset from the bottom page runs straight through those
+     * gaps, so zeroing the user's stack silently zeroed the page tables, and the entry
+     * point's mapping vanished between being written and being used.
+     *
+     * Every access to the stack therefore goes through a translation now, and the layout
+     * is arithmetic on *user* virtual addresses rather than on a kernel pointer, which is
+     * also what the program sees.
+     *
+     * The topmost page is skipped: it holds the scheduler's bootstrap context and the
+     * ring-3 return frame, which task_create_user() built. */
+    /* The condition is on the *end* of each page, not its start: the topmost page holds
+     * the frames, and testing `a < top - frames` still admits it because its first byte is
+     * well below them -- which zeroes the frame and leaves the first `ret` returning to
+     * address zero.  The topmost page is skipped deliberately; it arrives zeroed anyway,
+     * because `vmm_user_page_alloc()` hands out zeroed frames. */
+    for (uint64_t a = top - cap; a + page_size <= top - frames; a += page_size) {
+        uint64_t phys = vmm_translate_in(t->tables, a);
+
+        if (phys == 0) {
+            kprintf("elf: the stack page at %#lx is not mapped\n", (unsigned long)a);
+            return false;
+        }
+        memset((void *)phys_to_virt(phys), 0, page_size);
+    }
 
     /* The strings, at the top of the region the program owns. */
-    uint8_t *p = base + usable - strings_bytes;
-    memcpy(p, path, path_len);
-    p[path_len] = 0;
+    /* Lay the block out from an *aligned* stack pointer rather than from the strings down.
+     *
+     * `sp = q & ~15` rounds the block's low end down, which quietly moves the stack
+     * pointer off the `argc` word whenever the block does not happen to end 16-byte
+     * aligned -- and whether it does depends on the length of the program's name, so the
+     * same kernel built `argc = 1` for one program and `argc = 0` for the next.  A
+     * program entered that way reads a zero where its argument count should be, which is
+     * not a crash: it is a program that runs happily with no arguments, and the loader
+     * looks correct.
+     *
+     * So the stack pointer is computed first, aligned, and the rest of the block hangs
+     * off it. */
+    uint64_t sp = ALIGN_UP(top - frames - strings_bytes - block_bytes, 16);
+    uint64_t p = sp + block_bytes;          /* the strings, directly above the block */
+    stack_write(t, p, path, path_len);
+    {
+        char nul = 0;
+
+        stack_write(t, p + path_len, &nul, 1);
+    }
 
     /* The *addresses the program will see* are offsets into its own stack, not offsets
      * into the kernel's alias of it.  These two were computed from the alias, so the
@@ -240,23 +323,26 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
      *
      * So the alias is used only to *write*; everything the program will read back is
      * expressed against the user address of the stack. */
-    uint64_t stack_base = top - cap;
-    uint64_t argv0_addr = stack_base + (uint64_t)(p - base);
+    uint64_t argv0_addr = p;
 
     /* The block, ending just below the strings. */
-    uint8_t *q = base + usable - strings_bytes;
-    q -= (uint64_t)naux * 16;
-    memcpy(q, auxv, (size_t)naux * 16);
+    uint64_t q = p - (uint64_t)naux * 16;
+    stack_write(t, q, auxv, (size_t)naux * 16);
 
-    q -= 8;  *((uint64_t *)q) = 0;          /* envp[0] == NULL  */
-    q -= 8;  *((uint64_t *)q) = 0;          /* argv[1] == NULL  */
-    q -= 8;  *((uint64_t *)q) = argv0_addr; /* argv[0]          */
-    q -= 8;  *((uint64_t *)q) = 1;          /* argc == 1        */
+    q -= 8; stack_put(t, q, 0);             /* envp[0] == NULL  */
+    q -= 8; stack_put(t, q, 0);             /* argv[1] == NULL  */
+    q -= 8; stack_put(t, q, argv0_addr);    /* argv[0]          */
+    q -= 8; stack_put(t, q, 1);             /* argc == 1        */
 
-    /* The ABI wants 16-byte alignment at the first call, so the stack pointer is
-     * aligned here rather than where the arithmetic happens to land. */
-    uint64_t sp = stack_base + (uint64_t)(q - base);
-    sp &= ~15ull;
+    /* The ABI wants 16-byte alignment at the first call.  `sp` was computed aligned and
+     * the words above were written down to `q`, which has to land back exactly on it --
+     * so say so rather than rounding, because rounding is what moved the stack pointer
+     * off `argc` in the first place. */
+    if (q != sp || (sp & 15) != 0) {
+        kprintf("elf: the argument block ends at %#lx but the stack pointer is "
+                "%#lx\n", (unsigned long)q, (unsigned long)sp);
+        return false;
+    }
 
     /* And it has to land inside the program's own region: below the frames, and not off
      * the bottom of the stack.  The frames occupy [top - frames, top), so the region is
