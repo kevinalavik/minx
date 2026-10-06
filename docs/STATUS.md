@@ -283,6 +283,52 @@ reading it back through `tss_for(index)->rsp[0]` at every switch.
 on the grounds that a user task does not need one yet. It needs one immediately. Kept now,
 which also means a ring-3 task's kernel frames are guarded and per-task.
 
+### 0b. `phase6-user` -- THE RING-3 FRAME HAD SS AND RSP THE WRONG WAY ROUND
+
+**This was it, and it has been there since phase 6 was written.**
+
+`iretq` pops **RIP, CS, RFLAGS, RSP, SS** -- RSP is *fourth*, SS is *fifth*. The frame was
+built as RIP, CS, RFLAGS, SS, RSP.
+
+**How it presented, and why it cost so long.** Reading a stack pointer where a selector
+belongs raises `#GP` whose error code is the low half of that stack pointer. So the report
+was `vector 13, error code 0xef00` -- an error code that looks like a selector and is not
+one, and that points at the frame rather than at anything the CPU did with it. Two
+measurements pinned it exactly:
+
+- Changing the word the author thought was RSP from `0x7fffffffef00` to `0x7fffffffcf00`
+  changed the error code from `0xef00` to `0xcf00`.
+- Changing the word the author thought was **SS** changed the error code **not at all**.
+
+So the CPU was reading the fifth quadword as SS, which is what `iretq` does -- the frame
+was the right way round and the *contents* were in the wrong slots.
+
+**Proof it is fixed**, from QEMU's own log rather than the kernel's:
+
+    v=0e e=0014 i=0 cpl=3 IP=0023:000000000040042c pc=000000000040042c
+                SP=001b:00007fffffffef00 CR2=000000000040042c
+
+`cpl=3`, `CS=0x23`, `SS=0x1b`, RIP at the program's real entry point and RSP 256 bytes
+below the top of its own stack. **The program is in ring 3.** Before this it never got
+there.
+
+**What is left, precisely.** An instruction-fetch page fault at `0x40042c` reporting *not
+present*, with `CR3=0x513c000`. Walking that task's own tables finds the entry point
+present *and* user-readable -- so the CPU and `pt_get()` disagree, and the only remaining
+candidate is that the CR3 loaded is not `t->tables->pml4`. The comparison is not directly
+observable, because the exception path cannot survive the fault it is reporting: the `#PF`
+is immediately followed by `#DF` and a triple fault, so the handler's own report is lost.
+`isr_report_exception()` now prints what `__enter_user` saw -- `%cs`, `%rsp`, all five
+quadwords about to be popped, and CR3 -- which is the diagnostic that found this and is
+the one to widen next.
+
+**Next thing to try, in order.** (a) Print `t->tables->pml4` next to CR3 in that same
+report, so the two can be compared in one place. (b) Work out why the exception path dies
+on a ring-3 fault: `TSS.RSP0` is set now, but the `#DF` that follows suggests the IST1 path
+is not usable either, and `ist_stack_1` is a static in the kernel image. (c) Walk the four
+PTE levels from CR3 in the handler -- worth doing *after* (b), because a longer handler in
+a path that already cannot survive is the wrong direction.
+
 ### 1. `phase6-user` -- still hanging, now much further along
 The whole suite reaches it now, and every *other* part of phase 6 passes. It gets as far
 as the task being created, its address space built, its image loaded, its stack laid out

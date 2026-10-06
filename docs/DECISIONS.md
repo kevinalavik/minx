@@ -753,3 +753,43 @@ the user stack for it, and `TSS.RSP0` is its processor's boot stack. That works 
 switches to RSP0 on the way in from ring 3 -- but the frames are unguarded, not per-task,
 and every stack trace of a fault inside a syscall is meaningless. It is recorded in
 `docs/STATUS.md` as the first thing phase 6 still needs, not hidden.
+
+## 2026-10-06 — The ring-3 return frame had SS and RSP the wrong way round
+Decision: implemented. This was the phase-6 defect, and it was there from the first version
+of the frame.
+
+`iretq` pops RIP, CS, RFLAGS, **RSP, SS** — RSP fourth, SS fifth. The frame was built
+RIP, CS, RFLAGS, SS, RSP. And an earlier version of the *same* frame was also the wrong way
+round (RFLAGS first, RIP last), compensated in `task_enter_user()` by advancing `%rsp`; the
+two bugs together meant the frame had been wrong twice, in both directions, and each time it
+looked like something else.
+
+**Why it cost so long, which is the part worth keeping.** Reading a stack pointer where a
+selector belongs raises `#GP` whose error code is the low half of that stack pointer. So
+the report was `error code 0xef00` — an error code that looks like a selector and is not
+one, and that points at the frame rather than at anything the CPU did with it. Two
+measurements settled it in one run each:
+
+- Changing the word the author believed was RSP from `0x7fffffffef00` to `0x7fffffffcf00`
+  changed the error code from `0xef00` to `0xcf00`. So that word was being read as
+  something whose value appears in the error code — and SS is exactly that.
+- Changing the word the author believed was SS changed the error code not at all.
+
+A third measurement had already shown the `%cs` question was a dead end: recording `%cs`,
+`%rsp` and all five quadwords from `__enter_user` itself, immediately before the `iretq`,
+gave `cs=0x8 rsp=0x7fffffffefd8 | rip=0x40042c cs=0x23 rflags=0x202 ss=0x1b
+rsp=0x7fffffffef00` — every value correct and `%rsp` exactly at the frame. That is what
+made it certain the frame was not *placed* wrongly and only *popped* wrongly, which is the
+distinction the two experiments above then confirmed.
+
+**Lesson, recorded because it will recur:** a diagnostic that reads the frame through the
+kernel's alias proves the frame was *written* correctly. It says nothing about whether
+`%rsp` points *at* that alias when the CPU gets there, and those were different here. The
+measurement that answered the question cost five stores and a five-iteration loop in the
+ring-3 entry path, and it is kept: `task_iret_frame[]`, printed by `isr_report_exception()`.
+
+Rejected along the way, and recorded so it is not repeated: deriving the ring-3 context flag
+from `%cs` in `task_save_publish_and_switch()` (an interrupt from ring 3 switches the CPU
+to CPL 0 *before* the handler runs, so `%cs` is the kernel's and cannot see the frame —
+`isr_dispatch()` records it now), and running C to print from `__enter_user` (that runs on
+the task's user stack, so instrumenting the entry that way changes what it measures).

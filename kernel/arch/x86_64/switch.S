@@ -287,6 +287,24 @@ task_enter_user:
 .global __enter_user
 .type __enter_user, @function
 __enter_user:
+    /* Record %cs, %rsp and the five quadwords about to be popped, in a static the
+     * exception path can read.  Deliberately no call and no stack use: %rsp here is
+     * eight bytes below the top of the task's *user* stack, so a C call from here runs on
+     * that stack, and instrumenting the entry that way changes what it measures. */
+    leaq    task_iret_frame(%rip), %rsi
+    movq    %cs, %rax              /* a segment register loads only into a GPR */
+    movq    %rax, (%rsi)
+    movq    %rsp, 8(%rsi)
+    movq    %cr3, %rax
+    movq    %rax, 56(%rsi)
+    movq    %rsp, %rdi
+    movq    $5, %rcx
+1:  movq    (%rdi), %rax
+    movq    %rax, 16(%rsi)
+    addq    $8, %rdi
+    addq    $8, %rsi
+    decq    %rcx
+    jnz     1b
     iretq
 .size __enter_user, .-__enter_user
 

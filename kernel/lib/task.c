@@ -585,13 +585,17 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
                                  - USER_FRAME_BYTES - USER_CTX_BYTES);
     uint64_t user_stack_top = top - (uint64_t)pages * page_size;
 
-    /* In the order `iretq` pops them, which is the only order that works: RIP, CS,
-     * RFLAGS, SS, RSP, each one quadword above the last, with RSP left pointing at RIP.
-     * The first version of this frame listed them the other way round -- RFLAGS first,
-     * RIP last -- and compensated in task_enter_user() by advancing %rsp past the first
-     * two words.  That put RIP in the right slot by luck and left CS holding the SS
-     * selector, with SS and RSP loaded from above the frame: a #GP out of `iretq` with
-     * no ring-3 task in existence, which is what phase6-user hit every time.
+    /* In the order `iretq` pops them, each one quadword above the last, with %rsp left
+     * pointing at RIP: RIP, CS, RFLAGS, RSP, SS.
+     *
+     * Note that RSP is *fourth* and SS is fifth, which is the easy thing to get wrong and
+     * which this got wrong twice, in both directions at different times.  Reading a stack
+     * pointer where a selector belongs raises #GP whose error code is the low half of that
+     * stack pointer -- an error code that looks like a selector and is not one, and that
+     * points at the frame rather than at anything the CPU did with it.  An earlier version
+     * also had the frame itself the wrong way round (RFLAGS first, RIP last) and
+     * compensated in task_enter_user() by advancing %rsp, which put RIP in the right slot
+     * by luck and left CS holding the SS selector.  Two bugs, one symptom.
      *
      * The addressing is not negotiable either.  `virt_to_phys()` subtracts the direct-map
      * offset, so it is only meaningful for a kernel address; applied to a user address it
@@ -612,8 +616,8 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
      * The task's own DF and arithmetic flags are left clear, which is what the ABI
      * requires at a program's first instruction. */
     frame[2] = 0x202;                      /* RFLAGS: IF set, DF clear */
-    frame[3] = GDT_USER_DATA_RPL3;         /* SS   */
-    frame[4] = user_stack_top;             /* RSP: the bottom of its own stack */
+    frame[4] = GDT_USER_DATA_RPL3;         /* SS: fifth, after RSP */
+    frame[3] = user_stack_top;             /* RSP: fourth, before SS */
 
     for (unsigned i = 0; i < 6; i++)
         ctx[i] = 0;
@@ -905,6 +909,16 @@ static void charge_current(sched_cpu_t *c) {
  * off before choosing anything -- so nothing can preempt between the state store and the
  * queue insertion.
  */
+/* What __enter_user saw, immediately before `iretq`.
+ *
+ * [0] %cs, [1] %rsp, [2..6] the five quadwords `iretq` pops: RIP, CS, RFLAGS, SS, RSP.
+ *
+ * It exists because the frame written by task_create_user() has been verified correct from
+ * the kernel's own alias of it, and the one thing that has *not* been checked is whether
+ * %rsp points at that alias when the CPU gets there.  If it does not, everything above is
+ * right and the CPU still reads something else. */
+uint64_t task_iret_frame[8];
+
 void sched_publish_outgoing(uint64_t *save_rsp, task_t *prev, sched_cpu_t *c) {
     (void)save_rsp;
 

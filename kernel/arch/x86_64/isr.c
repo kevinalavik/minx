@@ -56,6 +56,8 @@ static void report_page_fault(regs_t *regs) {
 
     if (addr >= 0x0000000000001000ULL && addr < 0x0000000000100000ULL)
         kprintf("  -> low memory (below 1 MiB); the NULL page guard was hit\n");
+
+
 }
 
 void isr_report_exception(regs_t *regs) {
@@ -76,6 +78,26 @@ void isr_report_exception(regs_t *regs) {
     kprintf("  r11=%#018lx r12=%#018lx r13=%#018lx\n", regs->r11, regs->r12,
             regs->r13);
     kprintf("  r14=%#018lx r15=%#018lx\n", regs->r14, regs->r15);
+
+    /* What the ring-3 entry saw, if a user task has been entered at all.  This is the
+     * diagnostic that found the SS/RSP swap: the frame was verified correct from the
+     * kernel's own alias of it, and the only way to tell whether %rsp pointed *at* that
+     * alias when the CPU got there was to record what the CPU was about to read. */
+    {
+        extern uint64_t task_iret_frame[8];
+
+        if (task_iret_frame[1] != 0)
+            kprintf("  iret saw: cs=%#lx rsp=%#lx | rip=%#lx cs=%#lx rflags=%#lx "
+                    "ss=%#lx rsp=%#lx\n",
+                    (unsigned long)task_iret_frame[0],
+                    (unsigned long)task_iret_frame[1],
+                    (unsigned long)task_iret_frame[2],
+                    (unsigned long)task_iret_frame[3],
+                    (unsigned long)task_iret_frame[4],
+                    (unsigned long)task_iret_frame[5],
+                    (unsigned long)task_iret_frame[6]);
+        kprintf("  iret: cr3=%#lx\n", (unsigned long)task_iret_frame[7]);
+    }
 
     if (vector == 14)
         report_page_fault(regs);

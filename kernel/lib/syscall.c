@@ -408,9 +408,12 @@ task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
     /* The entry and stack pointer the loader worked out have to go into the ring-3
      * frame that task_create_user() built a placeholder in.  The frame lives at the top
      * of the task's own stack, which the kernel can reach through the direct map. */
-    /* `iretq` pops RIP, CS, RFLAGS, SS and RSP in that order, so RIP is the first
-     * quadword of the frame and RSP the fifth; task_create_user() lays them out in that
-     * order and records a kernel alias of the frame's page for exactly this.
+    /* `iretq` pops RIP, CS, RFLAGS, RSP and SS -- in that order, each one quadword above
+     * the last -- so RIP is the first quadword of the frame and SS the fifth.  RSP is
+     * *fourth*, not fifth: the two were the wrong way round here, and reading a stack
+     * pointer where a selector belongs is a #GP whose error code is the low half of the
+     * stack pointer.  task_create_user() lays the frame out in the order the CPU pops it
+     * and records a kernel alias of the frame's page for exactly this.
      *
      * The alias cannot be recomputed here.  The page is mapped only in this task's
      * address space, so phys_to_virt() of the user address is arithmetic on a user
@@ -425,7 +428,8 @@ task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
     uint64_t *frame = t->user_frame;
 
     frame[0] = r.entry;            /* RIP */
-    frame[4] = r.entry_rsp;        /* RSP */
+    frame[3] = r.entry_rsp;        /* RSP */
+    frame[4] = GDT_USER_DATA_RPL3; /* SS   */
 
 
     /* A virtual address: this is what the CPU loads into RSP. */
@@ -434,6 +438,21 @@ task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
 
     if (task_wakeup(t) != 0) {
         kwarn("program: could not queue %s", name);
+        return NULL;
+    }
+
+    /* The entry point has to be mapped in *this task's* address space, not merely in
+     * whatever the loader was running in, and the task's own tables are the only place
+     * that can be asked.  Without this the loader reports success and the program takes a
+     * page fault on its first instruction, with the loader nowhere in the report. */
+    if (!vmm_translate_in(t->tables, r.entry)) {
+        kwarn("program: %s loaded, but its entry point %#lx is not mapped in the "
+              "task's own address space", name, (unsigned long)r.entry);
+        return NULL;
+    }
+    if (!syscall_user_range_ok_in(t->tables, r.entry, 1, false)) {
+        kwarn("program: %s loaded, but its entry point %#lx is not user-readable in "
+              "the task's own address space", name, (unsigned long)r.entry);
         return NULL;
     }
 
