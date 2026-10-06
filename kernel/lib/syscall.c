@@ -369,8 +369,15 @@ void syscall_dispatch(regs_t *regs) {
 
     /* A handler that returned a kernel address would hand the program a pointer into
      * the kernel.  Nothing should, but this is the last place it can be caught and the
-     * check is two instructions. */
-    if (regs->rax > 0 && (uint64_t)regs->rax >= USER_SPACE_END) {
+     * check is two instructions.
+     *
+     * The comparison has to be *signed*.  A handler reports an error as a negative value,
+     * and the frame holds registers unsigned, so -9 is 0xfffffffffffffff7: it is greater
+     * than zero, it is greater than USER_SPACE_END, and this turned every error into
+     * EFAULT.  The program could not tell a bad descriptor from an unmapped buffer -- both
+     * came back as -14 -- which is exactly the distinction the boundary exists to make,
+     * and it was invisible because every test only asked for "some error". */
+    if ((int64_t)regs->rax > 0 && (uint64_t)regs->rax >= USER_SPACE_END) {
         syscall_set_errno(EFAULT);
         regs->rax = (uint64_t)(int64_t)-EFAULT;
     }
@@ -455,15 +462,23 @@ task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
         return NULL;
     }
 
+    /* Report before queueing, not after.
+     *
+     * Waking the task makes it runnable, and on this machine the next tick can hand it
+     * the processor while the report below is still being rendered.  The two then write
+     * to the console a character at a time -- the program's own output interleaved with
+     * this line, which reads as though the program had printed something strange:
+     * `argc=1` came out as `argc=g1r` because "program:" was being emitted into the
+     * middle of it.  Nothing was actually wrong with either line, and that is exactly
+     * why it is worth fixing: a report that cannot be read is a report nobody has. */
+    kprintf("program: %s loaded, entry %#lx, %u segment(s), %lu bytes, stack %#lx\n",
+            name, (unsigned long)r.entry, r.segments, (unsigned long)r.bytes,
+            (unsigned long)r.entry_rsp);
+
     if (task_wakeup(t) != 0) {
         kwarn("program: could not queue %s", name);
         return NULL;
     }
-
-
-    kprintf("program: %s loaded, entry %#lx, %u segment(s), %lu bytes, stack %#lx\n",
-            name, (unsigned long)r.entry, r.segments, (unsigned long)r.bytes,
-            (unsigned long)r.entry_rsp);
 
     return t;
 }
