@@ -95,7 +95,8 @@ void task_save_publish_and_switch(uint64_t *save_rsp, task_t *prev, sched_cpu_t 
                                  uint64_t next_rsp,
                                  const page_table_t *next_tables,
                                  int32_t *prev_saved_in_user,
-                                 int32_t *next_saved_in_user);
+                                 int32_t *next_saved_in_user,
+                                 int32_t from_user);
 
 static sched_cpu_t cpu[MAX_CPU_COUNT];
 
@@ -1168,9 +1169,16 @@ void schedule(void) {
         vmm_address_space_switch(next_tables);
         task_enter_first(next->saved_rsp);
     } else {
+        /* Whether the outgoing context is a ring-3 frame is recorded by the interrupt
+         * entry, not derived here: by the time schedule() runs the CPU has already
+         * switched to CPL 0, so the current CS cannot say.  Consuming it here is what
+         * stops it leaking into a later save that really was from the kernel. */
+        int32_t from_user = self->from_user;
+        self->from_user = 0;
+
         task_save_publish_and_switch(&prev->saved_rsp, prev, c, next->saved_rsp,
                                      next_tables, &prev->saved_in_user,
-                                     &next->saved_in_user);
+                                     &next->saved_in_user, from_user);
     }
 
     /* Only reached when this task is switched back into. */
@@ -1536,6 +1544,26 @@ void sched_check_stack(void) {
 
     if (t == NULL || t->stack_guard == NULL)
         return;               /* the boot processor's own stack has no guard */
+
+    /* A user task that has entered ring 3 runs its *kernel* code on its own user stack,
+     * because `iretq` puts %rsp there and the kernel half of the address space is mapped
+     * all the way down.  So %rsp is a user address, which is far below any kernel heap,
+     * and comparing it with the kernel stack's bottom reports an overflow that has not
+     * happened -- on the first ring-3 entry, every time.
+     *
+     * It reported one.  The panic it produced is what `phase6-user` had been dying of:
+     * a stack-overflow report naming an address in the middle of the user stack and a
+     * "bottom" in the kernel heap, and then a panic handler running on the user stack,
+     * which is why the follow-on reports were all nonsense -- a return address of
+     * TASK_STACK_GUARD, a register dump with a kernel-text `%rbp`, and a serial log that
+     * stopped in the middle of a line.  Every one of those was a symptom of panicking on
+     * a stack the panic path cannot use.
+     *
+     * There is nothing to check here: the user stack has no guard word, and its bounds are
+     * the loader's business, not the tick's.  A kernel task's %rsp is never a user
+     * address, so this does not weaken the check for anybody else. */
+    if (t->is_user && vmm_is_user_addr(rsp))
+        return;
 
     if (rsp < t->stack_low)
         panic("sched: task %lu (%s) has overflowed its stack: rsp %#lx is below "

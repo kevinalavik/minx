@@ -92,6 +92,12 @@ void isr_report_exception(regs_t *regs) {
 void isr_dispatch(regs_t *regs) {
     uint64_t vector = regs->vector;
 
+    /* Did this arrive from ring 3?  The scheduler needs to know, and it cannot find out
+     * for itself: the CPU has already switched to CPL 0, so the frame it pushed is a
+     * ring-3 frame while the CS in hand belongs to the kernel.  See percpu_t.from_user. */
+    if ((regs->cs & 3) != 0)
+        percpu_self()->from_user = 1;
+
     /* The remapped 8259 IRQs land on vectors 32..47, and the IOAPIC redirects
      * the same lines to the same vectors once it owns them. */
     if (vector >= IRQ_BASE_VECTOR && vector < IRQ_BASE_VECTOR + IRQ_MAX) {

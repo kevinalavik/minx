@@ -46,6 +46,20 @@ typedef struct {
     void    (*pending_fn)(void *);
     void     *pending_arg;
     uint32_t  pending;
+
+    /* Set when an interrupt arrives from ring 3, cleared by the next context save.
+     *
+     * This cannot be worked out at save time from the current CS.  An interrupt from
+     * ring 3 makes the CPU switch to CPL 0 and push a *ring-3 return frame* -- RIP, CS,
+     * RFLAGS, SS, RSP -- before a single instruction of the handler runs, so by the time
+     * the scheduler saves the outgoing task the current CS is the kernel's and says
+     * nothing about the frame sitting above it on the stack.
+     *
+     * Reading it as "the outermost interrupted context was ring 3" is also the right
+     * question.  A tick that lands inside a syscall inside a ring-3 task is still a
+     * ring-3 context as far as the scheduler is concerned, and every nested handler in
+     * between sees CS 0x08 -- so this stays set until a save consumes it. */
+    volatile int32_t from_user;
 } percpu_t;
 
 typedef struct {

@@ -240,7 +240,50 @@ scrolling test, which fills all 109 lines and scrolls correctly.
 `make test` -> **36 of 38 PASS**, `TEST-READY` reached, clean shutdown, no panic. The two
 that fail, and neither is worked around:
 
-### 1. `phase6-user` -- the ring-3 program hangs without printing anything
+### 0. `phase6-user`, progress this session -- four real bugs found and fixed
+
+**`sched_check_stack()` was panicking on every ring-3 entry.** A user task that has
+entered ring 3 runs its *kernel* code on its own user stack, because `iretq` puts `%rsp`
+there and the kernel half of the address space is mapped all the way down. So `%rsp` is a
+user address, far below any kernel heap, and comparing it with the kernel stack's low
+bound reports an overflow that has not happened. `task_create_user()` made it worse
+without meaning to: it cleared `t->stack` but left `t->stack_guard` set, so the "no guard,
+skip the check" path was never taken.
+
+**This was the fault behind every strange symptom this test produced.** The panic it
+raised is why the follow-on reports were nonsense: a return address of `TASK_STACK_GUARD`, a
+register dump with a kernel-text `%rbp`, and a serial log that stopped in the middle of a
+line. Every one of those was a symptom of *panicking on a stack the panic path cannot
+use*. The stack guard now skips a user task that is on its own stack, and says why; a
+kernel task's `%rsp` is never a user address, so the check is unchanged for everyone else.
+
+**The ring-3 context flag was being computed from `%cs`, which cannot see it.** An
+interrupt from ring 3 makes the CPU switch to CPL 0 and push a *ring-3 return frame* --
+RIP, CS, RFLAGS, SS, RSP -- before a single instruction of the handler runs. So by the
+time the scheduler saves the outgoing task, the current CS is the kernel's and says
+nothing about the frame sitting above it on the stack. Reading it that way marked every
+ring-3 context as a kernel one, and the restore then popped the ring-3 RIP as a return
+address and jumped to a user address at CPL 0 -- with the kernel's stack and CS, and
+everything the frame said about SS and RSP discarded.
+
+`isr_dispatch()` now records it where it can still be seen (`percpu_t.from_user`), and
+`schedule()` consumes it when it saves. It is "the outermost interrupted context was ring
+3", not "the innermost handler is running below ring 3": a tick that lands inside a
+syscall inside a ring-3 task is still a ring-3 context as far as the scheduler is
+concerned, and every handler nested in between sees CS `0x08`.
+
+**`TSS.RSP0` was zero on every processor in the machine.** `tss_init_for()` zeroes the TSS
+and `tss_set_rsp0()` was never called from anywhere, so the first `int $0x80` from any
+user task pushed its frame at address zero. Set per *processor*, not per task -- the CPU
+loads it on every interrupt out of ring 3, so it has to name whichever task is running on
+that processor right now, and `schedule()` does that before each switch. Verified by
+reading it back through `tss_for(index)->rsp[0]` at every switch.
+
+**`task_create_user()` discarded the kernel stack `task_create()` had already allocated**,
+on the grounds that a user task does not need one yet. It needs one immediately. Kept now,
+which also means a ring-3 task's kernel frames are guarded and per-task.
+
+### 1. `phase6-user` -- still hanging, now much further along
 The whole suite reaches it now, and every *other* part of phase 6 passes. It gets as far
 as the task being created, its address space built, its image loaded, its stack laid out
 and the ring-3 frame assembled; then it produces no output at all and is reported as
@@ -286,17 +329,39 @@ set, verified by reading it back through `tss_for(index)->rsp[0]` at every switc
 the syscall door (gate 0x80 is DPL 3, `int $0x80` with rdi/rsi/rdx/rax in the right
 registers).
 
-**And one measurement that does not fit the rest.** The fault is reported at CPL 0 with
-`%rsp` inside the task's *user* stack -- which is only possible if the program is running
-in ring 0 on its own stack, i.e. `iretq` did not drop privilege. But the frame says CS is
-`0x23`, and with interrupts left off in the frame the failure moves to a clean `#GP` at
-the `iretq` itself with error code `0xef00`, whose low half is the frame's own RSP. That
-looks like `%rsp` being one quadword lower than the frame when `iretq` reads it -- an
-off-by-one-frame -- but it is a hypothesis, not a measurement, and the arithmetic in
-`task_save_publish_and_switch()` and `task_enter_user()` has been checked twice and reads
-correct. **Next thing to try:** instrument `__enter_user` to dump the five quadwords it is
-about to pop *from `%rsp` itself* rather than from `t->user_frame`, which is the one place
-the two could differ -- the alias and the address the CPU actually reads.
+**The frame is verified correct**, dumped from the kernel's own alias of it immediately
+before the switch: `rip=0x40042c cs=0x23 rflags=0x202 ss=0x1b rsp=0x7fffffffef00` -- the
+program's real entry point, DPL-3 selectors, interrupts on, and a stack pointer 256 bytes
+below the top of its own stack.
+
+**What remains is one fault, and it is now narrow.** A single page fault, in `memcpy`,
+reading **8 bytes at exactly `USER_STACK_TOP`**, with `%rsp` inside the task's user stack
+and `cs = 0x08`. `RDI = top - 408`, `RSI = R8 = top`, `RDX = 8`, `R15 = 408`,
+`R9 = -408`, `RSP = top - 4512`. So it is a one-quadword copy whose *source* is the
+constant `USER_STACK_TOP`, both operands user addresses, from ring-0 code on the user
+stack. Nothing in the tree dereferences `USER_STACK_TOP` as a pointer any more -- the only
+three uses are `top - <constant>` arithmetic in `task.c`, `elf.c` and `syscall.c`.
+
+**Ruled out by measurement:** the loader (frame correct, image and stack mapped), the
+selectors (DPL 3, verified), the address space (CR2 is a present-but-unmapped address and
+the walk over the same tables agrees), `RSP0` (now set, verified by reading it back at
+every switch), the syscall door (gate 0x80 is DPL 3; `int $0x80` with rdi/rsi/rdx/rax in
+the right registers), `sys_write` (it does not copy -- it hands the user pointer to the
+console, which ring 0 may read with SMAP off), and preemption (the ring-3 restore now uses
+`iretq`, with a flag recorded where the frame is actually created).
+
+**The most useful thing found while narrowing it:** `syscall_dispatch()` prints nothing
+when a trace `kprintf` is put at its top, so the program never reaches its first syscall --
+`int $0x80` is never executed. The fault is therefore strictly *before* the first syscall,
+in the ring-3 entry or in the program's own first instructions.
+
+**Next thing to try, in order.** (a) Dump the *instruction pointer and CS* of the ring-3
+task at the fault from the exception frame rather than from the current registers, so it
+is unambiguous whether the program is in ring 3 at all. (b) `objdump` the exact faulting
+instruction and work out which of `rdi`/`rsi` is really the source, since `memcpy`'s loop
+clobbers both and the dump is mid-loop. (c) Trace the ring-3 entry: print from a `kwarn`
+immediately after `iretq` returns control, which for a program that faults on its first
+instruction is the exception handler.
 
 **Where to look next, in order.** (a) The user program's first syscall: `hello` writes to
 fd 1 first and *nothing at all* appears, so the fault is likely in argument marshalling

@@ -47,7 +47,8 @@ task_switch:
  *                                   sched_cpu_t *c, uint64_t next_rsp,
  *                                   const page_table_t *next_tables,
  *                                   int32_t *prev_saved_in_user,
- *                                   int32_t *next_saved_in_user)
+ *                                   int32_t *next_saved_in_user,
+ *                                   int32_t from_user)
  *
  * Save the running task's context, publish it to a run queue, load another task's address
  * space, and switch to it, without ever returning to C.  Never returns.
@@ -98,16 +99,20 @@ task_switch:
 .global task_save_publish_and_switch
 .type task_save_publish_and_switch, @function
 task_save_publish_and_switch:
-    /* Seven arguments, so the last one is on the stack and has to be read before anything
-     * moves the stack pointer.  %r15 holds it: the outgoing task's own %r15 is pushed two
-     * instructions below, and %r15 is callee-saved so both callbacks below keep it.
+    /* Eight arguments, so the last two are on the stack and have to be read before
+     * anything moves the stack pointer.
      *
-     * Both flags are needed.  The save writes the outgoing task's -- recording whether it
-     * was in ring 3 -- and the restore reads the incoming task's, which is what decides
-     * between `ret` and `iretq`.  Passing only one of them compiles, links and boots, and
-     * then reads the caller's return address as a pointer. */
+     * Both flags are needed.  The save writes the outgoing task's -- recording whether its
+     * context is a ring-3 frame -- and the restore reads the incoming task's, which is what
+     * decides between `ret` and `iretq`.  Passing only one of them compiles, links and
+     * boots, and then reads the caller's return address as a pointer.
+     *
+     * %r11 carries `from_user` across the two callbacks below.  It is caller-saved, so the
+     * callbacks may clobber it, which is why it is reloaded from the stack afterwards --
+     * and it cannot be %r15, because the first `popq %r15` is the *chosen* task's %r15 and
+     * is zero for a task that has never run. */
     movq    8(%rsp), %r15       /* &next->saved_in_user */
-    movq    %cs, %r11           /* caller-saved, and nothing else wants it yet */
+    movq    16(%rsp), %r11      /* from_user: passed in, not derived from %cs */
     pushq   %rbp
     pushq   %rbx
     pushq   %r12
@@ -117,23 +122,30 @@ task_save_publish_and_switch:
     movq    %rsp, (%rdi)        /* final: from here on another processor may run it */
     movq    %rcx, %r12          /* prev's %r12 is saved above; the slot is now free */
     movq    %r8, %r13           /* likewise prev's %r13 */
-    /* Was the outgoing task running in ring 3?  Then the CPU had already switched to a
-     * kernel stack and pushed a full ring-3 return frame just above where we are now,
-     * and that frame -- not a return address -- is what has to come back later. */
-    movl    $0, (%r9)
-    testq   $3, %r11
-    jz      1f
-    movl    $1, (%r9)
-1:      /* rdi = save_rsp, rsi = prev, rdx = c: already the arguments the callback wants.
+    /* Record whether the outgoing context is a ring-3 frame rather than a set of
+     * callee-saved registers and a return address.  The answer arrives as an argument.
+     *
+     * It used to be worked out here from %cs, which is wrong in a way that looks right: an
+     * interrupt from ring 3 makes the CPU switch to CPL 0 *before* the handler runs, so
+     * %cs is the kernel's and says nothing about the ring-3 frame already pushed above us.
+     * Read that way, every ring-3 context was marked as a kernel one, and the restore then
+     * popped the ring-3 RIP as a return address and jumped to a user address at CPL 0 --
+     * with the kernel's stack and CS, and everything the frame said about SS and RSP
+     * discarded.  isr_dispatch() records it where it can still be seen.
+     *
+     * %r11 is a register, so the pushes above do not disturb it -- only a stack-relative
+     * read would have to be repeated, and this one is not. */
+    movl    %r11d, (%r9)
+    /* rdi = save_rsp, rsi = prev, rdx = c: already the arguments the callback wants.
          * Still in prev's address space, which is where the outgoing task's stack lives. */
     call    sched_publish_outgoing
     movq    %r13, %rdi          /* next_tables */
     call    vmm_address_space_switch
     movq    %r12, %rsp          /* continue on the chosen task's stack */
-    /* The flag pointer moves to %r11, which the pops below do not touch.  It cannot stay
-     * in %r15: the first `popq %r15` is the *chosen* task's r15 -- zero for a task that
-     * has never run -- and the test after the pops would then dereference zero.  That
-     * faulted on the very first switch on the machine, which is at least a memorable
+    /* The incoming task's flag pointer moves to %r11, which the pops below do not touch.
+     * It cannot stay in %r15: the first `popq %r15` is the *chosen* task's r15 -- zero for
+     * a task that has never run -- and the test after the pops would then dereference zero.
+     * That faulted on the very first switch on the machine, which is at least a memorable
      * symptom for a mistake that is otherwise invisible. */
     movq    %r15, %r11
     popq    %r15
