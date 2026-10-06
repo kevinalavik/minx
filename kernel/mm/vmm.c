@@ -43,6 +43,12 @@ static struct {
      * clear of the image. */
     uint64_t heap_virt_base;
     uint64_t heap_virt_end;
+
+    /* Where the kernel image actually is in physical memory, and where it is mapped.
+     * vmm_kernel_phys() needs both: an image address is not a direct-map address, so the
+     * usual virt_to_phys() conversion does not apply to one. */
+    uint64_t image_virt;
+    uint64_t image_phys;
 } vmm;
 
 bool vmm_active(void) { return vmm.active; }
@@ -74,6 +80,89 @@ page_table_t *vmm_tables(void) {
  * so this falls back to walking CR3, which at that point is the bootloader's. */
 uint64_t vmm_translate(uint64_t virt) {
     return vmm_translate_in(vmm_tables(), virt);
+}
+
+/* Map [phys, phys+bytes) at the linear address equal to its physical address.
+ *
+ * `tables` is the space to map into; the caller passes the kernel's own for the first
+ * mapping and each new address space for its own copy.  Each space gets *its own*
+ * page tables for this, walked from its own PML4, rather than a pointer copied from
+ * the kernel's -- otherwise a process mapping anything in the same top-level slot
+ * would be editing the kernel's tables, and vmm_address_space_destroy() would free
+ * tables the kernel is still using.
+ *
+ * Not marked PTE_USER: nothing below ring 0 has any business here. */
+static int map_identity_into(page_table_t *tables, uint64_t phys, uint64_t bytes) {
+    if (!pt_map_supervised_range(tables, phys, phys, bytes,
+                                 PTE_PRESENT | PTE_WRITE | PTE_CACHE_WB)) {
+        kprintf("[warn] vmm: could not map %#lx..%#lx at its own physical "
+                "address\n", (unsigned long)phys,
+                (unsigned long)(phys + bytes));
+        return -1;
+    }
+
+    return 0;
+}
+
+/* The one region every address space must reach by physical address.  See vmm.h. */
+static uint64_t ident_phys;
+static uint64_t ident_bytes;
+
+int vmm_map_identity(uint64_t phys, uint64_t bytes) {
+    if (!vmm.active || phys == 0 || bytes == 0)
+        return -1;
+    phys &= ~(uint64_t)(page_size - 1);
+    bytes = ALIGN_UP(bytes, page_size);
+
+    if (ident_bytes != 0) {
+        if (ident_phys != phys || ident_bytes != bytes) {
+            kprintf("[warn] vmm: the identity-mapped region is already %#lx..%#lx\n",
+                    (unsigned long)ident_phys,
+                    (unsigned long)(ident_phys + ident_bytes));
+            return -1;
+        }
+
+        return 0;
+    }
+
+    if (map_identity_into(&vmm.tables, phys, bytes) != 0)
+        return -1;
+
+    ident_phys = phys;
+    ident_bytes = bytes;
+
+    kprintf("vmm: %#lx..%#lx also mapped at its own physical address, so the "
+            "processor can reach it by physical address\n",
+            (unsigned long)phys, (unsigned long)(phys + bytes));
+
+    return 0;
+}
+
+int vmm_map_identity_for_new_space(page_table_t *tables) {
+    if (ident_bytes == 0)
+        return 0;
+
+    return map_identity_into(tables, ident_phys, ident_bytes);
+}
+
+/* The physical address of a kernel-image address.
+ *
+ * `virt_to_phys()` subtracts the direct-map offset, which is only correct for an address
+ * *in* the direct map.  The kernel image is not in the direct map -- it is mapped once, at
+ * `__kernel_start`, from whatever physical base the bootloader chose -- so converting an
+ * image address that way yields a number with no page behind it.  For 0xffffffff80xxxxxx
+ * that number is 0x0000_8000_xxxx_xxxx, which reads like a plausible low physical address
+ * and is the reason a TSS descriptor written with it looked fine and did nothing.
+ *
+ * The image's physical base is *asked for*, not derived: see vmm_init(), which walks the
+ * bootloader's tables to find it, because the firmware memory map has no entry covering
+ * physical page zero at all.
+ */
+uint64_t vmm_kernel_phys(uint64_t vaddr) {
+    if (!vmm.active || vaddr < vmm.image_virt)
+        return 0;
+
+    return vmm.image_phys + (vaddr - vmm.image_virt);
 }
 
 /* As vmm_translate(), but against a named address space.
@@ -335,6 +424,11 @@ int vmm_init(void) {
                                     page_size);
 
     kprintf("vmm: kernel image at physical %#lx\n", (unsigned long)image_phys);
+
+    /* Kept for vmm_kernel_phys(): a kernel-image address is not a direct-map address, so
+     * virt_to_phys() cannot convert one, and the difference matters. */
+    vmm.image_virt = image_virt;
+    vmm.image_phys = image_phys;
 
     if (!pt_map_range(&vmm.tables, image_virt, image_phys, image_bytes,
                       PTE_PRESENT | PTE_WRITE | PTE_CACHE_WB)) {

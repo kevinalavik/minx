@@ -70,6 +70,16 @@ int vmm_address_space_create(page_table_t *out) {
     for (unsigned i = 0; i < 256; i++)
         dst[i] = 0;
 
+    /* Slot 0 now belongs to the process, so the identity mapping the processor needs
+     * by physical address has to be made again here -- into *this* space's own tables,
+     * walked from its own slot 0, so that a program mapping anything nearby cannot
+     * disturb the kernel's copy and destroy() frees only what this space owns. */
+    if (vmm_map_identity_for_new_space(out) != 0) {
+        pmm_free_phys_page(pml4_phys);
+        memset(out, 0, sizeof(*out));
+        return -1;
+    }
+
     return 0;
 }
 

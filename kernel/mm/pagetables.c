@@ -126,8 +126,8 @@ pte_t pt_get(page_table_t *tables, uint64_t virt) {
  * top-level entry.  So a user mapping never has to widen an existing kernel
  * page directory, and a kernel-only table reached while mapping a user page is a
  * layout mistake worth reporting rather than papering over. */
-static pte_t *walk_to_leaf(page_table_t *tables, uint64_t virt, bool user,
-                           bool create) {
+static pte_t *walk_to_leaf(page_table_t *tables, uint64_t virt, bool leaf_user,
+                           bool walk_user, bool create) {
     uint64_t table = tables->pml4;
     static const unsigned shifts[3] = { 39, 30, 21 };
 
@@ -146,11 +146,11 @@ static pte_t *walk_to_leaf(page_table_t *tables, uint64_t virt, bool user,
             memset((void *)phys_to_virt(frame), 0, page_size);
 
             uint64_t flags = PTE_PRESENT | PTE_WRITE;
-            if (user)
+            if (walk_user)
                 flags |= PTE_USER;
             *slot = pte_make(frame, flags);
             pt_invalidate(virt);
-        } else if (user && !pte_user(*slot)) {
+        } else if (leaf_user && !pte_user(*slot)) {
             kprintf("[warn] vmm: refused a user mapping at %#lx: an "
                     "intermediate table is not user-accessible, so the CPU "
                     "would refuse to walk to it\n", (unsigned long)virt);
@@ -164,14 +164,14 @@ static pte_t *walk_to_leaf(page_table_t *tables, uint64_t virt, bool user,
 }
 
 pte_t pt_get_create(page_table_t *tables, uint64_t virt, bool user) {
-    pte_t *leaf = walk_to_leaf(tables, virt, user, true);
+    pte_t *leaf = walk_to_leaf(tables, virt, user, user, true);
     return leaf != NULL ? *leaf : 0;
 }
 
-bool pt_map_page(page_table_t *tables, uint64_t virt, uint64_t phys,
-                 uint64_t flags) {
+static bool map_page(page_table_t *tables, uint64_t virt, uint64_t phys,
+                     uint64_t flags, bool walk_user) {
     bool user = (flags & PTE_USER) != 0;
-    pte_t *leaf = walk_to_leaf(tables, virt, user, true);
+    pte_t *leaf = walk_to_leaf(tables, virt, user, walk_user, true);
     if (leaf == NULL)
         return false;
 
@@ -185,6 +185,35 @@ bool pt_map_page(page_table_t *tables, uint64_t virt, uint64_t phys,
 
     *leaf = entry;
     pt_invalidate(virt);
+    return true;
+}
+
+bool pt_map_page(page_table_t *tables, uint64_t virt, uint64_t phys,
+                 uint64_t flags) {
+    bool user = (flags & PTE_USER) != 0;
+
+    return map_page(tables, virt, phys, flags, user);
+}
+
+/* Map a range whose *intermediate* tables are user-accessible while its leaves are
+ * not, so the walk to it succeeds and stops at the leaf.
+ *
+ * That combination is not a curiosity.  A structure the processor reaches by physical
+ * address -- the TSS -- has to be mapped at the linear address equal to that physical
+ * address, because QEMU resolves the fetch through the page tables.  The TSS holds the
+ * kernel stack pointers, so the page itself must stay out of ring 3's reach; but it
+ * lands in PML4 slot 0, the slot every user mapping below 512 GiB also goes through,
+ * and marking *its* intermediates supervisor-only makes walk_to_leaf() refuse every
+ * user mapping in that slot as well.  So: walkable intermediates, locked leaf. */
+bool pt_map_supervised_range(page_table_t *tables, uint64_t virt, uint64_t phys,
+                             size_t bytes, uint64_t flags) {
+    if (!IS_ALIGNED(virt, page_size) || !IS_ALIGNED(phys, page_size))
+        return false;
+
+    for (size_t off = 0; off < bytes; off += page_size) {
+        if (!map_page(tables, virt + off, phys + off, flags, true))
+            return false;
+    }
     return true;
 }
 
@@ -273,7 +302,7 @@ bool pt_map_1gib(page_table_t *tables, uint64_t virt, uint64_t phys,
 }
 
 bool pt_unmap_page(page_table_t *tables, uint64_t virt) {
-    pte_t *leaf = walk_to_leaf(tables, virt, false, false);
+    pte_t *leaf = walk_to_leaf(tables, virt, false, false, false);
     if (leaf == NULL || !pte_present(*leaf))
         return false;
 
@@ -283,7 +312,7 @@ bool pt_unmap_page(page_table_t *tables, uint64_t virt) {
 }
 
 bool pt_set_user(page_table_t *tables, uint64_t virt, bool user) {
-    pte_t *leaf = walk_to_leaf(tables, virt, user, true);
+    pte_t *leaf = walk_to_leaf(tables, virt, user, user, true);
     if (leaf == NULL)
         return false;
     if (user)
@@ -295,7 +324,7 @@ bool pt_set_user(page_table_t *tables, uint64_t virt, bool user) {
 }
 
 bool pt_set_writable(page_table_t *tables, uint64_t virt, bool writable) {
-    pte_t *leaf = walk_to_leaf(tables, virt, false, false);
+    pte_t *leaf = walk_to_leaf(tables, virt, false, false, false);
     if (leaf == NULL || !pte_present(*leaf))
         return false;
     if (writable)
@@ -307,7 +336,7 @@ bool pt_set_writable(page_table_t *tables, uint64_t virt, bool writable) {
 }
 
 bool pt_clear_nx(page_table_t *tables, uint64_t virt) {
-    pte_t *leaf = walk_to_leaf(tables, virt, false, false);
+    pte_t *leaf = walk_to_leaf(tables, virt, false, false, false);
     if (leaf == NULL || !pte_present(*leaf))
         return false;
     *leaf &= ~PTE_NX;
@@ -316,7 +345,7 @@ bool pt_clear_nx(page_table_t *tables, uint64_t virt) {
 }
 
 bool pt_set_nx(page_table_t *tables, uint64_t virt, bool nx) {
-    pte_t *leaf = walk_to_leaf(tables, virt, false, false);
+    pte_t *leaf = walk_to_leaf(tables, virt, false, false, false);
     if (leaf == NULL || !pte_present(*leaf))
         return false;
     if (nx)

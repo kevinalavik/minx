@@ -148,6 +148,36 @@ uint64_t vmm_translate_in(page_table_t *tables, uint64_t virt);
  * and leave the program with no code at its entry point. */
 int  vmm_map_into(page_table_t *tables, uint64_t virt, uint64_t phys, size_t bytes,
                   bool writable);
+
+/* Map [phys, phys+bytes) at the linear address that equals its physical address, in the
+ * kernel's tables *and* in every address space created afterwards.
+ *
+ * For structures the processor reaches by physical address rather than by a pointer:
+ * the TSS in particular, whose descriptor base is a physical address.  The TSS is not
+ * subject to paging, so on real hardware the address does not have to be mapped -- and
+ * on this machine it is not, since the image is mapped once at __kernel_start from
+ * whatever physical base the bootloader chose.
+ *
+ * QEMU resolves that fetch through the page tables instead (get_rsp_from_tss() reads
+ * `tr.base + 8*level + 4` with cpu_ldq_kernel, an ordinary supervisor read), so an
+ * unmapped physical address is a #PF on the *first* interrupt out of ring 3, with CR2
+ * sitting four bytes past the TSS descriptor's base.  Linux never sees this because its
+ * per-CPU area -- which is where its TSS lives -- sits in a region it maps at its own
+ * physical address, which is exactly what this function does.
+ *
+ * Only one region is tracked, which is all the TSS needs; a second call with a different
+ * range is refused rather than silently displacing the first.  The mapping is
+ * supervisor-only, so ring 3 cannot reach it, and each address space gets its own
+ * tables for it -- so a user program that maps over that address breaks its own TSS
+ * fetch and nothing else. */
+int  vmm_map_identity(uint64_t phys, uint64_t bytes);
+
+/* Give a freshly created address space its own copy of that identity mapping.
+ *
+ * Called by vmm_address_space_create(); not a general-purpose call -- it maps whatever
+ * vmm_map_identity() was given, and there is no way to un-register it. */
+int  vmm_map_identity_for_new_space(page_table_t *tables);
+
 int  vmm_unmap_user(uint64_t virt, size_t bytes);
 
 /* Total pages mapped, for /proc/meminfo and the phase-11 accounting check. */
@@ -162,5 +192,18 @@ void vmm_get_stats(vmm_stats_t *out);
 
 /* Translate a linear address through the kernel's tables. */
 uint64_t vmm_translate(uint64_t virt);
+
+/* The physical address of a *kernel-image* address.
+ *
+ * Not virt_to_phys(): that subtracts the direct-map offset and is only correct for an
+ * address in the direct map.  The image is mapped once, at __kernel_start, from whatever
+ * physical base the bootloader chose, so converting an image address that way produces a
+ * number with no page behind it -- for 0xffffffff80xxxxxx, 0x00008000xxxx_xxxx, which
+ * reads like a plausible low physical address.
+ *
+ * Needed for anything the CPU fetches by physical address: a TSS descriptor's base field
+ * is one, and getting it wrong leaves the CPU reading its TSS out of nowhere.  Returns 0
+ * before vmm_init() has resolved the image. */
+uint64_t vmm_kernel_phys(uint64_t vaddr);
 
 #endif /* MINX_VMM_H */

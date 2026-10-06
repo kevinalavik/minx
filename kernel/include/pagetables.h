@@ -111,6 +111,14 @@ bool pt_map_page(page_table_t *tables, uint64_t virt, uint64_t phys,
                  uint64_t flags);
 
 /* Map a range with the same flags on every page. */
+/* As pt_map_range(), with the intermediate tables marked user-accessible and the leaves
+ * left supervisor-only: reachable by the walk, refused at the last step.
+ *
+ * For a mapping the processor needs by physical address -- the TSS -- which has to sit
+ * at the linear address equal to its physical address.  See vmm_map_identity(). */
+bool pt_map_supervised_range(page_table_t *tables, uint64_t virt, uint64_t phys,
+                             size_t bytes, uint64_t flags);
+
 bool pt_map_range(page_table_t *tables, uint64_t virt, uint64_t phys,
                   size_t bytes, uint64_t flags);
 
