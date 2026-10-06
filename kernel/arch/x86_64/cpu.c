@@ -216,6 +216,21 @@ void tss_set_rsp0(uint64_t rsp) {
     kernel_tss[0].rsp[0] = rsp;
 }
 
+/* Processor `index`'s RSP0 -- the stack the CPU switches a task onto when an interrupt
+ * arrives from ring 3.
+ *
+ * This is per *processor*, not per task, and that is the whole reason it is set here and
+ * not once at boot: the CPU loads it from the current processor's TSS on every interrupt
+ * out of ring 3, so it has to name whichever task is running *on that processor* right
+ * now.  Setting it at task creation would leave every processor pointing at the boot
+ * task's stack, and a user task that migrated would take its kernel frames there. */
+void tss_set_rsp0_for(unsigned index, uint64_t rsp) {
+    if (index >= MAX_CPU_COUNT)
+        return;
+
+    kernel_tss[index].rsp[0] = rsp;
+}
+
 void tss_set_ist(int ist, uint64_t rsp) {
     if (ist >= 1 && ist <= 7)
         kernel_tss[0].ist[ist - 1] = rsp;

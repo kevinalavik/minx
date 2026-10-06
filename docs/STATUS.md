@@ -262,6 +262,42 @@ address space (CR2 is a *present-but-unmapped* address and the walk over the sam
 agrees), and not preemption (the ring-3 restore now uses `iretq` and the flag that selects
 it).
 
+**Two things found since, both real, and the frame verified correct.** The ring-3 return
+frame was dumped from the kernel's own alias of it immediately before the switch, and it
+is exactly right: `rip=0x40042c cs=0x23 rflags=0x202 ss=0x1b rsp=0x7fffffffef00` --
+the program's real entry, a DPL-3 code selector, a DPL-3 data selector, interrupts on,
+and a stack pointer 256 bytes below the top of its own stack. So the loader is not
+building a bad frame.
+
+**`TSS.RSP0` was zero on every processor in the machine, and that is now fixed.**
+`tss_init_for()` zeroes the TSS and `tss_set_rsp0()` was never called from anywhere --
+which means the first `int $0x80` from any user task pushed its frame at address zero.
+Setting it is per *processor*, not per task: the CPU loads it on every interrupt out of
+ring 3, so it has to name whichever task is running on that processor right now, and
+`schedule()` now does that before each switch. Related: `task_create_user()` was
+*discarding* the kernel stack `task_create()` had already allocated for the task, on the
+grounds that a user task does not need one yet. It needs one immediately. It is kept now,
+which also means a ring-3 task's kernel frames are guarded and per-task.
+
+**So what is left is narrower than it was.** Ruled out: the loader (frame correct, image
+and stack mapped), the selectors (DPL 3, verified in the dump), the address space (CR2
+is a present-but-unmapped address and the walk over the same tables agrees), `RSP0` (now
+set, verified by reading it back through `tss_for(index)->rsp[0]` at every switch), and
+the syscall door (gate 0x80 is DPL 3, `int $0x80` with rdi/rsi/rdx/rax in the right
+registers).
+
+**And one measurement that does not fit the rest.** The fault is reported at CPL 0 with
+`%rsp` inside the task's *user* stack -- which is only possible if the program is running
+in ring 0 on its own stack, i.e. `iretq` did not drop privilege. But the frame says CS is
+`0x23`, and with interrupts left off in the frame the failure moves to a clean `#GP` at
+the `iretq` itself with error code `0xef00`, whose low half is the frame's own RSP. That
+looks like `%rsp` being one quadword lower than the frame when `iretq` reads it -- an
+off-by-one-frame -- but it is a hypothesis, not a measurement, and the arithmetic in
+`task_save_publish_and_switch()` and `task_enter_user()` has been checked twice and reads
+correct. **Next thing to try:** instrument `__enter_user` to dump the five quadwords it is
+about to pop *from `%rsp` itself* rather than from `t->user_frame`, which is the one place
+the two could differ -- the alias and the address the CPU actually reads.
+
 **Where to look next, in order.** (a) The user program's first syscall: `hello` writes to
 fd 1 first and *nothing at all* appears, so the fault is likely in argument marshalling
 rather than in the string -- `arg(regs, n)` for `sys_write` deserves a look at the frame

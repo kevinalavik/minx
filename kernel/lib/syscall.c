@@ -427,6 +427,7 @@ task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
     frame[0] = r.entry;            /* RIP */
     frame[4] = r.entry_rsp;        /* RSP */
 
+
     /* A virtual address: this is what the CPU loads into RSP. */
     t->saved_rsp = USER_STACK_TOP - USER_FRAME_BYTES - USER_CTX_BYTES;
     t->started = false;

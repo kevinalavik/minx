@@ -125,6 +125,7 @@ static inline tss_t *tss_for(unsigned index) { return &kernel_tss[index]; }
 void tss_init(void);                              /* this processor's */
 void tss_init_for(unsigned index, uint64_t ist1, uint64_t ist2);
 void tss_set_rsp0(uint64_t rsp);
+void tss_set_rsp0_for(unsigned index, uint64_t rsp);
 void tss_set_ist(int ist, uint64_t rsp);
 
 /* ---------------------------------------------------------------- IDT --- */

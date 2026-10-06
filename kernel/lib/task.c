@@ -625,8 +625,28 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
      * that is an address in the middle of nothing in particular. */
     t->saved_rsp = top - USER_FRAME_BYTES - USER_CTX_BYTES;
     t->user_frame = frame;
-    t->stack = NULL;                       /* it owns no kernel stack yet */
-    t->stack_top = 0;
+
+    /* The kernel stack that task_create() already allocated is *kept*.
+     *
+     * It used to be thrown away here, on the grounds that a user task does not need one
+     * yet.  It needs one immediately: `int $0x80` and every interrupt from ring 3 switch
+     * to TSS.RSP0, and tss_init_for() zeroes the TSS, so RSP0 was zero on every processor
+     * in the machine.  The consequence is that a user task's very first syscall pushes its
+     * frame at address zero, and the handler that catches the resulting page fault runs on
+     * an IST stack with the *original* registers -- so the fault is reported somewhere
+     * entirely unrelated to the syscall that caused it, with a stack pointer that means
+     * nothing.
+     *
+     * Keeping it also gives the task guarded, per-task kernel frames, which is what makes
+     * a stack trace of a fault inside a syscall worth reading at all.
+     *
+     * `saved_rsp` still points into the *user* stack, because that is where the ring-3
+     * return frame and the bootstrap context are, and entering the task for the first time
+     * has to land between them.  After that it is a kernel-stack address like any other
+     * task's, because that is where the CPU puts the frame.  Both are reachable in this
+     * task's address space -- the kernel half is shared -- so nothing else has to change. */
+    if (t->stack == NULL || t->stack_top == 0)
+        return NULL;                      /* task_create() gave it one; check anyway */
 
     return t;
 }
@@ -1094,6 +1114,25 @@ void schedule(void) {
      * argument. */
     page_table_t *next_tables = next->tables != NULL ? next->tables
                                                     : vmm_kernel_tables();
+
+    /* Point this processor's RSP0 at the task that is about to run on it.
+     *
+     * The CPU loads RSP from TSS.RSP0 on *every* interrupt out of ring 3 -- every `int
+     * $0x80`, every timer tick, every IPI -- so it has to name the task that is running
+     * on this processor at this moment, and it is therefore per processor rather than per
+     * task.  Set at task creation it would leave every processor pointing at the boot
+     * task's stack, and a user task that migrated would take its kernel frames there.
+     *
+     * The boot task has no stack of its own -- it is running on the stack the kernel
+     * booted on, which was allocated before there were tasks -- so `stack_top` is zero
+     * and the previous value is left alone.  It is never loaded from, because the boot
+     * task never leaves ring 0.
+     *
+     * Doing this here rather than inside the switch is safe because interrupts are off
+     * across the whole selection-and-switch, so nothing can arrive between this store and
+     * the switch that would use it. */
+    if (next->stack_top != 0)
+        tss_set_rsp0_for(index, next->stack_top);
 
     /* Clear the guard before switching, not after.  A task that is switched to has
      * to be able to schedule immediately -- to sleep, to yield -- and this
