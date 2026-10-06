@@ -323,7 +323,21 @@ void gdt_init(void) {
     boot_trace('|');
     /* The TSS descriptor spills into two GDT slots; both must be written
      * before the reload below refreshes the CPU's cache of the table. */
-    gdt_write_tss_descriptor(0, (uint64_t)&kernel_tss[0],
+    /* A TSS descriptor's base field is a *physical* address.  The CPU fetches the TSS
+     * contents from it directly -- the TSS is not subject to paging, not even in long
+     * mode -- so passing the virtual address of the struct here leaves the CPU reading
+     * RSP0, the IST pointers and iomap_base out of physical address 0xffffffff80xxxxxx,
+     * which is not memory.
+     *
+     * Everything downstream of that fails in a way that points somewhere else entirely:
+     * an interrupt out of ring 3 loads a garbage RSP0, the push onto it faults, and the
+     * resulting double fault is reported at the *original* privilege level with the
+     * original instruction pointer -- so a ring-3 program that faults appears to fault
+     * twice at its own entry point and never gets a handler at all.  `phase4-tss` reads
+     * the struct rather than asking the CPU, so it passes throughout.
+     *
+     * Same trap in smp_cpu_entry() for the application processors. */
+    gdt_write_tss_descriptor(0, virt_to_phys((uint64_t)&kernel_tss[0]),
                              sizeof(kernel_tss[0]) - 1);
     gdt_set_kernel_table();
     boot_trace('|');

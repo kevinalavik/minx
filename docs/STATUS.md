@@ -322,12 +322,48 @@ is immediately followed by `#DF` and a triple fault, so the handler's own report
 quadwords about to be popped, and CR3 -- which is the diagnostic that found this and is
 the one to widen next.
 
-**Next thing to try, in order.** (a) Print `t->tables->pml4` next to CR3 in that same
-report, so the two can be compared in one place. (b) Work out why the exception path dies
-on a ring-3 fault: `TSS.RSP0` is set now, but the `#DF` that follows suggests the IST1 path
-is not usable either, and `ist_stack_1` is a static in the kernel image. (c) Walk the four
-PTE levels from CR3 in the handler -- worth doing *after* (b), because a longer handler in
-a path that already cannot survive is the wrong direction.
+**A second real bug found in the same hunt: the TSS descriptor base was a virtual
+address.** A TSS descriptor's base field is a *physical* address -- the CPU fetches the TSS
+contents from it directly, the TSS is not subject to paging even in long mode. Both call
+sites passed `(uint64_t)&kernel_tss[index]`, i.e. `0xffffffff80xxxxxx`, so the CPU was
+reading `RSP0`, the IST pointers and `iomap_base` out of physical address
+`0xffffffff80xxxxxx`, which is not memory. Now `virt_to_phys()` is applied. The symptom is
+worth recording because it points nowhere near the cause: an interrupt out of ring 3 loads a
+garbage `RSP0`, the push onto it faults, and the resulting `#DF` is reported **at the
+original privilege level with the original instruction pointer** -- so a ring-3 program that
+faults looks like it faults twice at its own entry point and never gets a handler at all.
+`phase4-tss` passes throughout because it reads the struct rather than asking the CPU, which
+is a fair reminder that a test can verify a structure's contents without ever checking
+whether the hardware agrees about them.
+
+**A third: the console was pointed at the framebuffer's own physical address**
+(`0xf0000000`, a PCI BAR, so PML4 slot 0 -- the half a user address space owns). Now
+through the direct map, which every address space shares. This turned out to be a no-op in
+the end, because `fb->address` was *already* a direct-map address, and it is left in place
+because it is correct and because it removes a trap for anyone who changes it later.
+
+**Where it stands.** `make test` runs 31 checks and then the machine dies in `phase6-user`
+with an instruction-fetch page fault at the entry point, `cpl=3`, `CR2=0x40042c`, reported
+*not present* -- and immediately followed by `#DF`, `#DF`, which is the ring-3 stack switch
+still failing despite the TSS fix above.
+
+**What is established, and what is not.** Established: the loader completes (bracketed with
+markers that all printed); the ring-3 frame is correct *and* is at `%rsp` when the `iretq`
+runs (`cs=0x8 rsp=0x7fffffffefd8 | rip=0x40042c cs=0x23 rflags=0x202 ss=0x1b
+rsp=0x7fffffffef00`); the selectors are DPL 3; the program reaches ring 3. **Not**
+established: why the CPU's walk of `CR3=0x513c000` finds `0x40042c` not present while
+`pt_get()` over `t->tables` finds it present *and* user-readable. Those two walks cannot be
+compared in one place, because the exception path dies before it can print -- which is the
+next thing to fix, and the reason it is that rather than the walk itself.
+
+**Next thing to try, in order.** (a) Make the ring-3 fault *reportable*: the `#DF` chain
+means `TSS.RSP0` is still not usable, so read `tss_for(index)->rsp[0]` **and** CR3 in the
+same place and print them with `serial_puts` -- plain serial, no formatting and no console,
+because the markers proved that survives and the console does not. (b) With the report
+working, print `t->tables->pml4` beside CR3. If they differ, `vmm_address_space_switch()` is
+not switching for this task; if they agree, `pt_get()` and the CPU really are disagreeing
+about the same tables and the PTE contents need dumping at both levels. (c) Only then look
+at the walk.
 
 ### 1. `phase6-user` -- still hanging, now much further along
 The whole suite reaches it now, and every *other* part of phase 6 passes. It gets as far

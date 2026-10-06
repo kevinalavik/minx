@@ -179,7 +179,28 @@ static void framebuffer_start(void) {
         return;
     }
 
-    if (fb_init((uint8_t *)fb->address, (uint32_t)fb->width,
+    /* Through the direct map, not at the framebuffer's own address.
+     *
+     * Limine hands over the framebuffer at its *physical* address, which for a PCI BAR is
+     * a hole low in the 32-bit range -- 0xf0000000 on this machine.  That is PML4 slot 0,
+     * which is the half a user address space owns: vmm_address_space_create() gives a
+     * process slots 0..255 and copies slots 256..511 from the kernel, so a user task has
+     * *nothing* mapped there.
+     *
+     * The console therefore became unusable from any user address space, and the place
+     * that matters is the ring-3 page-fault handler: it runs in the faulting task's
+     * address space, so writing one character of its own report faulted, which is a double
+     * fault, and the double-fault handler wrote its report the same way, which is a triple
+     * fault.  A user program that faulted took the machine down before printing anything,
+     * which is why every ring-3 failure in this kernel looked like a silent death rather
+     * than a report.
+     *
+     * The direct map covers the whole of physical memory and lives in the kernel half,
+     * which every address space shares, so the same bytes are reachable from all of them.
+     * The identity mapping at the framebuffer's own address is left in place: it is what
+     * vmm_init() creates it for, and it is harmless. */
+    if (fb_init((uint8_t *)phys_to_virt(virt_to_phys((uint64_t)fb->address)),
+                (uint32_t)fb->width,
                 (uint32_t)fb->height, (uint32_t)fb->pitch, fb->bpp, true,
                 fb->red_mask_size, fb->red_mask_shift, fb->green_mask_size,
                 fb->green_mask_shift, fb->blue_mask_size,

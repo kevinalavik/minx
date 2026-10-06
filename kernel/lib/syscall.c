@@ -38,6 +38,7 @@
 #include "task.h"
 #include "vectors.h"
 #include "vmm.h"
+#include "serial.h"
 
 /* --- the table ---------------------------------------------------------- */
 
