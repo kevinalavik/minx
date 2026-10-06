@@ -28,6 +28,7 @@
  *    write() runs perfectly happily on a stack that is merely wrong.
  */
 #include "elf.h"
+#include "serial.h"
 
 #include "kprintf.h"
 #include "pmm.h"

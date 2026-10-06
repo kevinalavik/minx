@@ -1,4 +1,5 @@
 #include "pagetables.h"
+#include "serial.h"
 
 #include "cpu.h"
 #include "io.h"
@@ -150,6 +151,9 @@ static pte_t *walk_to_leaf(page_table_t *tables, uint64_t virt, bool user,
             *slot = pte_make(frame, flags);
             pt_invalidate(virt);
         } else if (user && !pte_user(*slot)) {
+            kprintf("[warn] vmm: refused a user mapping at %#lx: an "
+                    "intermediate table is not user-accessible, so the CPU "
+                    "would refuse to walk to it\n", (unsigned long)virt);
             return NULL;
         }
 

@@ -295,8 +295,6 @@ __enter_user:
     movq    %cs, %rax              /* a segment register loads only into a GPR */
     movq    %rax, (%rsi)
     movq    %rsp, 8(%rsi)
-    movq    %cr3, %rax
-    movq    %rax, 56(%rsi)
     movq    %rsp, %rdi
     movq    $5, %rcx
 1:  movq    (%rdi), %rax

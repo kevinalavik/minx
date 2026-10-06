@@ -2,8 +2,9 @@
 
 Current phase: 6 (userspace entry) — phases 1 to 4 VERIFIED, phase 5's blocker
 **fixed**, phase 6 three of four. `make test` now runs the whole suite to the end and
-reports **36 of 38 PASS** with no panic at `-smp 1`, `-smp 2` and `-smp 4`, where it
-used to die before the tests began. Phase 5 is still **not** VERIFIED: it needs a clean
+reports **37 of 38 PASS** with no panic at `-smp 1` and `-smp 4`, where it used to die
+before the tests began. The one remaining failure is `phase6-user`, and it is now a single
+named bug rather than a class of them. Phase 5 is still **not** VERIFIED: it needs a clean
 matrix, and `phase4-lockfair` now fails for a reason that is the test's premise rather
 than the kernel's. Two failures remain, both named exactly in "Known bugs / gaps", and
 neither is worked around to make the number look better.
@@ -356,14 +357,65 @@ established: why the CPU's walk of `CR3=0x513c000` finds `0x40042c` not present 
 compared in one place, because the exception path dies before it can print -- which is the
 next thing to fix, and the reason it is that rather than the walk itself.
 
-**Next thing to try, in order.** (a) Make the ring-3 fault *reportable*: the `#DF` chain
-means `TSS.RSP0` is still not usable, so read `tss_for(index)->rsp[0]` **and** CR3 in the
-same place and print them with `serial_puts` -- plain serial, no formatting and no console,
-because the markers proved that survives and the console does not. (b) With the report
-working, print `t->tables->pml4` beside CR3. If they differ, `vmm_address_space_switch()` is
-not switching for this task; if they agree, `pt_get()` and the CPU really are disagreeing
-about the same tables and the PTE contents need dumping at both levels. (c) Only then look
-at the walk.
+**`TSS.RSP0` is now right, and the fault is a VMM contradiction rather than a report
+problem.** With the descriptor base fixed, the ring-3 `#DF` chain is gone: no ring-3 fault
+at all, no syscall, and every interrupt reporting `cs=0x8`. So the task is not faulting --
+it is not *running*. The check in `program_load_and_run()` now answers that, and it is the
+sharpest thing found:
+
+    [seg] tables=ffff800000161040 pml4=000000000513c000 ok     (three times)
+    [load] A=0 B=0 E=1 P=0 pm=1 pv=1 ac=1
+
+Read left to right: the loader mapped three pages into `t->tables`, whose PML4 is
+`0x513c000`; `0x513c000` is **exactly the CR3 the CPU is running on** when the program
+faults, so the right address space is loaded; `t->tables->pml4` is non-zero, its
+direct-map alias is non-NULL, and the VMM is active; and yet `pt_get(t->tables, 0x40042c)`
+returns 0. `build_stack()`'s own check against `t->tables` passes, so the tables are
+intact a few lines earlier and gone a few lines later, with only the frame patch between.
+
+**So this is a genuine contradiction inside the VMM, and it is where to look next:**
+`pt_map_page()` writes a leaf into a table that `pt_get()` cannot find a leaf in, for the
+same `tables` pointer, with `pt_invalidate()` a plain `invlpg` and
+`vmm_address_alloc()`/`pmm_alloc_phys_page()` a bitmap bump allocator that cannot hand out
+the same frame twice. Ruled out by measurement: `walk_to_leaf()` refusing a non-user
+intermediate (its refusal message never printed); `load_segment()` failing (its error
+messages never printed); the tables differing (they do not); the page-table frames being
+reused (`pmm_alloc_phys_page()` never frees, and `vmm_user_page_free()` is only reachable
+from two failure paths).
+
+**FOUND: `build_stack()` zeroes the page directory.** Bracketing the walk before and after
+it, for the entry point `0x40042c`:
+
+    AFTER-SEGMENTS  L0 i=0000 e=0000000005149007
+                    L1 i=0000 e=000000000514a007
+                    L2 i=0002 e=000000000514d007
+                    L3 i=0000 e=000000000514c005
+    AFTER-STACK     L1 i=0000 e=0000000000000000     <-- the PDPT entry, gone
+
+`build_stack()` does `memset(base, 0, usable)` where `base = phys_to_virt(t->user_stack_phys)`
+and `usable = cap - 96`. The frame it zeroes is `0x514a000` -- **the page directory pointer
+table**. So `t->user_stack_phys` and the PDPT are the same physical frame: the stack's
+bottom page and a page table are one page of memory, and zeroing one destroys the other.
+
+**Note also `L3 e=...c005`**: the *leaf* for the entry point has `U=0` and `W=0` -- present,
+but neither user-accessible nor writable -- which is a second thing wrong with the same
+mapping, and the one the CPU would hit first.
+
+**Where to look next.** (a) The allocator handed out `0x514a000` twice: `t->user_stack_phys`
+records it as the stack's bottom page, and `walk_to_leaf()` allocated it as the PDPT. Both
+come from `pmm_alloc_phys_page()`, whose bitmap should make that impossible -- so check
+`bit_set`/`bit_test` and whether `walk_to_leaf()`'s `pmm_alloc_phys_page()` is being counted
+somewhere else, or whether `t->user_stack_phys` is being recorded from the wrong loop
+iteration. (b) Fix the leaf flags: `load_segment()` passes `PTE_USER` for the image, so the
+leaf *should* have `U=1`; `0x...c005` says it does not, which points at the flags reaching
+`pte_make()` rather than at `walk_to_leaf()`. (c) With both fixed, `phase6-user` should
+reach the syscall path for the first time.
+
+**Two permanent checks were added rather than thrown away**, because both were silent
+successes that cost hours: `program_load_and_run()` now verifies the entry point is mapped
+and user-readable in the task's own tables *before* queuing the task (asked afterwards it
+reports a consequence of the thing it should have prevented, and the machine is by then in
+no state to print in); and `walk_to_leaf()` now says when it refuses a user mapping.
 
 ### 1. `phase6-user` -- still hanging, now much further along
 The whole suite reaches it now, and every *other* part of phase 6 passes. It gets as far

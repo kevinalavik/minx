@@ -675,6 +675,26 @@ void kmain(void) {
      * the allocator hands out all go through it. */
     hhdm_init();
 
+    /* Re-install the boot processor's TSS descriptor, now that virt_to_phys() means
+     * something.
+     *
+     * gdt_init() ran a moment ago and had to write this descriptor, but it ran before the
+     * direct map existed, so virt_to_phys() was the identity and the descriptor got the
+     * struct's *virtual* address.  A TSS descriptor's base field is a physical address --
+     * the CPU fetches the TSS contents from it directly, and the TSS is not subject to
+     * paging even in long mode -- so the CPU was reading RSP0, the IST pointers and
+     * iomap_base out of physical 0xffffffff80xxxxxx, which is not memory.
+     *
+     * Nothing about that shows up until something switches stacks, which is why it
+     * survived: an exception at CPL 0 needs no stack switch, so the whole of phases 1 to
+     * 5 works, and the first ring-3 fault loads a garbage RSP0 and dies.  Writing the
+     * descriptor a second time once the offset is known is the whole fix; the alternative
+     * is to move gdt_init() after hhdm_init(), which delays the descriptor tables -- the
+     * first thing kmain() installs precisely so that a fault is reportable -- for no gain.
+     */
+    gdt_write_tss_descriptor(0, virt_to_phys((uint64_t)&kernel_tss[0]),
+                             sizeof(kernel_tss[0]) - 1);
+
     kmalloc_init();
     parse_cmdline();
 

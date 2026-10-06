@@ -911,13 +911,13 @@ static void charge_current(sched_cpu_t *c) {
  */
 /* What __enter_user saw, immediately before `iretq`.
  *
- * [0] %cs, [1] %rsp, [2..6] the five quadwords `iretq` pops: RIP, CS, RFLAGS, SS, RSP.
+ * [0] %cs, [1] %rsp, [2..6] the five quadwords `iretq` pops: RIP, CS, RFLAGS, RSP, SS.
  *
  * It exists because the frame written by task_create_user() has been verified correct from
  * the kernel's own alias of it, and the one thing that has *not* been checked is whether
  * %rsp points at that alias when the CPU gets there.  If it does not, everything above is
  * right and the CPU still reads something else. */
-uint64_t task_iret_frame[8];
+uint64_t task_iret_frame[7];
 
 void sched_publish_outgoing(uint64_t *save_rsp, task_t *prev, sched_cpu_t *c) {
     (void)save_rsp;

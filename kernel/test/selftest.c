@@ -1605,6 +1605,23 @@ static void test_user_program(void) {
     }
 
     if (syscall_last_exit() < 0) {
+        /* Everything about the task that decides whether it ever ran, because "never
+         * exited" covers both "ran and hung" and "was never scheduled" and the two need
+         * opposite fixes. */
+        kprintf("phase6-user: task %lu (%s) state %d started %d switches %lu "
+                "last_cpu %u on-cpu %lu stack %p list_tag %p vruntime %lu\n",
+                (unsigned long)t->id, t->name, t->state, t->started ? 1 : 0,
+                (unsigned long)t->switch_count, t->last_cpu,
+                (unsigned long)t->ran_on_cpu, (void *)t->stack,
+                (void *)(uintptr_t)t->list_tag, (unsigned long)t->vruntime);
+        for (unsigned i = 0; i < percpu_online_count(); i++) {
+            sched_stats_t st;
+
+            sched_get_stats(i, &st);
+            kprintf("phase6-user: cpu %u holds %u queued, %u sleeping, %u switches, "
+                    "%u steals\n", i, st.queued, st.sleeping, st.switches,
+                    st.steals);
+        }
         test_fail("phase6-user", "the program never exited: it either hung or was "
                   "still waiting to be scheduled after 20 s");
         return;
@@ -2305,7 +2322,13 @@ static void test_smp_tss(void) {
             return;
         }
 
-        if (base != (uint64_t)&kernel_tss[i]) {
+        /* The descriptor's base field is a *physical* address: the CPU fetches the TSS
+         * contents from it directly and the TSS is not subject to paging, not even in long
+         * mode.  This test asserted the virtual address, so it agreed with a kernel that
+         * had the CPU reading its TSS out of physical 0xffffffff80xxxxxx -- and the CPU
+         * was, which is why nothing about the TSS worked from ring 3 and nothing here
+         * noticed. */
+        if (base != virt_to_phys((uint64_t)&kernel_tss[i])) {
             test_fail("phase4-tss", "processor %u's descriptor points at %#lx, "
                       "not at its own TSS at %p", i, (unsigned long)base,
                       (void *)&kernel_tss[i]);

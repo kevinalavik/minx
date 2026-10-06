@@ -793,3 +793,37 @@ from `%cs` in `task_save_publish_and_switch()` (an interrupt from ring 3 switche
 to CPL 0 *before* the handler runs, so `%cs` is the kernel's and cannot see the frame —
 `isr_dispatch()` records it now), and running C to print from `__enter_user` (that runs on
 the task's user stack, so instrumenting the entry that way changes what it measures).
+
+
+## 2026-10-06 — Two things a test can be wrong about
+Decision: both fixed, and both recorded because the second is the more useful lesson.
+
+**A TSS descriptor's base is a physical address, and `phase4-tss` asserted the virtual
+one.** The CPU fetches TSS contents from that field directly -- the TSS is not subject to
+paging, not even in long mode -- so the boot processor's `RSP0`, IST pointers and
+`iomap_base` were being read out of physical `0xffffffff80xxxxxx`, which is not memory.
+Nothing about that shows up until something switches stacks, which is why it survived the
+whole of phases 1 to 5: an exception at CPL 0 needs no stack switch, so every test passed
+and the first ring-3 fault loaded a garbage `RSP0` and died.
+
+The test agreed with the bug. It compared the descriptor's base against
+`(uint64_t)&kernel_tss[i]`, which is exactly what a kernel with this bug would contain --
+so it was not a weak test, it was a test that asserted the wrong thing, and it would have
+kept passing for as long as the bug existed. **A test that verifies a structure's contents
+without ever asking the hardware what it thinks those contents are is not testing the
+integration.** It now compares against `virt_to_phys()`.
+
+**And the boot processor's descriptor was written before `virt_to_phys()` meant anything.**
+`gdt_init()` runs first in `kmain()` -- deliberately, so that a fault is reportable from the
+first instruction -- and it has to write that descriptor, but `hhdm_init()` has not run yet,
+so `virt_to_phys()` is the identity and the descriptor gets the virtual address again. Fixed
+by re-installing the descriptor immediately after `hhdm_init()`. Moving `gdt_init()` later
+would have been the other answer and is worse: it delays the descriptor tables, which exist
+precisely so that a fault is reportable, for no gain.
+
+The lesson generalises to the whole of this session: three separate bugs (the ring-3 frame
+written backwards, the frame's SS and RSP swapped, the TSS base wrong) all presented as
+*the hardware disagreeing with the kernel*, and in each case the kernel was right to believe
+itself and the hardware was being asked the wrong question -- or the question was right and
+the answer was not being read. `docs/STATUS.md` records, for each, the measurement that
+settled it rather than the argument that did not.

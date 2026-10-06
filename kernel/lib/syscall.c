@@ -437,25 +437,29 @@ task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
     t->saved_rsp = USER_STACK_TOP - USER_FRAME_BYTES - USER_CTX_BYTES;
     t->started = false;
 
+    /* The entry point has to be mapped in *this task's* address space, and this has to be
+     * asked before the task is queued rather than after.  Asked afterwards it is too late
+     * to report: the task has been scheduled, it has run, and it has already faulted on
+     * this very address, so the check reports a consequence of the thing it should have
+     * prevented -- and by then the machine may not be in a state to print in.
+     *
+     * Without the check, a loader that maps nothing reports success and the program takes
+     * a page fault on its first instruction, with the loader nowhere in the report. */
+    if (!vmm_translate_in(t->tables, r.entry) ||
+        !syscall_user_range_ok_in(t->tables, r.entry, 1, false)) {
+        kwarn("program: %s loaded, but its entry point %#lx is not mapped user-readable "
+              "in the task's own address space", name, (unsigned long)r.entry);
+        vmm_address_space_destroy(t->tables);
+        kfree(t->tables);
+        t->tables = NULL;
+        return NULL;
+    }
+
     if (task_wakeup(t) != 0) {
         kwarn("program: could not queue %s", name);
         return NULL;
     }
 
-    /* The entry point has to be mapped in *this task's* address space, not merely in
-     * whatever the loader was running in, and the task's own tables are the only place
-     * that can be asked.  Without this the loader reports success and the program takes a
-     * page fault on its first instruction, with the loader nowhere in the report. */
-    if (!vmm_translate_in(t->tables, r.entry)) {
-        kwarn("program: %s loaded, but its entry point %#lx is not mapped in the "
-              "task's own address space", name, (unsigned long)r.entry);
-        return NULL;
-    }
-    if (!syscall_user_range_ok_in(t->tables, r.entry, 1, false)) {
-        kwarn("program: %s loaded, but its entry point %#lx is not user-readable in "
-              "the task's own address space", name, (unsigned long)r.entry);
-        return NULL;
-    }
 
     kprintf("program: %s loaded, entry %#lx, %u segment(s), %lu bytes, stack %#lx\n",
             name, (unsigned long)r.entry, r.segments, (unsigned long)r.bytes,

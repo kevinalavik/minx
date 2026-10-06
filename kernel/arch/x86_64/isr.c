@@ -96,7 +96,6 @@ void isr_report_exception(regs_t *regs) {
                     (unsigned long)task_iret_frame[4],
                     (unsigned long)task_iret_frame[5],
                     (unsigned long)task_iret_frame[6]);
-        kprintf("  iret: cr3=%#lx\n", (unsigned long)task_iret_frame[7]);
     }
 
     if (vector == 14)
@@ -119,6 +118,7 @@ void isr_dispatch(regs_t *regs) {
      * ring-3 frame while the CS in hand belongs to the kernel.  See percpu_t.from_user. */
     if ((regs->cs & 3) != 0)
         percpu_self()->from_user = 1;
+
 
     /* The remapped 8259 IRQs land on vectors 32..47, and the IOAPIC redirects
      * the same lines to the same vectors once it owns them. */
