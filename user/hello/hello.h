@@ -21,12 +21,14 @@
 #define SYS_GETPID  7
 #define SYS_FORK    8
 #define SYS_WAIT    9
+#define SYS_PIPE    10
 
 /* Errors, as the negative return values the kernel uses. */
 #define EBADF   9
 #define EFAULT  14
 #define ENOSYS  38
 #define ENOMEM  12
+#define EPIPE   32
 
 typedef unsigned long size_t_;
 typedef long ssize_t_;
@@ -95,6 +97,20 @@ static inline ssize_t_ minx_write(int fd, const void *buf, size_t_ n) {
 
 static inline ssize_t_ minx_read(int fd, void *buf, size_t_ n) {
     return minx_syscall3(SYS_READ, fd, (long)buf, (long)n);
+}
+
+/* Close a descriptor.  The kernel returns EBADF for a number that is not open, and for
+ * 0, 1 and 2 as well: the console belongs to the process table, not to the program, so a
+ * program that closes its own stdout loses its output rather than taking the console away
+ * from every other process on the machine. */
+static inline long minx_close(int fd) {
+    return minx_syscall1(SYS_CLOSE, fd);
+}
+
+/* Create a pipe and write its two ends into `fds`, which must be a pointer to two ints.
+ * Returns 0, or -errno. */
+static inline long minx_pipe(int *fds) {
+    return minx_syscall1(SYS_PIPE, (long)(uintptr_t)fds);
 }
 
 static inline long minx_exit(int code) {
