@@ -80,42 +80,76 @@ static bool load_segment(page_table_t *tables, const uint8_t *image, uint64_t vi
     if (filesz > memsz)
         return false;
 
-    size_t span = (size_t)ALIGN_UP(memsz, page_size);
+    /* Whole pages, from the first the segment touches to the first it does not.
+     *
+     * A segment does not start at a page boundary and does not end at one either, so the
+     * first and last pages are shared with whatever lies either side of it -- usually with
+     * the *next* segment, since a linker packs text and data into adjacent pages and the
+     * boundary between them is almost never page-aligned.  Those pages are mapped once and
+     * filled in twice.
+     *
+     * Which is what used to go wrong, and only showed up once `hello` grew past two pages
+     * of text: this allocated a fresh frame for every page of every segment, and
+     * pt_map_page() deliberately refuses to replace a different frame.  So the second
+     * segment to reach a shared page found the first one's frame there and refused, and the
+     * program would not load -- with "elf: could not map 0x4022ae" as the whole report.
+     * A loader that cannot map a page another segment already mapped is not a loader. */
+    uint64_t first = virt & ~(uint64_t)(page_size - 1);
+    uint64_t end = (virt + memsz + page_size - 1) & ~(uint64_t)(page_size - 1);
 
-    for (size_t off = 0; off < span; off += page_size) {
-        uint64_t phys = vmm_user_page_alloc();
+    for (uint64_t page = first; page < end; page += page_size) {
+        /* The part of *this* page this segment covers, and the part of it the file
+         * covers, both as offsets into the page. */
+        uint64_t seg_from = (virt > page) ? virt - page : 0;
+        uint64_t seg_to = (virt + memsz < page + page_size) ? virt + memsz - page
+                                                             : page_size;
+        uint64_t file_from = (filesz > seg_from) ? seg_from : filesz;
+        uint64_t file_to = (filesz > seg_to) ? seg_to : filesz;
+        uint64_t phys;
+        pte_t leaf = pt_get(tables, page);
 
-        /* Every one of these used to be a bare `return false`, so a program that would
-         * not load produced one line saying it would not load and nothing about why.  A
-         * loader that fails silently is indistinguishable from one that was never asked
-         * to load anything. */
-        if (phys == 0) {
-            kprintf("elf: out of frames mapping %#lx+%lu\n", (unsigned long)(virt + off),
-                    (unsigned long)memsz);
-            return false;
+        if (pte_present(leaf) && pte_user(leaf)) {
+            /* A page another segment already put here.  Fill it in rather than replacing
+             * it, and take the union of what the two segments ask for: a page that one
+             * segment calls read-only and another calls writable has to end up writable,
+             * or the second segment faults on its own text. */
+            phys = pte_phys(leaf);
+
+            if (writable && !pte_writable(leaf) &&
+                !pt_set_writable(tables, page, true)) {
+                kprintf("elf: could not make the shared page at %#lx writable\n",
+                        (unsigned long)page);
+                return false;
+            }
+        } else {
+            phys = vmm_user_page_alloc();
+
+            /* Every one of these used to be a bare `return false`, so a program that
+             * would not load produced one line saying it would not load and nothing about
+             * why.  A loader that fails silently is indistinguishable from one that was
+             * never asked to load anything. */
+            if (phys == 0) {
+                kprintf("elf: out of frames mapping %#lx+%lu\n",
+                        (unsigned long)virt, (unsigned long)memsz);
+                return false;
+            }
+
+            if (vmm_map_into(tables, page, phys, page_size, writable) != 0) {
+                kprintf("elf: could not map %#lx into %p\n",
+                        (unsigned long)page, (void *)tables);
+                vmm_user_page_free(phys);
+                return false;
+            }
         }
 
-        if (vmm_map_into(tables, virt + off, phys, page_size, writable) != 0) {
-            kprintf("elf: could not map %#lx into %p\n",
-                    (unsigned long)(virt + off), (void *)tables);
-            vmm_user_page_free(phys);
-            return false;
-        }
-
-        uint8_t *dst = (uint8_t *)phys_to_virt(phys);
-        size_t from_file = 0;
-
-        if (filesz > off)
-            from_file = (size_t)((filesz - off < page_size) ? filesz - off : page_size);
-
-        if (from_file != 0)
-            __builtin_memcpy(dst, image + off, from_file);
-
-        /* The tail stays zero, which vmm_user_page_alloc() arranged.  Written out
-         * explicitly because "the recycled frame happened to be zero" is not a property
-         * anything guarantees. */
-        if (from_file < page_size)
-            memset(dst + from_file, 0, page_size - from_file);
+        /* Copy what the file holds for this page.  The rest of the segment's range --
+         * .bss, and the slack below a segment that starts mid-page -- is already zero,
+         * because vmm_user_page_alloc() hands out zeroed frames and the segment ranges in
+         * one image do not overlap, so nothing another segment wrote here can be in it. */
+        if (file_to > file_from)
+            __builtin_memcpy((uint8_t *)phys_to_virt(phys) + file_from,
+                             image + (file_from - seg_from),
+                             (size_t)(file_to - file_from));
     }
 
     return true;
