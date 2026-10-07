@@ -22,10 +22,12 @@
 #include "boot.h"
 #include "cpu.h"
 #include "delay.h"
+#include "fd.h"
 #include "io.h"
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "serial.h"
 #include "smp.h"
 #include "string.h"
 #include "timer.h"
@@ -361,6 +363,40 @@ static void unblock(task_t *t) {
     enqueue(percpu_self_index(), t);
 }
 
+/* Forget that there is a ring-3 context on this processor's stack.
+ *
+ * Two paths need this, and they are the two that finish with the exception handler's C
+ * code instead of passing through it.
+ *
+ * The syscall door clears it on its way out, because leaving the marker set would hand the
+ * *next* save a ring-3 frame that is not there: the task would resume through `iretq` off
+ * whatever the handler had left on its stack.
+ *
+ * A task that is stopping in the middle of a syscall clears it for the same reason and
+ * with more at stake.  A ring-3 task is normally saved whole -- the interrupt frame the
+ * CPU pushed -- and resumed through `iretq`, which is the only way back to ring 3 with the
+ * right CS, SS and %rsp.  That is right for a task that was interrupted and is simply
+ * waiting its turn.  It is wrong for one blocked in a syscall: the frame's RIP is the
+ * instruction after `int $0x80`, so resuming it delivers the syscall's return value into
+ * user code -- whatever is in %rax when the task stopped, which is the call *number*,
+ * because nothing has computed a result yet.  A program then carries on believing its read
+ * returned 10, and the kernel's half of the buffer it was filling in is still waiting for
+ * whoever was supposed to be woken.
+ *
+ * Clearing it before the switch means such a task is saved the ordinary way: the
+ * callee-saved registers and a return address, with its C frames still on its kernel
+ * stack, intact.  Woken, it returns from `schedule()`, unwinds back through the syscall,
+ * computes the answer, writes it into the interrupt frame, and that frame's own `iretq` --
+ * still waiting where the CPU left it -- returns to ring 3 properly.  The answer is not
+ * lost either way: it is the same frame.
+ *
+ * `percpu_t.from_user` is consumed by exactly one reader, schedule(), so clearing it here
+ * cannot affect a save this task is not part of. */
+static void self_from_user_clear(void) {
+    percpu_self()->from_user = 0;
+    percpu_self()->user_frame = NULL;
+}
+
 /* The exported half of unblock(): see the header for why waking a blocked task is not
  * the same operation as queueing a runnable one. */
 void task_unblock(task_t *t) {
@@ -387,6 +423,16 @@ static task_t *task_alloc(void) {
     t->state = TASK_UNUSED;
     t->weight = TASK_WEIGHT_DEFAULT;
     t->last_cpu = MAX_CPU_COUNT;
+
+    /* The three descriptors every process starts with, filled in here rather than by each
+     * creator: a task that reached the point of being switched into with an empty
+     * descriptor table would have no stdout, and the symptom would be a program whose
+     * output silently goes nowhere. */
+    for (int i = 0; i < 3; i++) {
+        t->fds[i].kind = FD_CONSOLE;
+        t->fds[i].closable = false;
+    }
+
     return t;
 }
 
@@ -1215,7 +1261,19 @@ void schedule(void) {
                                      &next->saved_in_user, from_user, out_ctx);
     }
 
-    /* Only reached when this task is switched back into. */
+    /* Only reached when this task is switched back into.
+     *
+     * So the ring-3 marker has to be cleared *here*, on the way in, rather than on the
+     * way out: the task may come back on a processor that never saw it block, and that
+     * processor's marker is whatever its last ring-3 interrupt left there.  A task running
+     * in ring 0 saved against a stale marker is saved as though a ring-3 frame were on its
+     * stack, and comes back through `iretq` off the middle of its own C frames.
+     *
+     * After the switch, not before: the save above reads the marker to decide how to save
+     * *this* task, and clearing it there would save every ring-3 task as though it were in
+     * the kernel. */
+    self_from_user_clear();
+
     irq_restore(flags);
 }
 
@@ -1359,6 +1417,7 @@ void task_sleep_ms(uint64_t ms) {
     blocked_add(t);
 
     spin_unlock_irqrestore(&blocked.lock, lflags);
+    self_from_user_clear();
     schedule();
 
     irq_restore(flags);
@@ -1381,6 +1440,7 @@ void task_wait(void) {
     blocked_add(t);
 
     spin_unlock_irqrestore(&blocked.lock, lflags);
+    self_from_user_clear();
     schedule();
 
     irq_restore(flags);
@@ -1449,25 +1509,70 @@ void wait_queue_sleep(wait_queue_t *q, unsigned tag) {
     }
 }
 
+/* Enqueue without blocking.  The caller must hold q->lock, which is what makes the pair
+ * with wait_queue_block_locked() safe: see the header. */
+uint32_t wait_queue_enqueue_locked(wait_queue_t *q, unsigned tag) {
+    uint32_t slot = q->tail;
+
+    if (q->count == WAIT_QUEUE_ENTRIES) {
+        /* Full is a bug in the caller, and a dropped waiter is a task that never wakes. */
+        panic("wait_queue: %u waiters, more than the %u slots\n", q->count,
+              (unsigned)WAIT_QUEUE_ENTRIES);
+        return q->head;
+    }
+
+    q->tail = (q->tail + 1) % WAIT_QUEUE_ENTRIES;
+    q->slots[slot].tag = tag;
+    q->slots[slot].task = sched_current();
+    q->count++;
+
+    return slot;
+}
+
+/* Drop the lock and block until the slot is woken, then reclaim it.
+ *
+ * The caller must hold q->lock and must not touch what it was holding afterwards: the lock
+ * is dropped on the way in, and everything this waits on is guarded by it. */
+void wait_queue_block_locked(wait_queue_t *q, uint32_t slot) {
+    ticket_unlock(&q->lock);
+
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&q->lock);
+        bool woken = q->slots[slot].tag == 0;
+
+        spin_unlock_irqrestore(&q->lock, flags);
+
+        if (woken) {
+            uint64_t f2 = spin_lock_irqsave(&q->lock);
+            q->slots[slot].task = NULL;
+            q->slots[slot].tag = 0;
+            q->count--;
+            spin_unlock_irqrestore(&q->lock, f2);
+            return;
+        }
+
+        task_wait();
+    }
+}
+
 /* Wake the first waiter whose tag matches; tag 0 means "any". */
 void wait_queue_wake(wait_queue_t *q, unsigned tag) {
     task_t *woken[WAIT_QUEUE_ENTRIES];
     unsigned n = 0;
 
     ticket_lock(&q->lock);
-    for (unsigned i = 0; i < q->count && n < 4; i++) {
-        uint32_t slot = (q->head + i) % WAIT_QUEUE_ENTRIES;
-
-        if (q->slots[slot].task == NULL)
+    /* The whole array, not a window from `head` -- see the header. */
+    for (unsigned i = 0; i < WAIT_QUEUE_ENTRIES && n < 4; i++) {
+        if (q->slots[i].task == NULL)
             continue;
-        if (tag != 0 && q->slots[slot].tag != tag)
+        if (tag != 0 && q->slots[i].tag != tag)
             continue;
 
         /* Zero is the woken marker; the waiter clears it before returning. */
-        if (q->slots[slot].tag == 0)
+        if (q->slots[i].tag == 0)
             continue;
-        q->slots[slot].tag = 0;
-        woken[n++] = q->slots[slot].task;
+        q->slots[i].tag = 0;
+        woken[n++] = q->slots[i].task;
         if (tag != 0)
             break;
     }
@@ -1482,16 +1587,15 @@ void wait_queue_wake_all(wait_queue_t *q) {
     unsigned n = 0;
 
     ticket_lock(&q->lock);
-    for (unsigned i = 0; i < q->count && n < 8; i++) {
-        uint32_t slot = (q->head + i) % WAIT_QUEUE_ENTRIES;
-
-        if (q->slots[slot].task != NULL && q->slots[slot].tag != 0) {
-            q->slots[slot].tag = 0;
-            woken[n++] = q->slots[slot].task;
+    /* The whole array, not a window from `head` -- see the header for why `head` cannot
+     * say where the live waiters are. */
+    for (unsigned i = 0; i < WAIT_QUEUE_ENTRIES && n < 8; i++) {
+        if (q->slots[i].task != NULL && q->slots[i].tag != 0) {
+            q->slots[i].tag = 0;
+            woken[n++] = q->slots[i].task;
         }
     }
     ticket_unlock(&q->lock);
-
     for (unsigned i = 0; i < n; i++)
         unblock(woken[i]);
 }
@@ -1721,6 +1825,20 @@ task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight
 
     /* Zeroed, which is what every list and pointer in task_t wants to start as. */
     memset(t, 0, sizeof(*t));
+
+    /* The current task's descriptors, copied.  A fork inherits open files; that is what
+     * makes a pipe usable across one, since both processes then hold a descriptor for the
+     * same pipe.  Copied rather than shared, so a child that closes its end does not close
+     * the parent's -- the pipe counts its open ends, and `pipe_close_end()` is what makes
+     * that count drop to nothing.
+     *
+     * Read from the running task rather than passed in, because there is one parent by
+     * definition -- it is whichever task called `fork` -- and passing it would be a
+     * parameter that can only ever have one value. */
+    fd_entry_t *parent_fds = fd_table();
+
+    if (parent_fds != NULL)
+        fd_table_copy(t->fds, parent_fds);
 
     /* Registered rather than given an identifier here: `task_register()` is what puts a
      * task on the all-tasks list and assigns the id, and a task that has an id but is not

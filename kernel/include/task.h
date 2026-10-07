@@ -51,6 +51,37 @@ enum {
 #define TASK_WEIGHT_DEFAULT 4
 #define TASK_WEIGHT_MAX     64
 
+/* What a descriptor names, and the table a task keeps them in.
+ *
+ * These live here rather than in fd.h because task_t embeds the table and fd.h needs
+ * `wait_queue_t` from this file, so the header that defines them cannot include fd.h
+ * without going in a circle.  fd.h includes this one and is what programs of the kernel
+ * use. */
+typedef enum {
+    FD_NONE = 0,
+    FD_CONSOLE,      /* the framebuffer and its serial mirror, as one thing */
+    FD_PIPE,         /* pipe_t, one particular end of it */
+} fd_kind_t;
+
+/* Which end of a pipe a descriptor is, so a number cannot be used for the other end by
+ * accident. */
+typedef enum {
+    PIPE_READ = 0,
+    PIPE_WRITE = 1,
+} pipe_end_t;
+
+typedef struct {
+    fd_kind_t kind;
+    uint8_t   pipe_end;      /* which end, when kind is FD_PIPE */
+    void     *obj;           /* the pipe, when kind is FD_PIPE */
+    bool      closable;      /* false for 0, 1 and 2: they are not ours to close */
+} fd_entry_t;
+
+/* How many descriptors a task can hold.  Fixed rather than allocated because the table is
+ * read on every read and every write, and a kernel with no pipes yet had exactly three
+ * numbers to work with; a pipe is two more and they have to come from somewhere. */
+#define FD_TABLE_ENTRIES 16
+
 typedef struct task {
     uint64_t     id;
     char         name[16];
@@ -171,6 +202,16 @@ typedef struct task {
      * argv/envp/auxv block in it. */
     uint64_t     user_stack_phys;
     uint32_t     user_stack_pages;
+
+    /* This task's open descriptors, and nothing else's.
+     *
+     * A fork copies the entries and shares the objects they name, which is the whole
+     * reason a pipe survives one: both processes hold a descriptor for the same pipe, so a
+     * write on one side is a read on the other.  Copying rather than sharing the table is
+     * also why a child that closes its copy does not close the parent's -- the kernel
+     * counts the ends that are open on each object instead of trusting a number to mean
+     * "still open". */
+    fd_entry_t   fds[FD_TABLE_ENTRIES];
 
     /* Whether the context in `saved_rsp` is a ring-3 frame rather than a set of
      * callee-saved registers and a return address.
@@ -346,8 +387,45 @@ typedef struct wait_queue {
     wait_slot_t   slots[WAIT_QUEUE_ENTRIES];
 } wait_queue_t;
 
+/* Both wake functions scan the whole slot array rather than a window starting at
+ * `head`, and `head` is not a cursor.
+ *
+ * It looks like the front of the queue and is not: wait_queue_init() sets it to zero and
+ * nothing ever advances it, because a slot is not retired in the order it was queued.  It
+ * is retired by whichever task gets woken reclaiming it, and that can be any of them.
+ * The live waiters are therefore scattered anywhere in the array, and the gap a retired
+ * slot leaves is counted as though it were still occupied.
+ *
+ * Scanning `[head, head + count)` therefore reads the wrong slots as soon as one waiter in
+ * the middle goes away, and the symptom is a wake that finds nobody while somebody is
+ * demonstrably waiting: a pipe whose reader has given up its slot and whose writer is
+ * blocked on a full pipe both sit there for ever, neither faults and neither panics, and
+ * it looks like a scheduler that has stopped making progress.
+ *
+ * Sixty-four slots is sixty-four words, on a path taken once per state change rather than
+ * once per byte, so the whole-array scan is free -- and it cannot be wrong the way a
+ * cursor has to be maintained under concurrent retirement. */
 void wait_queue_init(wait_queue_t *q);
 void wait_queue_sleep(wait_queue_t *q, unsigned tag);
+
+/* Enqueue without blocking, then block.  Both require the caller to already hold
+ * `q->lock`.
+ *
+ * wait_queue_sleep() cannot be used by anything that decides to block based on state held
+ * under a *different* lock, because it enqueues and blocks as one step: a waker that
+ * changes that state in between -- after the caller has decided to wait and before the
+ * slot exists -- wakes nobody, and the caller sleeps for ever with the condition already
+ * satisfied.
+ *
+ * Splitting the two closes that window, because the caller holds the lock that guards the
+ * condition for the whole of it.  A pipe is the case in point: its buffer is guarded by
+ * the queue's own lock, so a reader that enqueues under that lock cannot be woken before
+ * it is enqueued, and a waker needs the same lock to change anything.
+ *
+ * `wait_queue_block_locked()` drops the lock on the way in and does not take it again, so
+ * the caller must not touch anything it was holding. */
+uint32_t wait_queue_enqueue_locked(wait_queue_t *q, unsigned tag);
+void     wait_queue_block_locked(wait_queue_t *q, uint32_t slot);
 void wait_queue_wake(wait_queue_t *q, unsigned tag);
 void wait_queue_wake_all(wait_queue_t *q);
 uint32_t wait_queue_count(const wait_queue_t *q);
