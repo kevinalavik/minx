@@ -151,3 +151,256 @@ void vmm_user_page_free(uint64_t phys) {
     if (phys != 0)
         pmm_free_phys_page(phys);
 }
+
+/* --- copy-on-write twins ------------------------------------------------ */
+
+/* Copy one leaf page table, dropping write permission on the writable leaves.
+ *
+ * And dropping it from the *source* as well, which is the half that makes this copy-on-
+ * write rather than copy-on-write-for-the-child-only.  The two page tables are separate
+ * frames, but they name the same physical pages, so the only bit that stands between the
+ * processes writing over each other is in one of them -- and if only the twin's bit is
+ * cleared then the parent writes straight through to the shared frame and the child's copy
+ * is never made.  A copy-on-write scheme that protects only the child is not a scheme.
+ *
+ * Both leaves end up read-only and *both* processes fault on the first write, which is
+ * also what makes the recorded entries worth having: each side restores its own. */
+static bool cow_copy_pt(uint64_t *slot, uint64_t *src_v, uint64_t base,
+                        cow_list_t *cow) {
+    uint64_t frame = pmm_alloc_phys_page();
+
+    if (frame == 0)
+        return false;
+
+    uint64_t *dst = (uint64_t *)phys_to_virt(frame);
+
+    memcpy(dst, src_v, page_size);
+
+    for (unsigned i = 0; i < PML4_ENTRY_COUNT; i++) {
+        uint64_t e = dst[i];
+
+        if (!pte_present(e) || !pte_writable(e) || pte_huge(e))
+            continue;
+
+        if (cow->count >= COW_MAX_PAGES) {
+            cow->full = true;
+            return false;
+        }
+        cow->page[cow->count].virt = base + (uint64_t)i * page_size;
+        cow->page[cow->count].entry = e;
+        cow->count++;
+        dst[i] = e & ~PTE_WRITE;
+        src_v[i] = e & ~PTE_WRITE;
+    }
+
+    /* With flags.  A bare frame number in a directory entry reads as *not present* --
+     * bit 0 is the present bit and a physical address never has it set -- so the twin would
+     * have a page directory pointing at a perfectly good leaf table that the CPU refuses to
+     * walk into, and every access through it would fault.
+     *
+     * This is not a subtlety: it is what the entry looked like on the first run, and the
+     * symptom was a forked child dying on the first instruction it tried to fetch, at the
+     * address of `test %rax,%rax` after its `fork` returned.  Nothing else in the address
+     * space was wrong, and nothing said so. */
+    *slot = pte_make(frame, PTE_PRESENT | PTE_WRITE | PTE_USER);
+    return true;
+}
+
+/* Build `dst` as a copy-on-write twin of `src`.
+ *
+ * Read-only pages are shared outright: nothing can ever write them, so nothing can ever
+ * notice.  A writable page has its leaf duplicated instead, and write permission taken
+ * away from *both* sides -- the parent's leaf is in a page table the two now share, so
+ * there is only one bit to clear, and clearing it in the twin clears it for the parent
+ * too.  That is the point: the first of the two to write takes a fault and gets a private
+ * copy, and the other one finds the fault waiting for it as well.
+ *
+ * The duplication is at the level of the *leaf* page table, not the leaf, and not the page
+ * directory.  A leaf has to be private, because the two processes must be able to point
+ * it at different frames.  A page directory and a page directory pointer table can be
+ * shared whenever every leaf under them is already read-only, and for a small program that
+ * is nearly all of them -- so the tables a `fork` duplicates are one per 4 MiB of address
+ * space that actually contains something writable, which for `hello` is one.
+ *
+ * Sharing a page table has a cost worth naming: a fault that *adds* a mapping would edit
+ * the twin's tables and so the parent's.  Nothing in this kernel does that from ring 3 --
+ * mmap arrives in phase 11 and will need this revisited -- and the alternative,
+ * duplicating every table, would make `fork` cost megabytes. */
+
+/* TEMP diagnostic. */
+int vmm_fork_aspace(page_table_t *dst, page_table_t *src, cow_list_t *cow) {
+    memset(cow, 0, sizeof(*cow));
+
+    uint64_t pml4_phys = alloc_zeroed_phys();
+
+    if (pml4_phys == 0)
+        return -1;
+
+    dst->pml4 = pml4_phys;
+    dst->pml4_v = (uint64_t *)phys_to_virt(pml4_phys);
+    dst->pdpt_v = NULL;
+
+    const uint64_t *k = vmm_kernel_tables()->pml4_v;
+
+    for (unsigned i = 256; i < PML4_ENTRY_COUNT; i++)
+        dst->pml4_v[i] = k[i];
+
+    for (unsigned i = 0; i < 256; i++) {
+        uint64_t top = src->pml4_v[i];
+
+        if (!pte_present(top))
+            continue;
+
+        /* The child's own PDPT: its PD entries may have to be rewritten below, so this
+         * one cannot be shared. */
+        uint64_t pdpt_phys = pmm_alloc_phys_page();
+
+        if (pdpt_phys == 0)
+            return -1;
+
+        uint64_t *pdpt = (uint64_t *)phys_to_virt(pdpt_phys);
+
+        memset(pdpt, 0, page_size);
+        memcpy(pdpt, (const uint64_t *)phys_to_virt(pte_phys(top)), page_size);
+
+
+        for (unsigned a = 0; a < PML4_ENTRY_COUNT; a++) {
+            uint64_t mid = pdpt[a];
+            uint64_t *src_mid;
+            uint64_t *mid_v;
+            bool any_writable = false;
+
+            if (!pte_present(mid) || pte_huge(mid))
+                continue;
+
+            src_mid = (uint64_t *)phys_to_virt(pte_phys(mid));
+
+            /* Is there anything writable anywhere under this directory?  If not, the whole
+             * directory can be shared with the parent untouched: nothing in it can ever
+             * change, so there is nothing for the two processes to disagree about. */
+            for (unsigned b = 0; b < PML4_ENTRY_COUNT && !any_writable; b++) {
+                uint64_t leaf = src_mid[b];
+                const uint64_t *pt;
+
+                if (!pte_present(leaf) || pte_huge(leaf))
+                    continue;
+
+                pt = (const uint64_t *)phys_to_virt(pte_phys(leaf));
+
+                for (unsigned c = 0; c < PML4_ENTRY_COUNT; c++) {
+                    uint64_t l = pt[c];
+
+                    if (pte_present(l) && !pte_huge(l) && pte_writable(l)) {
+                        any_writable = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!any_writable)
+                continue;               /* every leaf under it is read-only: share it */
+
+            /* It does hold something writable, so the entries below are about to be
+             * rewritten -- which means this directory cannot be shared either.
+             *
+             * Rewriting it in the parent's copy is the mistake this replaces: the PD entry
+             * is one word, and the two processes share the *page directory pointer table*
+             * only because nothing had needed to differ yet.  Point the parent's entry at
+             * the child's new leaf table and the parent loses its own writable one, adopts
+             * the child's read-only copy, has no copy-on-write list to consult, and faults
+             * on the first thing it writes -- with no way for the kernel to tell that fault
+             * from any other.  That is exactly how this was found. */
+            uint64_t pd_phys = pmm_alloc_phys_page();
+
+            if (pd_phys == 0)
+                return -1;
+
+            mid_v = (uint64_t *)phys_to_virt(pd_phys);
+            memcpy(mid_v, src_mid, page_size);
+            pdpt[a] = pte_make(pd_phys, PTE_PRESENT | PTE_WRITE | PTE_USER);
+
+            for (unsigned b = 0; b < PML4_ENTRY_COUNT; b++) {
+                uint64_t leaf = mid_v[b];
+                uint64_t *pt;
+                bool writable_here = false;
+
+                if (!pte_present(leaf) || pte_huge(leaf))
+                    continue;
+
+                pt = (uint64_t *)phys_to_virt(pte_phys(leaf));
+
+                for (unsigned c = 0; c < PML4_ENTRY_COUNT; c++) {
+                    uint64_t l = pt[c];
+
+                    if (pte_present(l) && !pte_huge(l) && pte_writable(l)) {
+                        writable_here = true;
+                        break;
+                    }
+                }
+
+                if (!writable_here)
+                    continue;           /* nothing writable under this one: share it */
+
+                uint64_t base = ((uint64_t)i << 39) | ((uint64_t)a << 30) |
+                                ((uint64_t)b << 21);
+
+                if (!cow_copy_pt(&mid_v[b], pt, base, cow))
+                    return -1;
+            }
+        }
+
+        dst->pml4_v[i] = pte_make(pdpt_phys, PTE_PRESENT | PTE_WRITE | PTE_USER);
+    }
+
+    if (vmm_map_identity_for_new_space(dst) != 0)
+        return -1;
+
+    return 0;
+}
+
+/* Resolve a write fault on a page this address space shares with its twin.
+ *
+ * Returns true if the fault was ours to handle, in which case the leaf now points at a
+ * private copy and the faulting instruction can simply be re-executed.  False means it was
+ * not a copy-on-write fault: the address is not in the list, or it is not one of the pages
+ * this address space gave up, and the caller should report it as what it is. */
+bool vmm_cow_fault(page_table_t *tables, cow_list_t *cow, uint64_t virt) {
+    if (tables == NULL || cow == NULL)
+        return false;
+
+    /* Align first.  CR2 is the exact byte the instruction touched -- a store four bytes
+     * into a page reports an address four bytes into the page -- while the list holds
+     * pages, and the loop below compares them.  Without this the search simply never
+     * matches and every copy-on-write fault is reported as an ordinary page fault, which
+     * is what a forked child writing its first byte sees. */
+    virt &= ~(uint64_t)(page_size - 1);
+
+    for (unsigned i = 0; i < cow->count; i++) {
+        if (cow->page[i].virt != virt)
+            continue;
+
+        uint64_t old_leaf = pt_get(tables, virt);
+        uint64_t new_phys = alloc_zeroed_phys();
+
+        if (new_phys == 0)
+            return false;
+
+        /* Copy through the direct map, not by mapping the frame into this address space:
+         * the frame is the parent's, it is writable in the kernel's tables, and mapping it
+         * in only to unmap it again would make the common case of a fault two operations
+         * that both need a page of tables. */
+        uint64_t old_phys = pte_phys(old_leaf);
+
+        if (old_phys != 0 && old_phys != new_phys) {
+            memcpy((void *)phys_to_virt(new_phys), (const void *)phys_to_virt(old_phys),
+                   page_size);
+        }
+
+        if (!pt_replace_user_leaf(tables, virt, new_phys, cow->page[i].entry))
+            return false;
+
+        return true;
+    }
+
+    return false;
+}

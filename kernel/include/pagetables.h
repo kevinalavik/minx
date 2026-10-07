@@ -107,6 +107,19 @@ bool pt_split_2mib(page_table_t *tables, uint64_t virt, uint64_t phys2mib,
                    uint64_t flags);
 
 /* Map a single 4 KiB page.  Returns false if an incompatible mapping exists. */
+/* Overwrite the leaf at `virt` outright, replacing whatever mapping is there.
+ *
+ * pt_map_page() deliberately refuses to replace a different frame, because a mapping
+ * silently changing under a running program is how a bug becomes permanent.  Copy-on-write
+ * is the one case where that is the whole point: the leaf *must* change from the parent's
+ * frame to a private copy, and refusing is what stops it happening.  So the intent is
+ * explicit in the name.
+ *
+ * Fails if `virt` is not present, or not user-accessible, or not a leaf rather than a
+ * huge page. */
+bool pt_replace_user_leaf(page_table_t *tables, uint64_t virt, uint64_t phys,
+                          uint64_t flags);
+
 bool pt_map_page(page_table_t *tables, uint64_t virt, uint64_t phys,
                  uint64_t flags);
 

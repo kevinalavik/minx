@@ -195,6 +195,18 @@ bool pt_map_page(page_table_t *tables, uint64_t virt, uint64_t phys,
     return map_page(tables, virt, phys, flags, user);
 }
 
+bool pt_replace_user_leaf(page_table_t *tables, uint64_t virt, uint64_t phys,
+                          uint64_t flags) {
+    pte_t *leaf = walk_to_leaf(tables, virt, true, true, false);
+
+    if (leaf == NULL || !pte_present(*leaf) || pte_huge(*leaf) || !pte_user(*leaf))
+        return false;
+
+    *leaf = pte_make(phys, flags | PTE_USER);
+    pt_invalidate(virt);
+    return true;
+}
+
 /* Map a range whose *intermediate* tables are user-accessible while its leaves are
  * not, so the walk to it succeeds and stops at the leaf.
  *

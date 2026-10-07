@@ -180,6 +180,52 @@ int  vmm_map_identity_for_new_space(page_table_t *tables);
 
 int  vmm_unmap_user(uint64_t virt, size_t bytes);
 
+/* --- copy on write ------------------------------------------------------- */
+
+/* A page this address space has given up write permission on, and the leaf entry that
+ * restores it.  The entry is kept rather than a flag, because the point of recording it
+ * is to put back exactly what was there: the loader maps data writable and text not, and
+ * a copy-on-write fault that made text writable again would be a security bug rather than a
+ * performance one. */
+typedef struct {
+    uint64_t virt;
+    uint64_t entry;
+} cow_page_t;
+
+/* Fixed capacity on purpose: this is allocated on the `fork` path, underneath which the
+ * page allocator is not reentrant, so a growing list would mean reallocating.  Past the
+ * limit `fork` fails rather than silently sharing a page it should have copied. */
+#define COW_MAX_PAGES 1024
+
+typedef struct {
+    cow_page_t page[COW_MAX_PAGES];
+    unsigned   count;
+    bool       full;
+} cow_list_t;
+
+/* Build `dst` as a copy-on-write twin of `src`.
+ *
+ * Read-only pages are shared outright -- nothing can write them, so nothing can notice.
+ * A writable page has its leaf page table duplicated and write permission taken away from
+ * both sides: the parent's leaf lives in a table the two now share, so there is only one
+ * bit to clear, and clearing it in the twin clears it for the parent too.  That is the
+ * point.  Whichever of the two writes first takes a fault and gets a private copy, and
+ * the other finds the fault waiting for it.
+ *
+ * Duplication is at the level of the leaf page table: a *leaf* must be private, because
+ * the two processes have to be able to point it at different frames, while a directory or
+ * a directory pointer table can be shared when every leaf under it is already read-only.
+ * For a small program that is one table per 4 MiB that holds anything writable. */
+int  vmm_fork_aspace(page_table_t *dst, page_table_t *src, cow_list_t *cow);
+
+/* Resolve a write fault on a page this address space shares with its twin.
+ *
+ * True if the fault was ours to handle, in which case the leaf now names a private copy and
+ * the faulting instruction can simply be re-executed.  False if it was not one of ours:
+ * the address is not in the list, or not a page this address space gave up, and the caller
+ * should report it for what it is rather than inventing a copy. */
+bool vmm_cow_fault(page_table_t *tables, cow_list_t *cow, uint64_t virt);
+
 /* Total pages mapped, for /proc/meminfo and the phase-11 accounting check. */
 typedef struct {
     uint64_t kernel_pages;
