@@ -1620,8 +1620,17 @@ static void test_user_program(void) {
     /* The task exits, and nothing wakes anybody when it does, so wait for the exit
      * itself rather than for a state change.  A program that hangs is a failure the
      * harness would otherwise report as "the guest never reached TEST-READY". */
+    /* Wait for *this* task's exit, not for any exit.
+     *
+     * That distinction did not exist before `fork`: there was one program, so "the last
+     * exit" and "the program's exit" were the same question.  Now `hello` forks, and its
+     * child exits with a status of its own on purpose, so the last exit recorded is
+     * whichever of the two finished last -- and the child's is a deliberate 7, which the
+     * test then read as the parent's own report that it had failed.
+     *
+     * `syscall_exit_pid()` is published together with the status for exactly this. */
     for (unsigned waited = 0; waited < 20000; waited++) {
-        if (syscall_last_exit() >= 0)
+        if (syscall_last_exit() >= 0 && syscall_exit_pid() == t->id)
             break;
         task_sleep_ms(1);
     }

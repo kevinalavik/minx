@@ -41,6 +41,18 @@ static void put_num(unsigned long v) {
     minx_write(1, &buf[i + 1], (unsigned long)(22 - i));
 }
 
+/* The byte the copy-on-write checks below argue over.
+ *
+ * `volatile` because the whole point is that the child's write must not be visible here,
+ * and the compiler is entitled to cache a non-volatile static in a register across a call
+ * it believes cannot have changed it.  Making it volatile means the read after `wait` is a
+ * real load of the real byte -- so a kernel that shared the page instead of copying it
+ * would be caught rather than hidden by the optimiser.
+ *
+ * Non-zero initialised, so a page that was never written still differs from a page of
+ * zeroes, and a byte that was never copied reads as something impossible. */
+static volatile unsigned char cow_byte = 0xa5;
+
 int minx_main(unsigned long argc, char **argv);
 
 int minx_main(unsigned long argc, char **argv) {
@@ -116,6 +128,73 @@ int minx_main(unsigned long argc, char **argv) {
     put("pid=");
     put_num((unsigned long)pid);
     put("\n");
+
+    /* --- fork and copy-on-write ------------------------------------------
+     *
+     * The property under test is that two processes can hold the same page and each get a
+     * private copy of it the first time one of them writes.  Sharing it outright is the
+     * bug; copying everything at `fork` is merely expensive.  Only one of those two
+     * mistakes is visible to a program, and it is the one that matters. */
+    cow_byte = 'P';
+    long child = minx_fork();
+
+    if (child < 0) {
+        put("fork: FAILED, the kernel refused\n");
+        return 1;
+    }
+
+    if (child == 0) {
+        /* The child: running this same code, one instruction after `fork`, with every
+         * register but the return value the same.  It inherits the byte, writes its own
+         * value -- a fault on a page it shares with its parent -- and exits with a status
+         * the parent reads back.
+         *
+         * The stack writes around this call matter as much as `cow_byte`: the child's
+         * frames are on the same user stack pages, so returning out of this frame is a
+         * second copy-on-write fault, on a page with nothing to do with the argument. */
+        if (cow_byte != 'P') {
+            put("fork: FAILED, the child did not inherit the page\n");
+            minx_exit(2);
+        }
+        cow_byte = 'C';
+        minx_exit(7);
+    }
+
+    put("fork: child ");
+    put_num((unsigned long)child);
+    put("\n");
+
+    if (child == minx_getpid()) {
+        put("fork: FAILED, the child's identifier is the parent's\n");
+        return 1;
+    }
+
+    /* The parent writes too, and may do so before or after the child's write.  Both fault
+     * on the same page; whichever went second had to take its own copy. */
+    cow_byte = 'Q';
+
+    int status = 0;
+    long reaped = minx_wait(&status);
+
+    if (reaped != child) {
+        put("fork: FAILED, wait returned the wrong child\n");
+        return 1;
+    }
+    if (status != 7) {
+        put("fork: FAILED, status ");
+        put_num((unsigned long)status);
+        put("\n");
+        return 1;
+    }
+
+    /* The check the whole thing exists for.  If the page had been shared, the child's
+     * write would be here. */
+    if (cow_byte != 'Q') {
+        put("cow: FAILED, the child's write reached the parent\n");
+        return 1;
+    }
+
+    put("cow: ok\n");
 
     put("hello: ok\n");
     return 0;

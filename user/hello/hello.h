@@ -5,6 +5,8 @@
  * intention of one yet -- phase 9 brings mlibc, which will have its own idea of all of
  * this and will need to agree with it.
  */
+#include <stdint.h>
+
 #ifndef MINX_USER_H
 #define MINX_USER_H
 
@@ -17,6 +19,8 @@
 #define SYS_BRK     5
 #define SYS_WRITEV  6
 #define SYS_GETPID  7
+#define SYS_FORK    8
+#define SYS_WAIT    9
 
 /* Errors, as the negative return values the kernel uses. */
 #define EBADF   9
@@ -99,6 +103,20 @@ static inline long minx_exit(int code) {
 
 static inline long minx_getpid(void) {
     return minx_syscall1(SYS_GETPID, 0);
+}
+
+/* Returns the child's identifier in the parent and zero in the child, which is the whole
+ * convention: the child continues at the instruction after this one with every register
+ * the same except the return value, so there is nothing to set up on either side. */
+static inline long minx_fork(void) {
+    return minx_syscall1(SYS_FORK, 0);
+}
+
+/* Blocks until one of this process's children has exited.  Returns its identifier, or
+ * -1 with nothing left to wait for.  `status` may be NULL; it is a pointer like any other,
+ * so the kernel checks it before writing to it. */
+static inline long minx_wait(int *status) {
+    return minx_syscall2(SYS_WAIT, (long)(uintptr_t)status, 0);
 }
 
 /* strlen, because a freestanding program has no libc and the loader's job is not to
