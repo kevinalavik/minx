@@ -131,9 +131,19 @@ static void pipe_ring_copy_in(pipe_t *p, uint64_t user, size_t n) {
      * a pipe is used. */
     size_t done = 0;
 
-    p->tail = pipe_cursor(p->tail);
-
     while (done < n) {
+        /* Normalised on *every* pass, not just the first.
+         *
+         * The room left before the end of the buffer is what says how much can be copied
+         * in one piece, and a cursor sitting at `capacity` reports none.  That happens
+         * part-way through a copy whose data wraps: the run reaches the end of the buffer,
+         * the cursor lands on `capacity`, and the next pass sees zero room.  With the
+         * normalisation only on entry the loop stops there, having copied part of what it
+         * was asked for -- and the caller, which has already decided how many bytes to move,
+         * books the whole number against the buffer's contents.  Bytes are lost, the count
+         * is wrong, and both show up much later as a checksum that does not add up. */
+        p->tail = pipe_cursor(p->tail);
+
         size_t room = p->capacity - p->tail;
         size_t chunk = n - done;
 
@@ -152,9 +162,10 @@ static void pipe_ring_copy_in(pipe_t *p, uint64_t user, size_t n) {
 static void pipe_ring_copy_out(pipe_t *p, uint64_t user, size_t n) {
     size_t done = 0;
 
-    p->head = pipe_cursor(p->head);
-
     while (done < n) {
+        /* Normalised every pass, for the reason pipe_ring_copy_in() gives. */
+        p->head = pipe_cursor(p->head);
+
         /* How far the copy may run before it reaches the end of the buffer.
          *
          * The bytes in a pipe are the run `[head, head + count)`, so the part of it before
