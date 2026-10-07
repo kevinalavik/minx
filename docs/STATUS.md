@@ -25,7 +25,7 @@ The measurement that matters is that `-smp 4` is now clean: three consecutive ru
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
 | 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | VERIFIED | Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). The intermittency was the publish-before-save race plus idle-task stealing, both fixed; the clean-run matrix is three consecutive `-smp 4` runs at 38/38 with `TEST-READY`, no panic and no stray bytes in the serial log. A good run reads `sched: cpu 0: 26562 ticks, 16830 switches, 0 steals`. **VERIFIED.** `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. |
 | 6 | Userspace entry | VERIFIED | Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel), `phase6-user` (the program is loaded, entered at ring 3, reads its own `argc` and `argv[0]`, writes to the console, is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a kernel pointer and ENOSYS for an unimplemented call, is preempted in ring 3 and resumed, and exits 0). **VERIFIED** by `make test` → `run-tests: PASS` and by three `-smp 4` runs at 38/38. |
-| 7 | Processes, signals, pipes | NOT STARTED | |
+| 7 | Processes, signals, pipes | IN PROGRESS | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes are committed and pass. **Not VERIFIED**: with `-smp 4` the guest hangs in roughly one run in three -- sometimes inside `hello`, sometimes in the phase-4 self-tests. See "Phase 7, where it got to" and "Known bugs / gaps". Signals are written but not committed. |
 | 8 | VFS + ramfs + initrd + devfs | NOT STARTED | |
 | 9 | TTY + libc + sh | NOT STARTED | |
 | 10 | Coreutils + procfs | NOT STARTED | |
@@ -375,58 +375,77 @@ kernel.
 
 ## Phase 7, where it got to
 
-`fork` with copy-on-write, `wait`, and the ELF loader's handling of two segments sharing a
-page are written and build warning-free. They are **not** committed: `hello` forking makes
-a page fault the kernel cannot account for, and the run never finishes. The patch is
-`build/phase7-wip.patch`.
+**Committed and passing** (`make test` -> 38/38, guest tally 38 passed 0 failed):
 
-Two of the three pieces are finished and verified, and the third is one fault away:
+- **`fork` with copy-on-write.** A forked child is not loaded and not started: it is a
+  copy of the frame `fork` arrived with, with `%rax` zero, over an address space built by
+  `vmm_fork_aspace()`. Read-only leaves are shared outright; leaves holding something
+  writable are duplicated along with the tables above them, so a small program pays for one
+  page table per 4 MiB that holds anything writable.
+- **`wait`**, and `task_unblock()`, which is the operation that means "wake something that
+  is blocked" -- `task_wakeup()` on a blocked task panics, because the task is linked into
+  the blocked list and a run queue refuses a task that is already on one.
+- **A per-process descriptor table** and **pipes**: 16 fixed slots per task, lowest free
+  number first, the console not the program's to close. A pipe is one ring, one lock (which
+  *is* its wait queue's lock) and one wait queue for both ends. End of file is zero bytes;
+  a full write end with no readers is `EPIPE`.
+- **The ELF loader** maps whole pages and shares a page two segments both touch, taking the
+  union of their permissions.
 
-**Fixed, and worth keeping whatever happens to the rest.** `load_segment()` allocated a
-fresh frame for every page of every segment, and `pt_map_page()` deliberately refuses to
-replace a different frame — so the second segment to reach a page the first had mapped
-failed to load, with `elf: could not map 0x4022ae` as the entire report. A loader that
-cannot map a page another segment already mapped is not a loader. It had been latent
-because `hello`'s text fitted in one page until the fork section pushed it to three, at
-which point text and `rodata` shared two pages. The loader now maps whole pages, fills in
-a page that is already there, and takes the *union* of what the two segments ask for — a
-page one segment calls read-only and another calls writable has to end up writable, or the
-second segment faults on its own data.
+**Three kernel bugs the pipe work exposed**, all of which are in commit messages:
 
-**Written, and correct by inspection but never observed working.** `vmm_fork_aspace()`
-shares every read-only leaf outright and duplicates the tables that hold writable ones;
-`vmm_cow_fault()` resolves a write fault by copying the page and restoring the recorded
-leaf entry — the *entry*, not a "writable" flag, because the loader maps data writable and
-text not and a copy-on-write fault that made text writable would be a security bug. The
-scheduler's ring-3 save already carries everything a forked child needs to resume, which is
-what makes `fork` a copy of one frame with `%rax` changed rather than a second loader.
+- `cow_copy_pt()` stored a bare frame number in a directory entry. Bit 0 of a physical
+  address is the *present* bit, so the entry read as not-present and the child died fetching
+  its first instruction, at the `test %rax,%rax` after its `fork` returned.
+- `wait_queue_wake()` and `wait_queue_wake_all()` scanned `[head, head + count)`. `head` is
+  set to zero by `wait_queue_init()` and **nothing ever advances it**, because a slot is
+  retired by whichever task gets woken reclaiming it, and that can be any of them. So the
+  live waiters are scattered anywhere in the array, and one wake that found nobody while
+  somebody was demonstrably waiting produced a reader and a writer both blocked for ever.
+  Both now scan the array.
+- **A ring-3 task could not stop inside a syscall.** Such a task is saved whole and resumed
+  through `iretq`; for a task blocked in a syscall that frame's RIP is the instruction after
+  `int $0x80`, so resuming it delivered the *call number* in `%rax` as the syscall's answer
+  and left the kernel's half of the buffer unfilled. `task_wait()` and `task_sleep_ms()` now
+  clear the per-processor ring-3 marker before switching away, so a task stopping in the
+  kernel comes back in the kernel with its C frames intact. The marker is also cleared on
+  the way *in* -- a blocked task can come back on a processor that never saw it block --
+  and clearing it on the way *out* instead wipes it for every ring-3 task, which stops the
+  self tests dead just after `phase6-elf`.
 
-**The fault that is left.** Two design mistakes were found and fixed on the way, both of
-them invisible rather than crashing, and both worth recording because they are the kind
-that produce a panic a long way from the mistake:
+**Not fixed: the guest still hangs at `-smp 4` about one run in three.** Two distinct
+hangs, both with no panic and no fault reported:
 
-- The child's new leaf table pointer was written into the **parent's** page directory,
-  because the two share a directory pointer table and nothing had needed to differ yet.
-  The parent then adopted the child's read-only copy, lost its own writable table, and had
-  no copy-on-write list to consult — so its first write faulted with nothing to resolve it.
-  The page *directory* has to be duplicated too, whenever anything under it is writable.
-- Write permission was taken away from the twin only, not from both sides. The two leaf
-  tables are separate frames naming the same physical pages, so clearing the bit only in
-  the child's copy leaves the parent writing straight through to the shared frame and the
-  child's copy never being made. A scheme that protects only the child is not a scheme.
-  This one needs the *parent* to have a list as well — and, if the parent is itself a
-  forked child, to have the new entries **added** to the list it already has, because a
-  task's list is every page it has given up and a fork gives up more.
+| symptom | how often | where |
+|---|---|---|
+| 37 of 38 checks, then `FAIL phase6-user: the program exited 7` | ~2 in 3 | `hello` never returns from the pipe section; the status quoted is the *first* fork child's deliberate 7, reported because the test timed out waiting for its own task |
+| stops after `PASS phase4-percpu` | ~1 in 8 | before `phase4-atomics`, so nothing in the new code has run yet |
 
-After both fixes a page fault still arrives that no list accounts for. The next thing to
-do is to read `CR2` for it rather than to guess again — the serial log truncates at the
-panic, so it needs `-d int` and the fault address, and the useful narrowing is to print
-which virtual address the fault is at against the contents of the running task's list.
+The second one is the more alarming of the two, and it is not yet explained. The pipe
+protocol itself checks out on paper -- a waiter enqueues while holding the lock that guards
+the condition, so a waker cannot miss it -- so the suspects are `unblock()`/`enqueue()` or
+the switch path. **This is the first thing the next session should look at**, and until it
+is found phase 7 cannot be called verified.
 
-`sys_wait` and the child-exit path are written and unused by anything yet: `sys_exit`
-records the status, publishes it before the flag that says it is there, and wakes the
-parent, which is the first thing in this kernel where one task's progress depends on
-another task finishing.
+**Written, not committed: signals.** `kernel/include/signal.h`, `kernel/lib/signal.c` and
+the `kill`/`sigaction`/`sigmask`/`sigreturn` calls are complete -- a delivered signal is a
+frame built on the task's own stack with the interrupted context in it, the copy-on-write
+break taken first so a signal to a child does not write through to its parent's stack, and
+delivery from the one place every return to ring 3 goes through. The patch is
+`build/phase7-signals.patch`. It is held back because adding its test to `hello` makes
+`hello`'s text span two pages instead of one, and from that point the program dies on its
+first instruction with `#GP` out of `iretq` (error code `0x1a`, `SS` base
+`0x7fffffffef00`). That is a real bug and it is not the frame order -- swapping `SS` and
+`RSP` in `task_create_user()` and the loader *also* breaks the one-page program that works.
+Everything measured points at the load being correct: `vmm_translate_in()` resolves the
+entry, the per-page copy arithmetic in `load_segment()` is right for every page, and the
+ring-3 return frame is fully initialised. Next step is to instrument `__enter_user` to print
+the five words it is about to pop, for both programs, and compare.
+
+**`exec` is deliberately not started.** It needs to resolve a *path*, and there is no
+filesystem until phase 8; the only thing that exists today is the embedded program image the
+loader is handed. Doing it against the initrd directly is phase 8's job and doing it against
+an in-memory name table would be a fiction that phase 8 then has to undo.
 
 ## The two remaining failures, exactly
 
@@ -748,6 +767,17 @@ property the scheduler provides on its own, with no lock involved. The per-proce
 attribution was the part that said something about the lock.
 
 ## Known bugs / gaps
+- **The guest hangs at `-smp 4` about one run in three, with no panic and no fault.** Two
+  distinct hangs: `hello` never returns from the pipe section (the suite reports 37 of 38
+  and the status it quotes is the first fork child's deliberate 7, which it reads because
+  the test timed out waiting for its own task), and, about one run in eight, the run stops
+  dead just after `PASS phase4-percpu`, before anything new has run. `make test` itself
+  passes, so this is not a gate failure -- it is a reliability failure, and phase 7 is not
+  called verified until it is gone. Full detail, and what has been ruled out, in "Phase 7,
+  where it got to" above.
+- A signal delivered to a program whose text spans two pages currently kills it on its
+  first instruction with `#GP` out of `iretq`. Not the frame order: swapping `SS` and `RSP`
+  breaks the one-page program too. See "Phase 7, where it got to".
 - **The phase-5/6 blocker is FIXED and verified** -- `make test` runs the whole suite to
   the end, 38 of 38 PASS, no panic at 1 or 4 processors. Root cause, established by
   reading the code rather than by inference: `schedule()` published the outgoing task to a run queue *before*

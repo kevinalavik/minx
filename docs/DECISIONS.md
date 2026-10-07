@@ -956,3 +956,73 @@ are recorded by `isr_dispatch()` and both consumed by `schedule()`. The marker i
 the syscall path too, because that path never reaches the scheduler — the door holds IF
 clear for its whole length, so a tick cannot arrive inside it and there is nothing to
 preempt, which would otherwise leave the marker set for the *next* save to misread.
+
+## A blocking syscall resumes in the kernel, not in ring 3
+
+**Date: 2026-10-07**
+
+A ring-3 task is saved whole -- the interrupt frame the CPU pushed -- and resumed through
+`iretq`, which is the only way back to ring 3 with the right CS, SS and %rsp. That is right
+for a task that was interrupted and is waiting its turn. It is wrong for a task blocked in
+the middle of a syscall: that frame's RIP is the instruction after `int $0x80`, so resuming
+it delivers the syscall's return value straight into user code, and the value is whatever is
+in `%rax` when the task stopped -- the call *number*, because nothing has computed a result
+yet.
+
+So a task that is stopping in the kernel clears the per-processor ring-3 marker before
+switching away and is saved the ordinary way, with its C frames intact on its own kernel
+stack. Woken, it unwinds back through the syscall, computes the answer, writes it into the
+interrupt frame, and that frame's own `iretq` returns to ring 3 properly.
+
+The marker is cleared on the way *in* as well as on the way out, because a blocked task can
+come back on a processor that never saw it block, and that processor's marker is whatever
+its last ring-3 interrupt left there. Clearing it on the way *out* instead -- which is where
+it is *read* for the outgoing save -- wipes it for every ring-3 task, and the self tests
+stop dead just after `phase6-elf` with the machine idle and no panic. Both orders are
+commented where they are, because the difference between them is invisible until it is
+fatal.
+
+The alternative was a restartable syscall: on resume, re-execute `int $0x80` and let the
+handler run again. That is what Linux does, and it is the better shape for a syscall that is
+not idempotent. It is also a bigger change than this phase needs, and every call here is
+either idempotent or safe to re-run.
+
+## A wait queue's `head` is not a cursor
+
+**Date: 2026-10-07**
+
+`wait_queue_t` has a `head` and a `tail`, and `tail` advances as slots are handed out. `head`
+is set to zero by `wait_queue_init()` and **nothing ever advances it**, because a slot is not
+retired in the order it was queued -- it is retired by whichever task gets woken reclaiming
+it, and that can be any of them. The live waiters are therefore scattered anywhere in the
+array, and the gap a retired slot leaves is counted as though it were still occupied.
+
+Scanning `[head, head + count)` reads the wrong slots as soon as one waiter in the middle
+goes away. The visible result was a wake that found nobody while somebody was demonstrably
+waiting: a pipe whose reader had given up its slot, and whose writer was blocked on a full
+pipe, both sat there for ever -- nothing faulted, nothing panicked, and it looked like a
+scheduler that had stopped making progress.
+
+Both wake functions now scan the whole array. Sixty-four words, on a path taken once per
+state change rather than once per byte, so correctness is free here, and a cursor that would
+have to be maintained correctly under concurrent retirement is not.
+
+## A pipe's lock is its wait queue's lock
+
+**Date: 2026-10-07**
+
+`wait_queue_sleep()` enqueues and blocks as one step, so a caller that decides to wait based
+on state held under a *different* lock has a window in which a waker changes that state
+before the slot exists -- and the caller then sleeps for ever on a condition that is already
+satisfied. `wait_queue_enqueue_locked()` and `wait_queue_block_locked()` split the two so the
+caller holds the lock that guards the condition for the whole of it.
+
+A pipe's buffer is guarded by its wait queue's own lock, which is why that is what it uses,
+and why there is one queue for both ends with every state change waking all of them: each
+waiter re-checks its own condition after waking, so a spurious wake costs a loop iteration
+and only a missed one is a bug -- and waking everybody cannot miss anybody.
+
+A pipe is freed with its last end, and read ends and write ends are counted separately. A
+`fork` counts too: the child holds a descriptor for the same pipe, so closing its inherited
+copy of the read end -- which every program does, or it could never see end of file -- must
+not make the parent's next write fail with `EPIPE` against a reader that is right there.
