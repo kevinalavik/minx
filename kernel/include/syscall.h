@@ -40,6 +40,7 @@ enum {
     SYS_GETPID = 7,
     SYS_FORK   = 8,
     SYS_WAIT   = 9,
+    SYS_PIPE   = 10,
 
     SYS_MAX = 32,
 };
@@ -58,6 +59,7 @@ enum {
 #define EACCES 13
 #define EFAULT 14
 #define EBUSY  16
+#define EPIPE  32
 #define EEXIST 17
 #define ENODEV 19
 #define ENOSYS 38
@@ -135,6 +137,7 @@ bool syscall_copy_to_user(uint64_t dst, const void *src, size_t bytes);
  * other descriptor is EBADF rather than a silent success, because a program that
  * believes it wrote somewhere is worse off than one that knows it did not. */
 long sys_fd_write(int fd, const void *buf, size_t bytes);
+long sys_fd_read(int fd, void *buf, size_t bytes);
 
 /* As above, for a scatter/gather list, used by writev. */
 long sys_write_to_fd(int fd, uint64_t base, uint64_t len);

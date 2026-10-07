@@ -30,6 +30,7 @@
 #include "syscall.h"
 
 #include "console.h"
+#include "fd.h"
 #include "elf.h"
 #include "kmalloc.h"
 #include "kprintf.h"
@@ -55,6 +56,7 @@ const char *syscall_name(unsigned nr) {
         [SYS_EXIT]   = "exit",
         [SYS_BRK]    = "brk",
         [SYS_WRITEV] = "writev",
+    [SYS_PIPE]   = "pipe",
         [SYS_GETPID] = "getpid",
     };
 
@@ -179,9 +181,16 @@ bool syscall_copy_to_user(uint64_t dst, const void *src, size_t bytes) {
 /* --- descriptors --------------------------------------------------------- */
 
 long sys_fd_write(int fd, const void *buf, size_t bytes) {
-    switch (fd) {
-    case 1:                       /* stdout */
-    case 2:                       /* stderr */
+    fd_entry_t *e = fd_get(fd);
+
+    if (e == NULL)
+        /* Not a descriptor this task has open.  EBADF rather than a silent success: a
+         * program that believes it wrote somewhere is worse off than one that knows it
+         * did not. */
+        errno_return(EBADF);
+
+    switch (e->kind) {
+    case FD_CONSOLE:
         /* The framebuffer and the serial mirror, so a program's output is in a
          * screenshot and in a log.  Going through console_write() rather than putting
          * characters out one at a time keeps the two in step, which matters because the
@@ -189,13 +198,46 @@ long sys_fd_write(int fd, const void *buf, size_t bytes) {
         console_write((const char *)buf, bytes);
         return (long)bytes;
 
-    case 0:                       /* stdin */
-        errno_return(EBADF);
+    case FD_PIPE:
+        /* Writing a read end is a mistake in the program, not a condition to wait out.
+         * Blocking here would wait for data that only this end is not allowed to consume
+         * and that nobody else will write, so the program would hang instead of being
+         * told. */
+        if (e->pipe_end != PIPE_WRITE)
+            errno_return(EBADF);
+
+        return pipe_write((pipe_t *)e->obj, (uint64_t)(uintptr_t)buf, bytes);
 
     default:
-        /* Anything else is not a descriptor this kernel has.  EBADF rather than a
-         * silent success: a program that believes it wrote somewhere is worse off than
-         * one that knows it did not. */
+        errno_return(EBADF);
+    }
+}
+
+long sys_fd_read(int fd, void *buf, size_t bytes) {
+    fd_entry_t *e = fd_get(fd);
+
+    if (e == NULL)
+        errno_return(EBADF);
+
+    switch (e->kind) {
+    case FD_PIPE:
+        /* A pipe with something buffered returns what is there without waiting for the
+         * full count: the writer has no way to know how much the reader wants, so a read
+         * that insisted on all of it could deadlock against its own buffer. */
+        if (e->pipe_end != PIPE_READ)
+            errno_return(EBADF);
+
+        return pipe_read((pipe_t *)e->obj, (uint64_t)(uintptr_t)buf, bytes);
+
+    case FD_CONSOLE:
+        /* Reading the console needs the keyboard's input buffer to be a thing a task can
+         * wait on, which is the shell's stdin and not this call's job to fake.  ENOSYS
+         * says the door exists and the room behind it is not built.  What it must not do
+         * is block here with interrupts disabled, which would stop the machine rather than
+         * the program. */
+        errno_return(ENOSYS);
+
+    default:
         errno_return(EBADF);
     }
 }
@@ -239,16 +281,20 @@ long sys_read(regs_t *regs) {
     uint64_t buf = arg(regs, 1);
     size_t count = (size_t)arg(regs, 2);
 
-    (void)buf;
-    (void)count;
+    if (count == 0)
+        return 0;
 
-    /* There is nothing to read from yet: no pipe, no file, no keyboard on a
-     * descriptor.  A read that waits for data has to put the task on a wait queue and
-     * be woken later, which is phase 7.  ENOSYS says the door exists and the room
-     * behind it does not.  What it must not do is block here with interrupts disabled,
-     * which would stop the machine rather than the program. */
-    (void)fd;
-    errno_return(ENOSYS);
+    /* The whole range is checked before anything is copied, for the same reason `write`
+     * checks it: one unmapped byte in the middle must not produce a partial read whose
+     * length depends on where the hole was. */
+    if (!syscall_user_range_ok(buf, count, true))
+        errno_return(EFAULT);
+
+    return sys_fd_read(fd, (void *)(uintptr_t)buf, count);
+}
+
+long sys_pipe(regs_t *regs) {
+    return pipe_create(arg(regs, 0));
 }
 
 long sys_open(regs_t *regs) {
@@ -257,8 +303,16 @@ long sys_open(regs_t *regs) {
 }
 
 long sys_close(regs_t *regs) {
-    (void)regs;
-    errno_return(ENOSYS);
+    int fd = (int)(int64_t)arg(regs, 0);
+
+    /* EBADF for a number that is not open, and for one of 0, 1 and 2: the program did
+     * not have it to begin with, and the console belongs to the process table.  Linux
+     * returns success for the second case and that is a question of taste, not one this
+     * kernel gets to be quietly different about on the way to a shell that will use it. */
+    if (!fd_close(fd))
+        errno_return(EBADF);
+
+    return 0;
 }
 
 long sys_writev(regs_t *regs) {
@@ -596,6 +650,7 @@ int syscall_init(void) {
     handlers[SYS_OPEN] = sys_open;
     handlers[SYS_CLOSE] = sys_close;
     handlers[SYS_WRITEV] = sys_writev;
+    handlers[SYS_PIPE] = sys_pipe;
     handlers[SYS_EXIT] = sys_exit;
     handlers[SYS_BRK] = sys_brk;
     handlers[SYS_GETPID] = sys_getpid;
