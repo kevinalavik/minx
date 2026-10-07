@@ -361,6 +361,12 @@ static void unblock(task_t *t) {
     enqueue(percpu_self_index(), t);
 }
 
+/* The exported half of unblock(): see the header for why waking a blocked task is not
+ * the same operation as queueing a runnable one. */
+void task_unblock(task_t *t) {
+    unblock(t);
+}
+
 /* ------------------------------------------------------------- creation --- */
 
 static task_t *task_alloc(void) {
@@ -1693,4 +1699,158 @@ void sched_task_enter(unsigned index) {
 
     for (;;)
         hlt();
+}
+/* --- fork --------------------------------------------------------------- */
+
+/* The size of a `regs_t` in quadwords, and where `%rax` sits inside it.
+ *
+ * Both belong next to the code that copies a frame rather than in cpu.h, because they are
+ * only meaningful to a caller that is copying one -- which is this, and the ISR tail. */
+#define REGS_WORDS       22
+#define REGS_RAX_INDEX   14        /* r15, r14, ... rbx, rax: fifteen, so rax is the 15th */
+
+task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight) {
+    task_t *t = NULL;
+    uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+
+    t = (task_t *)kmalloc(sizeof(task_t));
+    spin_unlock_irqrestore(&all_tasks.lock, flags);
+
+    if (t == NULL)
+        return NULL;
+
+    /* Zeroed, which is what every list and pointer in task_t wants to start as. */
+    memset(t, 0, sizeof(*t));
+
+    /* Registered rather than given an identifier here: `task_register()` is what puts a
+     * task on the all-tasks list and assigns the id, and a task that has an id but is not
+     * on that list is invisible to everything that walks it -- `ps`, and the test that
+     * checks the list's own invariants. */
+    task_register(t);
+
+    strncpy(t->name, name, sizeof(t->name) - 1);
+    t->is_user = true;
+    t->weight = weight;
+    t->state = TASK_NEW;
+
+    uint8_t *stack = (uint8_t *)kmalloc(TASK_STACK_SIZE);
+
+    if (stack == NULL)
+        return NULL;
+
+    /* Aligned so the frame lands where `iretq` wants it: sixteen-byte aligned, with the
+     * guard at the very bottom so the first byte written past the stack reports it. */
+    uint64_t *frame = (uint64_t *)(((uint64_t)stack + TASK_STACK_SIZE) & ~15ull) - REGS_WORDS;
+
+    memcpy(frame, regs, REGS_WORDS * sizeof(uint64_t));
+
+    /* The child sees zero from `fork`, and the parent sees the child's identifier.  The
+     * return value is the only register that differs between them, which is why this is a
+     * copy of the parent's frame and not something assembled afresh. */
+    frame[REGS_RAX_INDEX] = 0;
+
+    *(volatile uint64_t *)stack = TASK_STACK_GUARD;
+    t->stack_guard = (volatile uint64_t *)stack;
+    t->stack_low = (uint64_t)stack;
+    t->stack = stack;
+    t->stack_top = (uint64_t)stack + TASK_STACK_SIZE;
+
+    /* The scheduler's ring-3 restore path: this block *is* the interrupt frame, so
+     * `saved_rsp` names it and `saved_in_user` says so.  Nothing to build at the top of a
+     * user stack here, because there is no entry stack -- the child already has one, and
+     * it is the parent's, untouched. */
+    t->saved_rsp = (uint64_t)frame;
+    t->saved_in_user = 1;
+
+    return t;
+}
+
+int task_attach_cow_twin(task_t *child) {
+    task_t *parent = sched_current();
+
+    if (child == NULL || parent == NULL || parent->tables == NULL)
+        return -1;
+
+    cow_list_t *cow = (cow_list_t *)kmalloc(sizeof(cow_list_t));
+
+    if (cow == NULL)
+        return -1;
+
+    page_table_t *tables = (page_table_t *)kmalloc(sizeof(*tables));
+
+    if (tables == NULL || vmm_fork_aspace(tables, parent->tables, cow) != 0) {
+        if (cow->full) {
+            kprintf("[warn] task: fork would need more than %d copy-on-write pages; "
+                    "refusing rather than sharing a page it should have copied\\n",
+                    COW_MAX_PAGES);
+        }
+        return -1;
+    }
+
+    child->tables = tables;
+    child->cow = cow;
+    child->parent = parent;
+
+    /* The parent needs a list as well, and this is the half that is easy to miss.
+     *
+     * `vmm_fork_aspace()` takes write permission away from *both* sides -- that is what
+     * makes the pair copy-on-write rather than a child protected and a parent writing
+     * straight through to the shared frame.  So the parent now faults on the first write to
+     * anything it had writable, exactly as the child does, and with no list to consult the
+     * kernel has nothing to resolve it with and reports a page fault that is really just
+     * `fork` having happened.
+     *
+     * The entries are the same original leaf values on both sides and `vmm_cow_fault()`
+     * only reads the list, so the parent can be given a copy.  It cannot be given *the*
+     * list: the two tasks are freed independently.
+     *
+     * And if the parent is itself a forked child it already has a list, for the pages it
+     * gave up to *its* parent.  Those entries are still needed, so this adds to it rather
+     * than replacing it -- which is the general rule: a task's list is every page it has
+     * given up, and a fork gives up more. */
+    if (parent->cow == NULL) {
+        cow_list_t *own = (cow_list_t *)kmalloc(sizeof(cow_list_t));
+
+        if (own == NULL)
+            return -1;
+
+        memcpy(own, cow, sizeof(*own));
+        parent->cow = own;
+    } else if (parent->cow->count + cow->count <= COW_MAX_PAGES) {
+        memcpy(&parent->cow->page[parent->cow->count], &cow->page[0],
+               cow->count * sizeof(cow_page_t));
+        parent->cow->count += cow->count;
+    } else {
+        kprintf("[warn] task: the parent already owes copy-on-write copies of %u "
+                "pages and cannot owe %u more; refusing the fork rather than "
+                "sharing pages it should have copied\n",
+                parent->cow->count, cow->count);
+        return -1;
+    }
+
+    /* Onto the parent's child list.  `sibling` is this child's link and `child` the
+     * parent's head, so a fork from a task that already has children is a prepend and
+     * costs nothing -- and `wait` scans the list, so the order children were made in is
+     * not the order they exit in, which is exactly what a parent asking "wait for any"
+     * expects. */
+    child->sibling = parent->child;
+    parent->child = child;
+
+    return 0;
+}
+
+void task_exit_with(int status) {
+    task_t *t = sched_current();
+
+    if (t != NULL) {
+        t->exit_code = status;
+
+        /* Publish the status before the flag that says it is there.  A parent on another
+         * processor reads `exited` and then `exit_code`, and the other order lets it see
+         * "finished" with the status the task has not written yet -- which is a value from
+         * whatever ran on that task's slot last. */
+        __atomic_store_n(&t->exited, 1, __ATOMIC_RELEASE);
+    }
+
+    task_exit();
 }

@@ -297,13 +297,25 @@ long sys_writev(regs_t *regs) {
 }
 
 long sys_exit(regs_t *regs) {
-    int code = (int)(int64_t)arg(regs, 0);
+    int code = (int)(int32_t)arg(regs, 0);
+    task_t *t = sched_current();
 
     syscall_note_exit(code);
 
+    /* Records the status and publishes it *before* the flag that says it is there, then
+     * wakes the parent -- which is what makes `wait` return at all.
+     *
+     * A parent blocked in `wait` is off the run queue with nothing to run it; nothing
+     * would ever bring it back, and the process tree would stop at the first child.  The
+     * wake has to happen while this task is still alive and still on a run queue, because
+     * `task_wakeup()` publishes to *another* processor's queue and that processor may
+     * reach the parent immediately. */
+    if (t != NULL && t->parent != NULL)
+        task_unblock(t->parent);
+
     /* Does not return, and nothing may touch this frame afterwards: the task's stack is
      * about to be abandoned, and the handler it was called from is running on it. */
-    task_exit();
+    task_exit_with(code);
 
     for (;;)
         hlt();
@@ -483,6 +495,98 @@ task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
     return t;
 }
 
+/* --- fork and wait ------------------------------------------------------- */
+
+/* `fork`: a new task, continuing this one where this one is, over an address space that
+ * shares every read-only page and copies every writable one on first use.
+ *
+ * The child is not loaded and not started: it is a copy of the frame this call arrived
+ * with, with `%rax` changed to zero, and an address space built by `vmm_fork_aspace()`.
+ * That is why a forked child needs no entry stack and no ELF loader -- it is already
+ * running, partway through an instruction stream its parent is in the middle of. */
+long sys_fork(regs_t *regs) {
+    task_t *parent = sched_current();
+
+    if (parent == NULL || parent->tables == NULL) {
+        /* A kernel task has no user address space to twin, and a fork that silently
+         * produced something else would be worse than one that refuses. */
+        errno_return(EPERM);
+    }
+
+    /* Refuse once there is nothing left to give: a forked task's kernel stack and its
+     * task_t are 16 KiB plus change, and a program in a loop would otherwise take the heap
+     * to zero and fault somewhere unrelated. */
+    if (task_count() >= TASK_LIMIT) {
+        errno_return(EAGAIN);
+    }
+
+    task_t *child = task_create_forked("fork", regs, parent->weight);
+
+    if (child == NULL) {
+        errno_return(ENOMEM);
+    }
+
+    if (task_attach_cow_twin(child) != 0) {
+        errno_return(ENOMEM);
+    }
+
+    if (task_wakeup(child) != 0) {
+        errno_return(ENOMEM);
+    }
+
+    return (long)child->id;
+}
+
+/* `wait`: block until one of this task's children has exited, and report which.
+ *
+ * Returns the child's identifier and stores its status, or -1 with ENOENT if there are no
+ * children left at all.  ENOENT rather than ECHILD: there is one error number in this
+ * kernel's ABI so far and inventing a second one to say "no children" when it means the
+ * same thing as "nothing to wait for" is a distinction without a difference yet.
+ *
+ * Blocking is the whole reason `wait` is interesting: a parent that has to *wait* is a
+ * task that must leave the run queue and be woken by its child's exit, which is the first
+ * thing in this kernel where a task's progress depends on another task finishing. */
+long sys_wait(regs_t *regs) {
+    uint64_t status_ptr = arg(regs, 0);
+    task_t *parent = sched_current();
+
+    if (parent == NULL || parent->child == NULL) {
+        errno_return(ENOENT);
+    }
+
+    for (;;) {
+        for (task_t *c = parent->child; c != NULL; c = c->sibling) {
+            if (__atomic_load_n(&c->exited, __ATOMIC_ACQUIRE)) {
+                /* Unlink before reporting, so a second `wait` cannot collect the same
+                 * child again -- and so the list does not grow a chain of already-reported
+                 * children for a process that never reaps. */
+                for (task_t **p = &parent->child; *p != NULL; p = &(*p)->sibling) {
+                    if (*p == c) {
+                        *p = c->sibling;
+                        c->sibling = NULL;
+                        break;
+                    }
+                }
+
+                /* The status goes back through the ordinary pointer check, like every
+                 * other pointer a program hands over.  A `wait` whose status pointer is
+                 * unmapped is an error about the pointer, not about the child. */
+                if (status_ptr != 0) {
+                    int32_t status = (int32_t)c->exit_code;
+
+                    if (!syscall_copy_to_user(status_ptr, &status, sizeof(status)))
+                        errno_return(EFAULT);
+                }
+
+                return (long)c->id;
+            }
+        }
+
+        task_wait();
+    }
+}
+
 int syscall_init(void) {
     for (unsigned i = 0; i < SYS_MAX; i++)
         handlers[i] = NULL;
@@ -495,6 +599,8 @@ int syscall_init(void) {
     handlers[SYS_EXIT] = sys_exit;
     handlers[SYS_BRK] = sys_brk;
     handlers[SYS_GETPID] = sys_getpid;
+    handlers[SYS_FORK] = sys_fork;
+    handlers[SYS_WAIT] = sys_wait;
 
     /* DPL 3: the gate has to be reachable from ring 3, which is the entire point.  A
      * kernel gate is DPL 0, and a user `int $0x80` against one raises #GP -- which is

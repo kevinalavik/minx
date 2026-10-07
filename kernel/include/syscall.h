@@ -38,6 +38,8 @@ enum {
     SYS_BRK   = 5,
     SYS_WRITEV = 6,
     SYS_GETPID = 7,
+    SYS_FORK   = 8,
+    SYS_WAIT   = 9,
 
     SYS_MAX = 32,
 };

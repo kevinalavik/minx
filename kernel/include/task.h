@@ -28,6 +28,8 @@
 #include "pagetables.h"
 #include "percpu.h"
 #include "spinlock.h"
+#include "cpu.h"
+#include "vmm.h"
 
 /* Task states.  A task is on exactly one list -- a run queue, a sleep list, a
  * wait queue, or nowhere -- and its state is what says which. */
@@ -71,6 +73,29 @@ typedef struct task {
     /* Set for a task that entered ring 3, so the exception and page-fault paths can
      * tell a user address from a kernel one without trusting the faulting `cs`. */
     bool         is_user;
+
+    /* The parent, for `wait`, and the children waiting on it.
+     *
+     * NULL for the boot task and for a kernel task, which have no parent to wait on.
+     * `wait` walks `children` and takes the first that has exited, which is why it is a
+     * list rather than a single pointer: several children can be outstanding and the
+     * order they exit in is not the order they were made in. */
+    struct task *parent;
+    struct task *sibling;          /* the next child of the same parent */
+    struct task *child;            /* the first child of this task */
+
+    /* Set once the task has called `exit`, with the status it passed, so that "has it
+     * finished" and "how did it finish" are one question with one answer rather than two
+     * that can disagree.  A parent blocked in `wait` reads both; the self tests read
+     * `exit_code` on its own. */
+    volatile int32_t exited;
+
+    /* The pages this address space gave up write permission on for its twin, or NULL.
+     *
+     * Owned by the task and freed with it.  A page fault consults it through the running
+     * task, because a fault happens on whatever task is running and the tables it is
+     * faulting on are that task's. */
+    cow_list_t  *cow;
 
     /* The program's own idea of how it went, from its `exit`, and the top of its heap
      * from `brk`.  Read by the self tests, and by /proc later; a task's exit status is
@@ -170,6 +195,15 @@ typedef struct task {
 /* The word written at the bottom of every task stack. */
 #define TASK_STACK_GUARD 0x5dead5deadbeef11ull
 
+/* How many tasks this kernel will have at once.
+ *
+ * There is no table to overflow -- tasks are heap-allocated -- so this is a limit on
+ * memory rather than on indices, and it exists because `fork` in a loop would otherwise
+ * take the heap to zero and fault somewhere with nothing to connect it to the loop.  The
+ * cost is a forked task's kernel stack, so the number is generous: 16 KiB each, and phase
+ * 11's stress test forks in the dozens, not the hundreds. */
+#define TASK_LIMIT 512
+
 /* Report a stack overflow loudly rather than letting it corrupt something else.
  * Called from the tick, so it costs two loads and a compare. */
 void sched_check_stack(void);
@@ -217,9 +251,41 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
 int  task_wakeup(task_t *t);
 int  task_wakeup_on(unsigned index, task_t *t);
 
+/* Wake a task that is *blocked* -- one in task_wait(), or sleeping.
+ *
+ * Not the same as task_wakeup(), and using that one here is a crash rather than a
+ * mistake that shows up: a blocked task is linked into the blocked list, and a run queue
+ * refuses a task that is already linked into a list (list_link() checks, because one task
+ * on two lists splices them).  So waking a blocked parent with task_wakeup() makes the next
+ * queue insertion panic on the parent's name -- which is what `fork` followed by `wait`
+ * did, at the point the child exited and told its parent so.
+ *
+ * A no-op if the task is not blocked, so a wake that races another one, or a timed sleep
+ * that has already fired, is harmless rather than a double insertion. */
+void task_unblock(task_t *t);
+
 /* Mark a task dead.  Its stack is not freed: there is nothing to free it into
  * safely, and a leaked 16 KiB is better than a use-after-free. */
 void task_exit(void);
+
+/* Exit with a status, which is what `exit` wants: task_exit() exists to end a kernel
+ * thread that has nobody waiting for it, and has no status to report because no one is
+ * looking. */
+void task_exit_with(int status);
+
+/* A forked child: a kernel stack holding a frame that returns 0 into the same place its
+ * parent will return from, over an address space that is its parent's twin.
+ *
+ * Not built by task_create_user() because that one lays out an *entry* stack for a program
+ * starting for the first time, and this is the opposite: the child continues partway
+ * through an instruction stream its parent is already executing, with every register
+ * except the return value the same. */
+task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight);
+
+/* Attach a copy-on-write twin of `parent`'s address space to a freshly forked task.  Kept
+ * apart from task_create_forked() so that a failure to build the twin leaves nothing to
+ * unwind except the task itself. */
+int  task_attach_cow_twin(task_t *child);
 
 /* The two frames a user task starts with, and their sizes.
  *

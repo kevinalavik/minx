@@ -15,7 +15,9 @@
 #include "panic.h"
 #include "percpu.h"
 #include "string.h"
+#include "task.h"
 #include "vectors.h"
+#include "vmm.h"
 
 static const char *const exception_names[32] = {
     "divide error",             "debug",
@@ -148,6 +150,24 @@ void isr_dispatch(regs_t *regs) {
         percpu_count_interrupt();
         lapic_eoi();
         return;
+    }
+
+    /* A write fault in a user address on a page this process shares with its twin is not
+     * an error: it is the copy-on-write machinery being asked to do its job.  Handle it
+     * here, before anything reports anything, and return -- the frame's RIP still names the
+     * faulting instruction, because #PF is fault-like, so the tail's `iretq` re-executes it
+     * against a page that is now private.
+     *
+     * Before this, a forked child that wrote to anything -- its stack, its data -- took a
+     * #PF on a page the parent had every right to be using, and the only honest report the
+     * kernel could make was "page fault", which says nothing about why. */
+    if (vector == 14 && (regs->cs & 3) != 0) {
+        task_t *t = sched_current();
+
+        if (t != NULL && t->cow != NULL &&
+            vmm_cow_fault(t->tables, t->cow, read_cr2())) {
+            return;
+        }
     }
 
     isr_handler_t handler = vector < 256 ? handlers[vector] : NULL;
