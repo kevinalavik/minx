@@ -1423,15 +1423,15 @@ void task_sleep_ms(uint64_t ms) {
     irq_restore(flags);
 }
 
-void task_wait(void) {
+/* Put the running task on the blocked list without yet switching away.
+ *
+ * Split out of task_wait() so a caller that has to decide *and* register atomically can:
+ * see wait_queue_block_locked(), where the window between the two is a lost wake. */
+void task_block_register(void) {
     task_t *t = sched_current();
 
     if (t == NULL)
         return;
-
-    /* Interrupts off for the same reason as in task_sleep_ms(): the window
-     * between blocking and switching away must not be interruptible. */
-    uint64_t flags = irq_save();
 
     uint64_t lflags = spin_lock_irqsave(&blocked.lock);
 
@@ -1440,6 +1440,18 @@ void task_wait(void) {
     blocked_add(t);
 
     spin_unlock_irqrestore(&blocked.lock, lflags);
+}
+
+/* Wait for a named wake, with no condition of its own to re-check. */
+void task_wait(void) {
+    if (sched_current() == NULL)
+        return;
+
+    /* Interrupts off for the same reason as in task_sleep_ms(): the window
+     * between blocking and switching away must not be interruptible. */
+    uint64_t flags = irq_save();
+
+    task_block_register();
     self_from_user_clear();
     schedule();
 
@@ -1534,24 +1546,65 @@ uint32_t wait_queue_enqueue_locked(wait_queue_t *q, unsigned tag) {
  * The caller must hold q->lock and must not touch what it was holding afterwards: the lock
  * is dropped on the way in, and everything this waits on is guarded by it. */
 void wait_queue_block_locked(wait_queue_t *q, uint32_t slot) {
-    ticket_unlock(&q->lock);
+    /* Interrupts off across the whole of it, for the reason task_wait() gives: the window
+     * between deciding to block and switching away must not be interruptible. */
+    uint64_t flags = irq_save();
+    task_t *self = sched_current();
 
     for (;;) {
-        uint64_t flags = spin_lock_irqsave(&q->lock);
+        /* Entered with `q->lock` held; each pass leaves it held again.  The test and the
+         * registration below happen with that lock still held, which is what closes the
+         * lost wake: a waker needs the same lock to touch the slot, so it either arrives
+         * first -- and the tag is already zero, so nothing is registered -- or after, when
+         * the task is already TASK_WAITING and `unblock()` queues it. */
         bool woken = q->slots[slot].tag == 0;
 
-        spin_unlock_irqrestore(&q->lock, flags);
-
         if (woken) {
+            q->slots[slot].task = NULL;
+            q->slots[slot].tag = 0;
+            q->count--;
+
+            /* `count` is the queue's occupancy and the rest of this file believes it: the
+             * enqueue hands out a slot on the strength of it.  An undercount hands out a
+             * slot a live waiter still holds, and that surfaces as an indirect call
+             * through an overwritten pointer rather than as anything to do with a queue. */
+            if (q->count > WAIT_QUEUE_ENTRIES)
+                panic("wait_queue: count %u after reclaiming a slot, more than the %u\n",
+                      (unsigned)q->count, (unsigned)WAIT_QUEUE_ENTRIES);
+
+            ticket_unlock(&q->lock);
+            irq_restore(flags);
+            return;
+        }
+
+        task_block_register();
+
+        ticket_unlock(&q->lock);
+
+        /* Claimed between the unlock and here?  `unblock()` clears the tag under `q->lock`
+         * before its CAS, so a task no longer in TASK_WAITING has been woken.  Switching
+         * away now would leave it queued *and* blocked -- one task with two owners, which
+         * is what `list_link()` panics on -- so the wait ends and the caller re-tests its
+         * own condition against whatever woke it. */
+        if (self == NULL ||
+            __atomic_load_n(&self->state, __ATOMIC_ACQUIRE) != TASK_WAITING) {
             uint64_t f2 = spin_lock_irqsave(&q->lock);
+
             q->slots[slot].task = NULL;
             q->slots[slot].tag = 0;
             q->count--;
             spin_unlock_irqrestore(&q->lock, f2);
+            irq_restore(flags);
             return;
         }
 
-        task_wait();
+        self_from_user_clear();
+        schedule();
+
+        /* Back from `schedule()`, so the task was queued and has run.  Take the lock for
+         * the next test -- a wake only means "something changed", and a spurious one must
+         * send this back round rather than reclaim a slot nothing woke. */
+        spin_lock_irqsave(&q->lock);
     }
 }
 
