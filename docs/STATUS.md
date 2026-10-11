@@ -25,7 +25,7 @@ The measurement that matters is that `-smp 4` is now clean: three consecutive ru
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
 | 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | VERIFIED | Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). The intermittency was the publish-before-save race plus idle-task stealing, both fixed; the clean-run matrix is three consecutive `-smp 4` runs at 38/38 with `TEST-READY`, no panic and no stray bytes in the serial log. A good run reads `sched: cpu 0: 26562 ticks, 16830 switches, 0 steals`. **VERIFIED.** `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. |
 | 6 | Userspace entry | VERIFIED | Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel), `phase6-user` (the program is loaded, entered at ring 3, reads its own `argc` and `argv[0]`, writes to the console, is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a kernel pointer and ENOSYS for an unimplemented call, is preempted in ring 3 and resumed, and exits 0). **VERIFIED** by `make test` → `run-tests: PASS` and by three `-smp 4` runs at 38/38. |
-| 7 | Processes, signals, pipes | IN PROGRESS | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes are committed and pass, and the `-smp 4` hang that was blocking this is fixed (3/8 clean to 6/6). **Not VERIFIED**: `-smp 8` under TCG still faults intermittently. `exec` and signals are outstanding. See "Phase 7, where it got to". |
+| 7 | Processes, signals, pipes | IN PROGRESS | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes are committed and pass, and the `-smp 4` hang that was blocking this is fixed (3/8 clean to 6/6). **Not VERIFIED**: `-smp 8` under TCG still faults intermittently. `exec` is done; signals are outstanding. See "Phase 7, where it got to". |
 | 8 | VFS + ramfs + initrd + devfs | NOT STARTED | |
 | 9 | TTY + libc + sh | NOT STARTED | |
 | 10 | Coreutils + procfs | NOT STARTED | |
@@ -458,17 +458,25 @@ right and is not the fault.
 sends one signal, and checks the count -- in its own small program, via the registry below,
 rather than inside `hello`.
 
-**`exec` is the next piece of work.** It needs to resolve a *path*, and there is no
-filesystem until phase 8; the only thing that exists today is the embedded image the loader
-is handed by the one object that includes it. So it wants a **program registry**: a table of
-{name, image, bytes} that `program_load_and_run()` looks up by name, which phase 8 replaces
-with a real read of the initrd and which the loader does not otherwise change.
+**`exec` is DONE.** There is a **program registry** -- a table of {name, image, bytes} that
+`program_load_and_run()` and `sys_exec()` both look up by name -- and a second ring-3
+program, `exectest`, which starts, prints one line, and execs `hello`.  `hello` then prints
+and exits 0 in the same task, so one task checks both that a program can be started and
+that a process can be replaced, and the process that exits at the end is `hello`, which
+`exectest` could not have been: its own exit status is only ever what a failed `exec`
+returns.  Phase 8 replaces the registry lookup with a real read of the initrd; the loader
+does not otherwise change.
 
-The same registry is what makes the dedicated checks the spec asks for -- `forktest`,
-`cowtest`, `sigtest` -- possible. They are separate programs today only because they did not
-have to be: `hello` has grown to the point where its own growth is a bug, which is what the
-loader bug above was. `user/hello/start.S` and `user/hello/hello.h` are the first two things
-that want to become shared.
+Three things about `exec` are not obvious and each cost a run -- all in the commit message:
+the address space has to be switched before the call returns, the *live* interrupt frame has
+to be patched rather than `saved_rsp`, and the task keeps its own kernel stack.  A fourth,
+found on the way, is that a shared include guard in the generated image headers makes the
+second program's array undeclared the moment there are two of them.
+
+The registry is also what makes the rest of the spec's dedicated checks -- `forktest`,
+`cowtest`, `sigtest` -- cheap: each is now a directory under `user/` and nothing else.  That
+matters because a test living inside another program's text is a test that changes what it
+is testing, and `hello` growing past 4 KiB is exactly what exposed the loader bug above.
 
 ## The two remaining failures, exactly
 
