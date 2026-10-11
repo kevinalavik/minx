@@ -315,20 +315,36 @@ USER_PROGRAM_LDFLAGS := -static -nostdlib -z noexecstack \
 # makes `forktest`, `cowtest` and `sigtest` cheap to have as programs of their own rather
 # than folded into hello until hello's own growth becomes a bug.  It has: hello crossing
 # 4 KiB of text is what exposed the loader's per-page copy error.
-# `notdir` of a path that ends in a slash is the empty string, not the directory's name,
-# so the names come off the .c files directly rather than off the directories.
-USER_PROGS     := $(sort $(notdir $(basename $(wildcard user/*/*.c))))
+# The programs are the *directories*, named after themselves.  Taking the name off the
+# source file gives "main" for every program in the tree that has a main.c, which is all of
+# them; and `notdir` of a path ending in a slash is the empty string, so the trailing slash
+# comes off first.
 USER_PROG_DIRS := $(sort $(dir $(wildcard user/*/*.c)))
+USER_PROGS     := $(sort $(notdir $(patsubst %/,%,$(USER_PROG_DIRS))))
 USER_SRC       := $(foreach d,$(USER_PROG_DIRS),$(wildcard $(d)*.c) $(wildcard $(d)*.S))
 USER_HDRS      := $(wildcard user/*/*.h) $(wildcard user/common/*.h)
 
-$(BUILD)/bin/%: $(USER_SRC) $(USER_HDRS)
-	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS) -Iuser/common -Iuser/$* $? \
-	    $(USER_PROGRAM_LDFLAGS) -o $@
-	@readelf -h $@ | grep -q 'Type:.*EXEC' || \
-	    { echo "$@ is not an ET_EXEC ELF; the loader only loads those" >&2; \
+COMMON_SRC := $(wildcard user/common/*.c) $(wildcard user/common/*.S)
+
+# One explicit rule per program rather than a pattern rule over all of them at once.
+#
+# A pattern rule here would have every program's sources as one prerequisite list, and
+# `$?` -- the only thing a pattern rule can use to say which program to build -- then lists
+# headers and the recipe's own line continuation along with the sources.  Naming them
+# outright is no more code and cannot go wrong that way.
+define USER_PROGRAM_RULE
+$(BUILD)/bin/$(1): $$(wildcard user/$(1)/*.c) $$(wildcard user/$(1)/*.S) \
+                     $$(COMMON_SRC) $$(USER_HDRS)
+	@mkdir -p $$(dir $$@)
+	$(CC) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS) -Iuser/common -Iuser/$(1) \
+	    $$(wildcard user/$(1)/*.c) $$(wildcard user/$(1)/*.S) $(COMMON_SRC) \
+	    $(USER_PROGRAM_LDFLAGS) -o $$@
+	@readelf -h $$@ | grep -q 'Type:.*EXEC' || \
+	    { echo "$$@ is not an ET_EXEC ELF; the loader only loads those" >&2; \
 	      exit 1; }
+endef
+
+$(foreach p,$(USER_PROGS),$(eval $(call USER_PROGRAM_RULE,$(p))))
 
 $(BUILD)/bin/%: $(USER_DIR)/%
 	@mkdir -p $(dir $@)

@@ -22,6 +22,7 @@
 #define SYS_FORK    8
 #define SYS_WAIT    9
 #define SYS_PIPE    10
+#define SYS_EXEC    11
 
 /* Errors, as the negative return values the kernel uses. */
 #define EBADF   9
@@ -97,6 +98,19 @@ static inline ssize_t_ minx_write(int fd, const void *buf, size_t_ n) {
 
 static inline ssize_t_ minx_read(int fd, void *buf, size_t_ n) {
     return minx_syscall3(SYS_READ, fd, (long)buf, (long)n);
+}
+
+/* Replace this process with the program called `path`.
+ *
+ * `argv` is an array of pointers into *this* process's memory, which the kernel reads before
+ * unmapping it.  It may be NULL.
+ *
+ * On success this does not return: the old program's text and stack are gone, so there is no
+ * code left here to come back to.  On failure it returns -errno and the process carries on,
+ * so a program can report what went wrong. */
+static inline long minx_exec(const char *path, char *const *argv, char *const *envp) {
+    return minx_syscall3(SYS_EXEC, (long)(uintptr_t)path, (long)(uintptr_t)argv,
+                         (long)(uintptr_t)envp);
 }
 
 /* Close a descriptor.  The kernel returns EBADF for a number that is not open, and for

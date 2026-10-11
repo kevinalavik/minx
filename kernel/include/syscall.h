@@ -42,6 +42,7 @@ enum {
     SYS_FORK   = 8,
     SYS_WAIT   = 9,
     SYS_PIPE   = 10,
+    SYS_EXEC   = 11,
 
     SYS_MAX = 32,
 };
@@ -60,6 +61,7 @@ enum {
 #define EACCES 13
 #define EFAULT 14
 #define EBUSY  16
+#define ENOEXEC 8
 #define EPIPE  32
 #define EEXIST 17
 #define ENODEV 19
@@ -167,9 +169,19 @@ struct task *program_start(const struct program_image *p);
  *
  * On failure the task is untouched -- still running the old program, still able to report
  * the error -- because the alternative is a process with no program and no way to be told
- * why. */
+ * why.
+ *
+ * The new entry point and stack pointer come back through `entry_out` and `rsp_out`
+ * because the caller has to patch them into something `saved_rsp` cannot reach.  An `exec`
+ * is made by a task that is *running*, and such a task returns to ring 3 through the
+ * interrupt frame it is in the middle of -- not through `saved_rsp`, which only says where
+ * to resume it if it were switched out first.  Patching only `saved_rsp` builds a program
+ * that starts correctly the next time it is scheduled and runs the *old* program right now,
+ * which is the more confusing of the two failures because the first switch looks like it
+ * worked. */
 struct task *program_exec_into(struct task *t, const char *name, const void *image,
-                               size_t bytes, uint32_t stack_pages);
+                               size_t bytes, uint32_t stack_pages,
+                               uint64_t *entry_out, uint64_t *rsp_out);
 
 /* --- what a program did -------------------------------------------------- */
 

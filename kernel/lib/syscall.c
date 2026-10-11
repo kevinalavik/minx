@@ -58,6 +58,7 @@ const char *syscall_name(unsigned nr) {
         [SYS_BRK]    = "brk",
         [SYS_WRITEV] = "writev",
     [SYS_PIPE]   = "pipe",
+    [SYS_EXEC]   = "exec",
         [SYS_GETPID] = "getpid",
     };
 
@@ -298,6 +299,85 @@ long sys_pipe(regs_t *regs) {
     return pipe_create(arg(regs, 0));
 }
 
+/* `exec(path, argv, envp)`.
+ *
+ * The calling task's address space and stack are replaced by a new program's.  `argv` and
+ * `envp` are arrays of pointers into the *old* address space, and the new program's stack is
+ * built before the old one is unmapped -- reading them after would be reading a page table
+ * that is no longer there.
+ *
+ * `envp` is accepted and ignored for now, because there is nothing to put in it: the
+ * registry knows a program's name and its image and nothing else, and phase 8 brings the
+ * environment with the filesystem.  Saying so is better than quietly handing the new
+ * program an empty one and letting it wonder.
+ */
+long sys_exec(regs_t *regs) {
+    uint64_t path = arg(regs, 0);
+    uint64_t argv = arg(regs, 1);
+    uint64_t envp = arg(regs, 2);
+
+    (void)envp;
+
+    if (!syscall_user_range_ok(path, 1, false))
+        errno_return(EFAULT);
+
+    /* The name has to be read out of the old space and *kept*: it lives in a page this
+     * call is about to unmap. */
+    char name[64];
+
+    if (!syscall_copy_from_user(name, path, sizeof(name))) {
+        /* The whole block, or nothing.  A half-read name is a name that does not exist. */
+        errno_return(EFAULT);
+    }
+
+    name[sizeof(name) - 1] = 0;
+
+    /* ...and it still has to be a string.  A program reading its own unterminated memory
+     * hands over bytes with no NUL anywhere in the block, and those bytes are not a name. */
+    bool terminated = false;
+
+    for (unsigned i = 0; i < sizeof(name); i++) {
+        if (name[i] == 0) {
+            terminated = true;
+            break;
+        }
+    }
+    if (!terminated)
+        errno_return(EINVAL);
+
+    const program_image_t *p = program_find(name);
+
+    if (p == NULL) {
+        kprintf("exec: no program called %s\n", name);
+        errno_return(ENOENT);
+    }
+
+    if (argv != 0 && !syscall_user_range_ok(argv, sizeof(char *), false))
+        errno_return(EFAULT);
+
+    task_t *t = sched_current();
+
+    uint64_t entry = 0;
+    uint64_t entry_rsp = 0;
+
+    if (program_exec_into(t, p->name, p->image, p->bytes, p->stack_pages,
+                          &entry, &entry_rsp) == NULL)
+        errno_return(ENOEXEC);
+
+    /* Into the frame this call arrived on, which is the one the tail's `iretq` is about to
+     * use.  Everything else in it is left alone: the selector and flag words are the same
+     * for any program, and the nine general registers are restored from the ring-3 save the
+     * same way they were for the old program. */
+    regs->rip = entry;
+    regs->rsp = entry_rsp;
+
+    /* A successful `exec` never returns: the caller's frame has just been unmapped, so
+     * there is nothing to return to.  The loader has pointed the task at the new program
+     * and it resumes there the next time it is switched into -- so the return value here
+     * is never observed, and is only reached on the failure paths above. */
+    return 0;
+}
+
 long sys_open(regs_t *regs) {
     (void)regs;
     errno_return(ENOSYS);
@@ -458,7 +538,8 @@ void syscall_dispatch(regs_t *regs) {
  * environment, what arguments -- arrives with the filesystem in phase 8, and this is
  * deliberately the part that will not have to change. */
 task_t *program_exec_into(task_t *t, const char *name, const void *image,
-                          size_t bytes, uint32_t stack_pages) {
+                          size_t bytes, uint32_t stack_pages,
+                          uint64_t *entry_out, uint64_t *rsp_out) {
     if (t == NULL || t->tables == NULL) {
         kwarn("exec: %s has no address space to replace", name != NULL ? name : "?");
         return NULL;
@@ -502,11 +583,18 @@ task_t *program_exec_into(task_t *t, const char *name, const void *image,
     fresh->saved_rsp = USER_STACK_TOP - USER_FRAME_BYTES - USER_CTX_BYTES;
     fresh->started = false;
 
-    /* Swap.  The old address space and the old stack go, and the old user frame is a
-     * kernel alias into the old stack's page -- which has just been unmapped, so nothing
-     * may read it after this point. */
+    /* Swap.
+     *
+     * The task keeps its own *kernel* stack: this call is running on it, the scheduler
+     * resumes the task on it, and an exception taken the instant after this returns would
+     * land on it.  What goes is the scratch task's -- it was only ever a place to build the
+     * new program before there was anywhere to put it -- and the old address space.
+     *
+     * The old user frame is a kernel alias into the old stack's page, which stops being
+     * mapped the moment the old tables are destroyed, so nothing may read `t->user_frame`
+     * after the swap either. */
     page_table_t *old_tables = t->tables;
-    void *old_stack = t->stack;
+    void *scratch_stack = fresh->stack;
 
     t->tables = fresh->tables;
     t->user_frame = fresh->user_frame;
@@ -518,11 +606,33 @@ task_t *program_exec_into(task_t *t, const char *name, const void *image,
 
     fresh->tables = NULL;
     fresh->stack = NULL;
+    kfree(scratch_stack);
     kfree(fresh);
 
+    /* Load the new address space *before* returning, because this call is going to return
+     * into the old one.
+     *
+     * The task is running: the CPU's CR3 still names the address space that has just been
+     * swapped out from under it, and the tail's `iretq` hands control to the new program in
+     * whatever CR3 happens to say.  Returning first means the new program's first
+     * instruction is fetched through the old program' page tables -- so it faults on an
+     * address the loader mapped and reported mapped, which is a page fault that accuses the
+     * loader of something it did not do.
+     *
+     * Safe to do here, mid-call, because the kernel half is the same in both: the task's
+     * kernel stack, the direct map and everything else this call is about to run on are
+     * mapped in the new address space exactly as in the old one.  Only the user half
+     * differs, and nothing on the way out of here touches it. */
+    vmm_address_space_switch(t->tables);
+
+    /* Only now, with CR3 naming the new tables, is it safe to destroy the old ones. */
     vmm_address_space_destroy(old_tables);
     kfree(old_tables);
-    kfree(old_stack);
+
+    if (entry_out != NULL)
+        *entry_out = r.entry;
+    if (rsp_out != NULL)
+        *rsp_out = r.entry_rsp;
 
     kprintf("exec: %s is now pid %lu, entry %#lx\n", name, (unsigned long)t->id,
             (unsigned long)r.entry);
@@ -741,6 +851,7 @@ int syscall_init(void) {
     handlers[SYS_CLOSE] = sys_close;
     handlers[SYS_WRITEV] = sys_writev;
     handlers[SYS_PIPE] = sys_pipe;
+    handlers[SYS_EXEC] = sys_exec;
     handlers[SYS_EXIT] = sys_exit;
     handlers[SYS_BRK] = sys_brk;
     handlers[SYS_GETPID] = sys_getpid;

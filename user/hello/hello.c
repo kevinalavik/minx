@@ -12,7 +12,9 @@
  *      than faulting or, worse, reading it.  A boundary that has only been tested with
  *      good input has not been tested.
  */
-#include "hello.h"
+/* The ABI is shared by every user program, so it lives one directory up: a second program
+ * should not have to copy a syscall wrapper to be able to make one. */
+#include "../common/minx_user.h"
 
 static void put(const char *s) {
     minx_write(1, s, minx_strlen(s));

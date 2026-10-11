@@ -14,6 +14,13 @@
  * for its own recursion should fail the same way whoever runs it. */
 static const program_image_t programs[] = {
     {
+        "exectest",
+        exectest_image,
+        exectest_image_len,
+        4,
+        "exectest, which replaces itself with hello",
+    },
+    {
         "hello",
         hello_image,
         hello_image_len,

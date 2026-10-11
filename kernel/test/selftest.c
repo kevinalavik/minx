@@ -1609,7 +1609,12 @@ static bool wait_until(volatile uint64_t *counter, uint64_t target,
 static void test_user_program(void) {
     syscall_last_errno_reset();
 
-    task_t *t = program_load_and_run("hello", 8);
+    /* `exectest`, not `hello`: it replaces itself with `hello` and then hello runs to
+     * completion in the same task.  So one task checks both that a program can be started
+     * and that a process can be replaced by another, and the process that exits 0 at the
+     * end is `hello` -- which `exectest` could not have been, since its own exit status is
+     * only ever the one it returns on a failed `exec`. */
+    task_t *t = program_load_and_run("exectest", 8);
 
     if (t == NULL) {
         test_fail("phase6-user", "the program would not load");
