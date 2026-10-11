@@ -26,6 +26,7 @@
 #include "kmalloc.h"
 #include "kprintf.h"
 #include "pmm.h"
+#include "ramfs.h"
 #include "panic.h"
 #include "serial.h"
 #include "spinlock.h"
@@ -1752,6 +1753,255 @@ static void test_user_pointers(void) {
  * evidence the check works is that it is refused *and says why*.  A loader that
  * accepted a class-32 ELF would still load every program in this tree, and would only
  * be found out the first time somebody handed it a file from somewhere else. */
+/* --- phase 8: the ramfs ------------------------------------------------- */
+
+/* The filesystem, tested through the interface the rest of the kernel uses rather than
+ * through the internals, because the point of a filesystem is what a caller can do to it.
+ *
+ * Every case here is one whose absence is silent: a file that reads back the right length
+ * of the right bytes, in a tree nobody can walk, still looks fine until something tries to
+ * unlink it or link it a second time.  So each check has a second half that would fail if
+ * the first half had quietly done the wrong thing. */
+static void test_ramfs(void) {
+    const char *name = "phase8-ramfs";
+
+    if (!ramfs_mounted()) {
+        test_fail(name, "the root filesystem is not mounted");
+        return;
+    }
+
+    uint64_t root = ramfs_root();
+    if (root == 0) {
+        test_fail(name, "the root directory has no node number");
+        return;
+    }
+
+    unsigned before = ramfs_node_count();
+
+    /* A file, written in two pieces so that the second write lands past the end of the
+     * first and has to grow the buffer rather than overwrite it. */
+    uint64_t f = ramfs_create(root, "greeting", RAMFS_FILE, 0644);
+    if (f == 0) {
+        test_fail(name, "could not create a file in the root directory");
+        return;
+    }
+
+    if (ramfs_write(f, 0, "hello ", 6) != 6 || ramfs_write(f, 6, "ramfs", 5) != 5) {
+        test_fail(name, "a write to a fresh file did not report its length");
+        return;
+    }
+
+    if (ramfs_node_size(f) != 11) {
+        test_fail(name, "two writes of 6 and 5 bytes produced a file of %llu",
+                  (unsigned long long)ramfs_node_size(f));
+        return;
+    }
+
+    char buf[32];
+    memset(buf, 0, sizeof(buf));
+
+    /* Read from the middle: an offset that lands inside the data has to be honoured, and
+     * the commonest way to get that wrong is to treat the offset as a length. */
+    if (ramfs_read(f, 6, buf, 5) != 5 || memcmp(buf, "ramfs", 5) != 0) {
+        test_fail(name, "reading 5 bytes from offset 6 did not give \"ramfs\"");
+        return;
+    }
+
+    /* Reading past the end returns what is there and no more -- short, never -1.  A reader
+     * that gets a negative length instead has to special-case the end of a file, and one
+     * that pads has invented bytes that were never written. */
+    long got = ramfs_read(f, 8, buf, sizeof(buf));
+    if (got != 3 || memcmp(buf, "mfs", 3) != 0) {
+        test_fail(name, "reading 32 bytes from offset 8 of an 11-byte file gave "
+                  "%ld bytes", got);
+        return;
+    }
+
+    if (ramfs_read(f, 11, buf, sizeof(buf)) != 0) {
+        test_fail(name, "reading at the end of a file did not return zero bytes");
+        return;
+    }
+
+    /* Truncation shrinks and then grows, and the gap it grows over is zeroes -- which is
+     * what a program that truncates a file to use it as scratch depends on. */
+    if (ramfs_truncate(f, 5) != 0 || ramfs_node_size(f) != 5) {
+        test_fail(name, "truncating to 5 left the file at %llu bytes",
+                  (unsigned long long)ramfs_node_size(f));
+        return;
+    }
+
+    if (ramfs_truncate(f, 8) != 0) {
+        test_fail(name, "growing a file back failed");
+        return;
+    }
+
+    memset(buf, 0xaa, sizeof(buf));
+    if (ramfs_read(f, 5, buf, 3) != 3) {
+        test_fail(name, "reading the bytes added by a growing truncate failed");
+        return;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (buf[i] != 0) {
+            test_fail(name, "the gap left by a growing truncate is 0x%02x, not zero",
+                      (unsigned char)buf[i]);
+            return;
+        }
+    }
+
+    /* Directories, and a path is a walk through them. */
+    uint64_t d = ramfs_create(root, "sub", RAMFS_DIR, 0755);
+    uint64_t deep = ramfs_create(d, "deeper", RAMFS_DIR, 0755);
+    if (d == 0 || deep == 0) {
+        test_fail(name, "could not create nested directories");
+        return;
+    }
+
+    uint64_t n = ramfs_create(deep, "leaf", RAMFS_FILE, 0600);
+    if (n == 0 || ramfs_write(n, 0, "x", 1) != 1) {
+        test_fail(name, "could not create a file two directories down");
+        return;
+    }
+
+    /* The name is one component, and refusing a slash is what makes `..` and every path
+     * walker downstream sound.  A directory called "a/b" would be reachable by two paths
+     * and reachable by neither walk. */
+    if (ramfs_create(d, "not/a/name", RAMFS_FILE, 0644) != 0) {
+        test_fail(name, "a name containing a slash was accepted");
+        return;
+    }
+
+    /* A hard link is a second name for the same data, not a copy: writing through one has
+     * to be visible through the other, and the two have to share a node number. */
+    if (ramfs_link(root, "greeting2", f) != 0) {
+        test_fail(name, "could not hard-link a file");
+        return;
+    }
+
+    uint64_t f2 = ramfs_lookup(root, "greeting2");
+    if (f2 != f) {
+        test_fail(name, "a hard link reached node %llu rather than %llu",
+                  (unsigned long long)f2, (unsigned long long)f);
+        return;
+    }
+
+    if (ramfs_write(f2, 0, "HELLO", 5) != 5) {
+        test_fail(name, "writing through a hard link failed");
+        return;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    if (ramfs_read(f, 0, buf, 5) != 5 || memcmp(buf, "HELLO", 5) != 0) {
+        test_fail(name, "a write through one name was not visible through the other");
+        return;
+    }
+
+    /* A directory cannot be hard-linked: two parents for one directory makes `..` a cycle
+     * and the tree stops being a tree. */
+    if (ramfs_link(root, "sub2", d) >= 0) {
+        test_fail(name, "a directory could be hard-linked");
+        return;
+    }
+
+    /* And it cannot be removed while it still has anything in it. */
+    if (ramfs_rmdir(root, "sub") != -ENOTEMPTY) {
+        test_fail(name, "a non-empty directory was removed");
+        return;
+    }
+
+    if (ramfs_rmdir(root, "sub") == 0) {
+        test_fail(name, "the non-empty directory went away on the second attempt");
+        return;
+    }
+
+    /* Rename moves the name and keeps the data. */
+    if (ramfs_rename(root, "greeting2", root, "greeting3") != 0) {
+        test_fail(name, "renaming a file failed");
+        return;
+    }
+
+    if (ramfs_lookup(root, "greeting2") != 0) {
+        test_fail(name, "the old name survived a rename");
+        return;
+    }
+
+    if (ramfs_lookup(root, "greeting3") != f) {
+        test_fail(name, "the new name does not reach the same node");
+        return;
+    }
+
+    /* Symlinks hold a path, not the thing the path names, and the test is that renaming the
+     * target is visible through the link.  A symlink that stored the node would keep
+     * working after the file it names is gone, which is the opposite of what it is for. */
+    if (ramfs_symlink(root, "link", "greeting") == 0) {
+        test_fail(name, "could not create a symbolic link");
+        return;
+    }
+
+    uint64_t sl = ramfs_lookup(root, "link");
+    if (sl == 0) {
+        test_fail(name, "the symbolic link was not created");
+        return;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    if (ramfs_read(sl, 0, buf, sizeof(buf)) != 8 ||
+        memcmp(buf, "greeting", 8) != 0) {
+        test_fail(name, "a symbolic link did not read back as the path it names");
+        return;
+    }
+
+    /* Unlink takes the name away.  The data goes only when the last name does, so the
+     * original file -- still reached by "greeting" -- has to survive the link's removal,
+     * which is what makes `rm` on one of two links safe. */
+    if (ramfs_unlink(root, "greeting3") != 0) {
+        test_fail(name, "unlinking a file failed");
+        return;
+    }
+
+    if (ramfs_lookup(root, "greeting3") != 0) {
+        test_fail(name, "the name survived an unlink");
+        return;
+    }
+
+    if (ramfs_lookup(root, "greeting") != f) {
+        test_fail(name, "unlinking one name of a hard-linked file lost the data");
+        return;
+    }
+
+    if (ramfs_unlink(root, "nothing-here") != -ENOENT) {
+        test_fail(name, "unlinking a name that does not exist did not report ENOENT");
+        return;
+    }
+
+    /* Everything above left the tree dirty; clean up so the test does not change what
+     * every test after it sees. */
+    ramfs_unlink(root, "greeting");
+    ramfs_unlink(root, "link");
+    ramfs_unlink(deep, "leaf");
+
+    /* A directory comes out with rmdir, not unlink, and only while it is empty -- which is
+     * the check that has to come first, because the order above is the only thing that made
+     * it empty. */
+    if (ramfs_rmdir(d, "deeper") != 0) {
+        test_fail(name, "removing an empty directory failed");
+        return;
+    }
+
+    if (ramfs_rmdir(root, "sub") != 0) {
+        test_fail(name, "removing an emptied directory failed");
+        return;
+    }
+
+    if (ramfs_node_count() != before) {
+        test_fail(name, "%u nodes were created and not removed",
+                  ramfs_node_count() - before);
+        return;
+    }
+
+    test_pass(name);
+}
+
 static void test_elf_rejects(void) {
     static uint8_t fake[128];
     page_table_t tables;
@@ -2520,6 +2770,7 @@ void test_run_all(void) {
     test_elf_rejects();
     test_address_spaces();
     test_user_program();
+    test_ramfs();
     test_sched_queues();
     test_sched_parallel();
     test_sched_preempt();

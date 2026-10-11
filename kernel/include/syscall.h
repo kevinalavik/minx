@@ -62,6 +62,17 @@ enum {
 #define EFAULT 14
 #define EBUSY  16
 #define ENOEXEC 8
+#define EISDIR   21
+#define EINVAL   22
+#define ENFILE   23
+#define EMFILE   24
+#define ENOTDIR  20
+#define ENOSPC   28
+#define ESPIPE   29
+#define EROFS    30
+#define ENAMETOOLONG 36
+#define ENOTEMPTY   39
+#define EMLINK      31
 #define EPIPE  32
 #define EEXIST 17
 #define ENODEV 19

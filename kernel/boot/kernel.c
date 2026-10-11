@@ -24,6 +24,7 @@
 #include "panic.h"
 #include "percpu.h"
 #include "pmm.h"
+#include "ramfs.h"
 #include "power.h"
 #include "serial.h"
 #include "smp.h"
@@ -613,6 +614,12 @@ static void kmain_stage2(void) {
     }
 
     report_initrd(module_request.response);
+
+    /* The root filesystem, before anything can want a file.  A machine that boots with no
+     * root says so here rather than at the first `open`, which is much later and reports
+     * nothing about why. */
+    if (ramfs_mount_initrd(boot_info.initrd_base, boot_info.initrd_size) != 0)
+        kprintf("[warn] the root filesystem could not be mounted\n");
 
     cpu_interrupts_init();
 
