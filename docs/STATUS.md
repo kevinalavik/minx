@@ -428,15 +428,27 @@ is left is a hang, not memory damage.  And the scheduler's own invariant check n
     sched: processor 5 chose the task it is already running (69, exectest, state 2);
            it will not be switched to
 
-So the run queue handed a processor the task that processor is already running, which means
-`prev` reached `rq_push()` without having been removed, or a task was published while it was
-still on a queue.  That is the same shape as the `list_link()` double-insertion panic, except
-that here it is caught by a check rather than by the panic -- so it is *nearly* the same bug,
-and the queue itself is behaving.
+So the run queue handed a processor the task that processor is already running, and the
+task's state was `TASK_RUNNABLE` at that point -- so it really was on the queue, not merely
+reported as being so.  `list_link()`'s double-insertion panic does *not* fire, so there is
+one task on one queue; the problem is that the queue's one entry is a task that is running.
 
-**This is the first thing the next session should look at**, and the check that reports it
-is already in place and already firing, which is the useful part: it says which processor and
-which task, which nothing else did.
+**The handler is wrong, and that is the useful part of knowing it.**  `schedule()` returns
+without switching, having already popped the task off the queue -- and the popped task is
+marked runnable and now sits on no queue at all.  So each occurrence loses a task outright,
+the machine quietly runs out of work, and nothing reports a fault.  Putting the task back
+before falling through to the steal and idle fallbacks is obviously the right *handler*...
+
+...and it was tried, and it does not fix it: over six runs at `-smp 8` the self-selection
+did not occur once, while the suite got measurably worse (35-37 checks instead of 38).  So
+whatever puts a running task on a run queue is doing something else as well, and masking the
+symptom hides that too.  The attempt is kept at `build/sched-selfselect-attempt.patch` and
+should not be applied without more understanding.
+
+**So the state at `-smp 8`, measured on the committed tree: three of four runs clean**, and
+the fourth stops early -- after 24 checks, before phase 5, so not in anything phase 7 added.
+The two failures are unrelated to each other and neither is diagnosed.  `-smp 4`, which is
+what `make run` and `make test` use, is green.
 
 **Fourth bug, found on the way: the loader filled every page of a segment with a copy of
 the segment's first page.** `hello` only just grew past 4 KiB of text to expose it. Nothing
