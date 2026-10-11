@@ -421,14 +421,22 @@ the summary, so the next session does not re-derive them.
 `-smp 4` goes from 3 of 8 clean runs to 6 of 6, and `make test` passes three times out of
 three under KVM, which is the gate.
 
-**Still open: `-smp 8` under TCG faults intermittently**, roughly one run in four, as a
-page fault whose own reporting path then faults and destroys the evidence -- so the log
-says only `unhandled CPU exception: vector 14` and a register dump that is itself
-garbage. That is the same signature the queue corruption had, and the assertion added to
-`wait_queue_block_locked()` to catch it does not fire, so it is not obviously the same
-bug. It is worth knowing that `-smp 8` was *clean* before the pipe work, so this is
-something phase 7 introduced and has not yet accounted for. **This is the first thing the
-next session should look at.**
+**Still open: `-smp 8` under TCG, about one run in four.** It is no longer a panic -- the
+corrupting failures are gone, and the queue's occupancy assertion has never fired -- so what
+is left is a hang, not memory damage.  And the scheduler's own invariant check now names it:
+
+    sched: processor 5 chose the task it is already running (69, exectest, state 2);
+           it will not be switched to
+
+So the run queue handed a processor the task that processor is already running, which means
+`prev` reached `rq_push()` without having been removed, or a task was published while it was
+still on a queue.  That is the same shape as the `list_link()` double-insertion panic, except
+that here it is caught by a check rather than by the panic -- so it is *nearly* the same bug,
+and the queue itself is behaving.
+
+**This is the first thing the next session should look at**, and the check that reports it
+is already in place and already firing, which is the useful part: it says which processor and
+which task, which nothing else did.
 
 **Fourth bug, found on the way: the loader filled every page of a segment with a copy of
 the segment's first page.** `hello` only just grew past 4 KiB of text to expose it. Nothing
