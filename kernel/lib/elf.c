@@ -98,8 +98,28 @@ static bool load_segment(page_table_t *tables, const uint8_t *image, uint64_t vi
     uint64_t end = (virt + memsz + page_size - 1) & ~(uint64_t)(page_size - 1);
 
     for (uint64_t page = first; page < end; page += page_size) {
-        /* The part of *this* page this segment covers, and the part of it the file
-         * covers, both as offsets into the page. */
+        /* Where this page sits within the segment, and within the buffer the file's bytes
+         * for the segment are copied from.  Two different distances, and conflating them is
+         * the bug this arithmetic exists to avoid.
+         *
+         * `skip` is how far the page is from the *start of the segment*: zero on the first
+         * page, 4 KiB on the second, and so on.  It is what says where in the file's bytes
+         * this page begins.
+         *
+         * `seg_from` is where the segment begins *within this page*: zero on every page but
+         * the first, and the segment's misalignment on the first.  It is what says where in
+         * this page the bytes go.
+         *
+         * Confusing the two gives a source offset of 0 on every page, so every page of a
+         * segment gets a copy of the segment's *first* page.  One page of text loads
+         * perfectly and two pages load with the second one full of the first one's bytes --
+         * so the program's entry point, which the linker has placed on the second page by
+         * then, executes whatever was at the top of the first.  There is nothing to fault
+         * on: the page is mapped, it is writable, it is full of valid text, and the CPU
+         * starts somewhere nobody asked for.  The observable symptom is a program that
+         * dies on its first instruction with a #GP out of `iretq`, which points at the
+         * privilege transition and not at the loader at all. */
+        uint64_t skip = (page >= virt) ? page - virt : 0;
         uint64_t seg_from = (virt > page) ? virt - page : 0;
         uint64_t seg_to = (virt + memsz < page + page_size) ? virt + memsz - page
                                                              : page_size;
@@ -148,7 +168,7 @@ static bool load_segment(page_table_t *tables, const uint8_t *image, uint64_t vi
          * one image do not overlap, so nothing another segment wrote here can be in it. */
         if (file_to > file_from)
             __builtin_memcpy((uint8_t *)phys_to_virt(phys) + file_from,
-                             image + (file_from - seg_from),
+                             image + skip + (file_from - seg_from),
                              (size_t)(file_to - file_from));
     }
 

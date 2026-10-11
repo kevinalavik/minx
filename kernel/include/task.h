@@ -29,7 +29,6 @@
 #include "percpu.h"
 #include "spinlock.h"
 #include "cpu.h"
-#include "signal.h"
 #include "vmm.h"
 
 /* Task states.  A task is on exactly one list -- a run queue, a sleep list, a
@@ -213,23 +212,6 @@ typedef struct task {
      * counts the ends that are open on each object instead of trusting a number to mean
      * "still open". */
     fd_entry_t   fds[FD_TABLE_ENTRIES];
-
-    /* Signals: what this task has been sent, what it is ignoring, and what it has
-     * installed.  See signal.h for what happens next.
-     *
-     * `sig_trampoline` is a *program* address, not a kernel one: the handler is entered
-     * exactly as `call` would enter it, so its return address has to be somewhere ring 3
-     * can execute, and the only such address a program knows is one it supplied.  A
-     * kernel trampoline would have to live at a ring-3 address, and the kernel is mapped
-     * high where ring 3 cannot reach.
-     *
-     * `sig_pending` is set by another processor with an atomic, hence the volatile pair:
-     * a task can be sent a signal while it is running, and the value it reads at the end
-     * of an interrupt has to be the one that was there. */
-    uint64_t     sig_handler[SIG_MAX];
-    uint64_t     sig_trampoline[SIG_MAX];
-    volatile uint64_t sig_pending;
-    uint64_t     sig_blocked;
 
     /* Whether the context in `saved_rsp` is a ring-3 frame rather than a set of
      * callee-saved registers and a return address.

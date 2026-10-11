@@ -188,6 +188,24 @@ void idt_set_gate(int vector, void *handler, uint8_t ist, uint8_t dpl);
 /* Named `regs` as well as typedef'd, because driver headers take the frame as
  * `struct regs *` and that reads better than the typedef everywhere. */
 typedef struct regs {
+    /* This struct *is* the block the CPU pushed, read a quadword at a time, so the
+     * declaration order is the memory layout and is not free to be tidy.
+     *
+     * The 15 general registers come out in reverse of the order they went in, because a
+     * push moves the stack pointer down: the first one pushed is the highest address.  Then
+     * the vector and the error code, which `isr_common()` pushes after the CPU has already
+     * pushed the rest -- and then the five words `iretq` pops, in the order it pops them.
+     *
+     * That last part is the one worth checking rather than assuming.  Measured, by printing
+     * the five words about to be popped and reading them back: the block is RIP, CS,
+     * RFLAGS, RSP, SS -- RSP before SS, not the other way round, which is how the Intel
+     * manual's list of what `IRET` pops is most easily read.  Swapping them was tried and
+     * breaks every use of `regs->rsp`, because after the swap it reads the selector rather
+     * than the stack pointer, and a signal frame then gets built at 0xffffffffffffffd0.
+     *
+     * The order is only worth stating because it is invisible until something *writes*
+     * these fields: reading `regs->rsp` to print it would have been wrong and merely looked
+     * odd, while assigning to it puts a value in the wrong word for the CPU entirely. */
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t vector;
