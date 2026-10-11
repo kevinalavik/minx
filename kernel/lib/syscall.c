@@ -31,6 +31,7 @@
 
 #include "console.h"
 #include "fd.h"
+#include "programs.h"
 #include "elf.h"
 #include "kmalloc.h"
 #include "kprintf.h"
@@ -456,8 +457,97 @@ void syscall_dispatch(regs_t *regs) {
  * initial stack frame, and onto a run queue.  Everything else -- which terminal, what
  * environment, what arguments -- arrives with the filesystem in phase 8, and this is
  * deliberately the part that will not have to change. */
-task_t *program_load_and_run(const char *name, const void *image, size_t bytes,
-                             uint32_t stack_pages) {
+task_t *program_exec_into(task_t *t, const char *name, const void *image,
+                          size_t bytes, uint32_t stack_pages) {
+    if (t == NULL || t->tables == NULL) {
+        kwarn("exec: %s has no address space to replace", name != NULL ? name : "?");
+        return NULL;
+    }
+
+    /* Built in a scratch task and only swapped in once it is complete.
+     *
+     * Doing it in place is the obvious thing and it is wrong: the load allocates frames,
+     * maps segments and builds a stack, and any of those can fail.  A program that fails
+     * half way through an in-place `exec` has no program, no stack, and no way to report
+     * why -- it is a corpse that used to be a process.  Here, a failure leaves the old
+     * program running and the error reaching the program that asked, which is the only
+     * behaviour that leaves anything useful behind. */
+    task_t *fresh = task_create_user(name, 0, stack_pages, TASK_WEIGHT_DEFAULT);
+
+    if (fresh == NULL) {
+        kwarn("exec: could not build %s", name);
+        return NULL;
+    }
+
+    elf_load_result_t r = elf_load(image, bytes, fresh, stack_pages,
+                                   USER_IMAGE_BASE + sizeof(Elf64_Ehdr));
+
+    if (!r.ok || fresh->user_frame == NULL ||
+        !vmm_translate_in(fresh->tables, r.entry) ||
+        !syscall_user_range_ok_in(fresh->tables, r.entry, 1, false)) {
+        kwarn("exec: %s would not load", name);
+        vmm_address_space_destroy(fresh->tables);
+        kfree(fresh->tables);
+        fresh->tables = NULL;
+        kfree(fresh->stack);
+        fresh->stack = NULL;
+        return NULL;
+    }
+
+    uint64_t *frame = fresh->user_frame;
+
+    frame[0] = r.entry;
+    frame[3] = r.entry_rsp;
+    frame[4] = GDT_USER_DATA_RPL3;
+    fresh->saved_rsp = USER_STACK_TOP - USER_FRAME_BYTES - USER_CTX_BYTES;
+    fresh->started = false;
+
+    /* Swap.  The old address space and the old stack go, and the old user frame is a
+     * kernel alias into the old stack's page -- which has just been unmapped, so nothing
+     * may read it after this point. */
+    page_table_t *old_tables = t->tables;
+    void *old_stack = t->stack;
+
+    t->tables = fresh->tables;
+    t->user_frame = fresh->user_frame;
+    t->user_stack_phys = fresh->user_stack_phys;
+    t->user_stack_pages = fresh->user_stack_pages;
+    t->saved_rsp = fresh->saved_rsp;
+    t->started = false;
+    t->cow = NULL;             /* the old pages are gone; the list described them */
+
+    fresh->tables = NULL;
+    fresh->stack = NULL;
+    kfree(fresh);
+
+    vmm_address_space_destroy(old_tables);
+    kfree(old_tables);
+    kfree(old_stack);
+
+    kprintf("exec: %s is now pid %lu, entry %#lx\n", name, (unsigned long)t->id,
+            (unsigned long)r.entry);
+    return t;
+}
+
+task_t *program_load_and_run(const char *name, uint32_t stack_pages) {
+    const program_image_t *p = program_find(name);
+
+    if (p == NULL) {
+        kwarn("program: no program called %s", name != NULL ? name : "(null)");
+        return NULL;
+    }
+
+    return program_start(p);
+}
+
+/* Create a task and load one registered program into it.  Split out because the loader
+ * body is now reached from two places and neither of them wants the other's half. */
+task_t *program_start(const program_image_t *p) {
+    const char *name = p->name;
+    const void *image = p->image;
+    size_t bytes = p->bytes;
+    uint32_t stack_pages = p->stack_pages;
+
     task_t *t = task_create_user(name, 0, stack_pages, TASK_WEIGHT_DEFAULT);
 
     if (t == NULL) {

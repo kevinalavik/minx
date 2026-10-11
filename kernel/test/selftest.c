@@ -33,7 +33,7 @@
 #include "smp.h"
 #include "string.h"
 #include "timer.h"
-#include "hello_image.h"
+#include "programs.h"
 #include "elf.h"
 #include "syscall.h"
 #include "vmm.h"
@@ -1609,8 +1609,7 @@ static bool wait_until(volatile uint64_t *counter, uint64_t target,
 static void test_user_program(void) {
     syscall_last_errno_reset();
 
-    task_t *t = program_load_and_run("hello", hello_image,
-                                     (size_t)hello_image_len, 8);
+    task_t *t = program_load_and_run("hello", 8);
 
     if (t == NULL) {
         test_fail("phase6-user", "the program would not load");

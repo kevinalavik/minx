@@ -165,8 +165,12 @@ KERNEL_OBJ := $(KERNEL_C:%.c=$(BUILD)/k/%.o) $(KERNEL_S:%.S=$(BUILD)/k/%.o) \
 # The kernel image embeds the ring-3 test program, because there is no filesystem to
 # read it from until phase 8.  Listed as a prerequisite of the one object that uses it so
 # that -j does not compile the test before the header exists.
-HELLO_IMAGE_H := $(GEN_INC)/hello_image.h
-$(BUILD)/k/kernel/test/selftest.o: $(HELLO_IMAGE_H)
+# The ring-3 programs, as C arrays, plus one header that includes them all.  The registry
+# includes only that one header, so adding a program touches no C file.
+USER_IMAGE_H   := $(foreach p,$(USER_PROGS),$(GEN_INC)/$(p)_image.h)
+PROGRAMS_H     := $(GEN_INC)/programs_list.h
+$(BUILD)/k/kernel/lib/programs.o: $(PROGRAMS_H)
+$(BUILD)/k/kernel/test/selftest.o: $(PROGRAMS_H)
 
 LIBC_C   := $(shell find $(LIBC_DIR)/src -name '*.c' 2>/dev/null | sort)
 LIBC_ASM := $(shell find $(LIBC_DIR)/src -name '*.S' 2>/dev/null | sort)
@@ -306,11 +310,21 @@ USER_PROGRAM_CFLAGS := -Wno-unused-function
 USER_PROGRAM_LDFLAGS := -static -nostdlib -z noexecstack \
             -Wl,--build-id=none -Wl,-Ttext=$(USER_TEXT_BASE) -Wl,--fatal-warnings
 
-HELLO_SRC := $(wildcard user/hello/*.c) $(wildcard user/hello/*.S)
+# Every directory under user/ that holds sources is a ring-3 program.  One rule for all
+# of them, so adding a program is a directory and not a Makefile edit -- which is what
+# makes `forktest`, `cowtest` and `sigtest` cheap to have as programs of their own rather
+# than folded into hello until hello's own growth becomes a bug.  It has: hello crossing
+# 4 KiB of text is what exposed the loader's per-page copy error.
+# `notdir` of a path that ends in a slash is the empty string, not the directory's name,
+# so the names come off the .c files directly rather than off the directories.
+USER_PROGS     := $(sort $(notdir $(basename $(wildcard user/*/*.c))))
+USER_PROG_DIRS := $(sort $(dir $(wildcard user/*/*.c)))
+USER_SRC       := $(foreach d,$(USER_PROG_DIRS),$(wildcard $(d)*.c) $(wildcard $(d)*.S))
+USER_HDRS      := $(wildcard user/*/*.h) $(wildcard user/common/*.h)
 
-$(BUILD)/bin/hello: $(HELLO_SRC) user/hello/hello.h
+$(BUILD)/bin/%: $(USER_SRC) $(USER_HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS) -Iuser/hello $(HELLO_SRC) \
+	$(CC) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS) -Iuser/common -Iuser/$* $? \
 	    $(USER_PROGRAM_LDFLAGS) -o $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC' || \
 	    { echo "$@ is not an ET_EXEC ELF; the loader only loads those" >&2; \
@@ -354,10 +368,15 @@ $(INITRD_SRC)/tree.stamp:
 # from one: its image goes into the kernel as an array.  Phase 8 replaces this with a
 # real read of the initrd, and the loader does not change -- only where the bytes come
 # from.
-$(GEN_INC)/hello_image.h: $(BUILD)/bin/hello tools/bin2c.py
+$(GEN_INC)/%_image.h: $(BUILD)/bin/% tools/bin2c.py
 	@mkdir -p $(GEN_INC)
-	$(PYTHON) tools/bin2c.py $< $@ hello_image \
-	    "build/bin/hello, the ring-3 self-test program"
+	$(PYTHON) tools/bin2c.py $< $@ $*_image \
+	    "build/bin/$*, a ring-3 program"
+
+# The registry's list of what exists, generated so the kernel never has to be told.
+$(PROGRAMS_H): $(USER_IMAGE_H) tools/gen-programs-list.sh
+	@mkdir -p $(GEN_INC)
+	@sh tools/gen-programs-list.sh $(GEN_INC) $@ $(USER_PROGS)
 
 $(INITRD): $(INITRD_ROOT)/.stamp
 	@mkdir -p $(dir $@)

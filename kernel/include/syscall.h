@@ -19,6 +19,7 @@
 
 #include "cpu.h"
 #include "pagetables.h"
+#include "programs.h"
 
 /* --- call numbers ------------------------------------------------------- */
 
@@ -153,8 +154,22 @@ struct task;
  * The one call that turns three subsystems into a program.  It is here rather than in
  * the ELF loader because the loader knows how to map an image and knows nothing about
  * tasks, and this is where the two meet. */
-struct task *program_load_and_run(const char *name, const void *image, size_t bytes,
-                                  uint32_t stack_pages);
+struct task *program_load_and_run(const char *name, uint32_t stack_pages);
+
+/* Create a task and start one registered program in it. */
+struct task *program_start(const struct program_image *p);
+
+/* Load `image` into the *existing* task `t`, throwing away whatever address space and
+ * frame it had.  This is `exec`, and it is split from program_load_and_run() because
+ * creating a task and replacing one are different jobs: the first allocates a stack and an
+ * address space, the second frees both and builds new ones, and a program cannot be allowed
+ * to fail half way through and be left with neither.
+ *
+ * On failure the task is untouched -- still running the old program, still able to report
+ * the error -- because the alternative is a process with no program and no way to be told
+ * why. */
+struct task *program_exec_into(struct task *t, const char *name, const void *image,
+                               size_t bytes, uint32_t stack_pages);
 
 /* --- what a program did -------------------------------------------------- */
 
