@@ -162,6 +162,22 @@ KERNEL_S := $(shell find $(KERNEL_DIR) -name '*.S' 2>/dev/null | sort)
 KERNEL_OBJ := $(KERNEL_C:%.c=$(BUILD)/k/%.o) $(KERNEL_S:%.S=$(BUILD)/k/%.o) \
              $(FONT_OBJ)
 
+# Every directory under user/ that holds sources is one ring-3 program, except
+# user/common, which holds the code every program links in and is not itself a program.
+#
+# Defined here rather than beside the program rules further down because `USER_IMAGE_H`
+# below is an immediate assignment: with the list computed after it, the list is empty when
+# the images are asked for, and the build fails on a missing `common_image.h` -- which is
+# the shape of a bug that looks like a missing program.
+# `user/common` holds code every program links in -- print.c and the entry point -- and is
+# not itself a program.  Excluded by name rather than by moving it, because "the directory
+# with no main() in it" is a rule the Makefile cannot check without running the compiler,
+# and a program that is silently not built is worse than one that is not a program.
+USER_COMMON_DIR := user/common
+USER_PROG_DIRS := $(sort $(dir $(wildcard user/*/*.c)))
+USER_PROG_DIRS := $(filter-out $(USER_COMMON_DIR)/,$(USER_PROG_DIRS))
+USER_PROGS     := $(sort $(notdir $(patsubst %/,%,$(USER_PROG_DIRS))))
+
 # The kernel image embeds the ring-3 test program, because there is no filesystem to
 # read it from until phase 8.  Listed as a prerequisite of the one object that uses it so
 # that -j does not compile the test before the header exists.
@@ -319,8 +335,6 @@ USER_PROGRAM_LDFLAGS := -static -nostdlib -z noexecstack \
 # source file gives "main" for every program in the tree that has a main.c, which is all of
 # them; and `notdir` of a path ending in a slash is the empty string, so the trailing slash
 # comes off first.
-USER_PROG_DIRS := $(sort $(dir $(wildcard user/*/*.c)))
-USER_PROGS     := $(sort $(notdir $(patsubst %/,%,$(USER_PROG_DIRS))))
 USER_SRC       := $(foreach d,$(USER_PROG_DIRS),$(wildcard $(d)*.c) $(wildcard $(d)*.S))
 USER_HDRS      := $(wildcard user/*/*.h) $(wildcard user/common/*.h)
 

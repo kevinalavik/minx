@@ -1697,6 +1697,73 @@ static void test_user_program(void) {
     test_pass("phase6-user");
 }
 
+/* Run one registered ring-3 program to completion and report whether it exited 0.
+ *
+ * The helper rather than four copies of the wait loop: the wait is the delicate part --
+ * it has to watch for *this* task's exit rather than any exit, because a program that
+ * forks has children whose exits are not its own report -- and four copies of a delicate
+ * part is three chances to get one of them subtly different. */
+static bool run_program(const char *name, const char *test, const char *what) {
+    syscall_last_errno_reset();
+
+    task_t *t = program_load_and_run(name, 8);
+
+    if (t == NULL) {
+        test_fail(test, "%s", what);
+        return false;
+    }
+
+    for (unsigned waited = 0; waited < 40000; waited++) {
+        if (syscall_last_exit() >= 0 && syscall_exit_pid() == t->id)
+            break;
+        task_sleep_ms(1);
+    }
+
+    if (syscall_last_exit() < 0) {
+        kprintf("%s: task %lu (%s) never exited: state %d, started %d, %lu "
+                "switches, %lu on cpu %u\n", test, (unsigned long)t->id, t->name,
+                t->state, t->started ? 1 : 0, (unsigned long)t->switch_count,
+                (unsigned long)t->ran_on_cpu, t->last_cpu);
+        test_fail(test, "the program never exited: it hung or was never scheduled "
+                  "after 40 s");
+        return false;
+    }
+
+    if (syscall_last_exit() != 0) {
+        kprintf("%s: %s exited %d, which is its own report that a check failed\n",
+                test, name, syscall_last_exit());
+        test_fail(test, "the program's own checks failed");
+        return false;
+    }
+
+    return true;
+}
+
+/* Phase 7's three programs.
+ *
+ * Each one is a directory under user/ and nothing else, and that is the point of them
+ * being separate: `hello` grew past 4 KiB of text while the signal checks were being added
+ * to it, and its own growth was the bug -- the loader was filling every page of a segment
+ * with a copy of the first.  A test that lives inside another program's text is a test
+ * that changes what it is testing. */
+static void test_fork_program(void) {
+    if (!run_program("forktest", "phase7-fork", "forktest would not load"))
+        return;
+    test_pass("phase7-fork");
+}
+
+static void test_cow_program(void) {
+    if (!run_program("cowtest", "phase7-cow", "cowtest would not load"))
+        return;
+    test_pass("phase7-cow");
+}
+
+static void test_signal_program(void) {
+    if (!run_program("sigtest", "phase7-signal", "sigtest would not load"))
+        return;
+    test_pass("phase7-signal");
+}
+
 /* Ring 3 cannot read the kernel, and the check for that is a page-table walk rather
  * than a fault: `syscall_user_range_ok()` is the only thing standing between a
  * program's pointer and the kernel's memory, so it is worth testing on its own rather
@@ -2770,6 +2837,9 @@ void test_run_all(void) {
     test_elf_rejects();
     test_address_spaces();
     test_user_program();
+    test_fork_program();
+    test_cow_program();
+    test_signal_program();
     test_ramfs();
     test_sched_queues();
     test_sched_parallel();

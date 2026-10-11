@@ -27,6 +27,7 @@
 
 #include "pagetables.h"
 #include "percpu.h"
+#include "signal.h"
 #include "spinlock.h"
 #include "cpu.h"
 #include "vmm.h"
@@ -212,6 +213,29 @@ typedef struct task {
      * counts the ends that are open on each object instead of trusting a number to mean
      * "still open". */
     fd_entry_t   fds[FD_TABLE_ENTRIES];
+
+    /* This process's signal state: what is blocked, what is pending, what happens when a
+     * handler returns, and the handlers themselves.
+     *
+     * In the task rather than in a kernel table keyed by pid because a signal's whole
+     * subject is a process: a fork copies these, an exec keeps the blocked set and drops
+     * the handlers (POSIX's rule, and the one that makes `exec` reset a caught ^C rather
+     * than leave the new program running the old one's handler), and a task's death
+     * releases them with the task.
+     *
+     * `sig_saved` is the interrupted context, held whole while a handler runs.  It is a
+     * `regs_t` -- the same structure an interrupt pushes -- because that is exactly what it
+     * is: the frame the processor built, captured before delivery and written back on
+     * return.  Keeping it as a `regs_t` rather than as a hand-built struct is what makes
+     * `sigreturn` a handful of assignments instead of a translation layer with its own
+     * idea of the register order. */
+    uint64_t     sig_blocked;
+    uint64_t     sig_blocked_saved;  /* the blocked set from before a handler started */
+    uint64_t     sig_pending;
+    uint32_t     sig_active;        /* the signal whose handler is running, 0 if none */
+    uint32_t     sig_stopped;       /* set by SIGSTOP/SIGTSTP until SIGCONT */
+    regs_t       sig_saved;
+    sig_slot_t   sig_slots[SIG_HANDLER_SLOTS];
 
     /* Whether the context in `saved_rsp` is a ring-3 frame rather than a set of
      * callee-saved registers and a return address.

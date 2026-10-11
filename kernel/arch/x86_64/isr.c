@@ -14,6 +14,7 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "percpu.h"
+#include "signal.h"
 #include "string.h"
 #include "task.h"
 #include "vectors.h"
@@ -112,7 +113,9 @@ void isr_report_exception(regs_t *regs) {
                 (uint64_t)__kernel_start, (uint64_t)__kernel_end);
 }
 
-void isr_dispatch(regs_t *regs) {
+/* The real dispatcher.  Static, because there is exactly one way in and signal delivery
+ * must happen on the way out of *every* one of them. */
+static void isr_dispatch_inner(regs_t *regs) {
     uint64_t vector = regs->vector;
 
     /* Did this arrive from ring 3?  The scheduler needs to know, and it cannot find out
@@ -174,17 +177,19 @@ void isr_dispatch(regs_t *regs) {
     if (handler != NULL) {
         handler(regs);
 
-        /* Clear the ring-3 marker on the way out, because nothing in this path ever
-         * reaches the scheduler to consume it.
+        /* The ring-3 marker is *not* cleared here, and that is the half of this that is
+         * easy to get wrong.
          *
-         * Only the interrupt paths do: the tick and the IRIs all end in schedule(),
-         * which takes the marker and resets it.  The syscall door ends here, and the
-         * door clears IF for its whole length, so a tick cannot arrive inside it and
-         * there is nothing to preempt -- which means leaving the marker set would hand
-         * the *next* save a ring-3 frame that is not there, and the task would resume
-         * through `iretq` off whatever the handler left on its stack. */
-        percpu_self()->from_user = 0;
-        percpu_self()->user_frame = NULL;
+         * Only the interrupt paths used to clear it, and they did it because they are the
+         * ones that reach the scheduler, which consumes the marker and resets it.  The
+         * syscall door never reaches the scheduler -- it clears IF for its whole length,
+         * so a tick cannot arrive inside it and there is nothing to preempt -- so it left
+         * the marker set, which handed the *next* save a ring-3 frame that was not there.
+         *
+         * Signal delivery needs the marker after the handler has run, because delivering
+         * means patching the frame the tail is about to return through.  So the clearing
+         * moved to isr_dispatch() below, which runs after everything: it is the one place
+         * that sees both the handler and the delivery. */
         return;
     }
 
@@ -197,4 +202,37 @@ void isr_dispatch(regs_t *regs) {
     }
 
     kprintf("[warn] unexpected interrupt vector %lu ignored\n", vector);
+}
+
+/* The one place every return to ring 3 goes through.
+ *
+ * Delivery cannot live in the middle of the dispatcher: there are five exits from it (an
+ * IRQ, the spurious vector, the copy-on-write fixup, a handled vector, and the panic
+ * path), and a signal that is only delivered on one of them is a signal that is delivered
+ * most of the time, which is indistinguishable from one that works.
+ *
+ * So the dispatcher is split rather than duplicated: the existing body runs first, and
+ * then this wrapper looks for a signal to deliver and patches the live frame.  A task that
+ * is switched away from here is switched away with the frame already patched, because the
+ * scheduler saves the frame -- and the frame is what the patch is in.
+ *
+ * `percpu_self()->from_user` is read and then cleared here, for the same reason the
+ * scheduler consumes it: it is "the outermost interrupted context was ring 3", and it is
+ * the only record of that which is still true by the time the tail runs. */
+void isr_dispatch(regs_t *regs) {
+    isr_dispatch_inner(regs);
+
+    /* Read *after* the dispatcher, not before: it is the dispatcher that records that the
+     * interrupt arrived from ring 3, and reading it earlier is reading the last
+     * interrupt's answer to this one's question.  On a syscall path -- which is where
+     * signals are delivered from -- that is always zero, and no signal would ever arrive.
+     *
+     * Cleared afterwards for the reason the handler path no longer clears it: this is the
+     * last instruction before either the scheduler consumes the marker or the tail's
+     * `iretq` returns to ring 3 without it. */
+    if (percpu_self()->from_user != 0)
+        signal_deliver_on_return_to_user(regs);
+
+    percpu_self()->from_user = 0;
+    percpu_self()->user_frame = NULL;
 }

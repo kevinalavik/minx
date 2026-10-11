@@ -44,6 +44,16 @@ enum {
     SYS_PIPE   = 10,
     SYS_EXEC   = 11,
 
+    /* Signals.  Grouped together and numbered in a run, because they are the calls that
+     * make a *process* -- rather than a thread or a file -- exist: everything above this
+     * line could be done by a kernel thread with a descriptor table. */
+    SYS_KILL         = 12,
+    SYS_SIGACTION    = 13,
+    SYS_SIGRETURN    = 14,
+    SYS_SIGPROCMASK  = 15,
+    SYS_SIGPENDING   = 16,
+    SYS_PAUSE        = 17,
+
     SYS_MAX = 32,
 };
 
@@ -53,6 +63,7 @@ enum {
  * from every call number and from every plausible successful result. */
 #define EPERM  1
 #define ENOENT 2
+#define ESRCH   3
 #define EINTR  4
 #define EIO    5
 #define EBADF  9
@@ -121,6 +132,12 @@ void syscall_dispatch(regs_t *regs);
 /* The name of a call, for a message.  "?" for a number nothing is installed for. */
 const char *syscall_name(unsigned nr);
 
+/* The i'th integer argument of the call this frame carries, in the System V order:
+ * rdi, rsi, rdx, rcx, r8, r9.  Exposed because a handler defined in another file is still
+ * a handler, and having each one open-code the same six-way switch would put six copies of
+ * the same mistake in the tree. */
+uint64_t syscall_arg(regs_t *regs, unsigned n);
+
 /* --- copying between the boundary ---------------------------------------- */
 
 /* True when every page the range covers is mapped, user-accessible, and -- for a
@@ -138,6 +155,12 @@ bool syscall_user_range_ok(uint64_t addr, size_t bytes, bool write);
  * the ELF loader, filling in a program that has not started. */
 bool syscall_user_range_ok_in(page_table_t *tables, uint64_t addr, size_t bytes,
                               bool write);
+
+/* Resolve any copy-on-write page in a range the caller is about to write to.
+ *
+ * Call this before syscall_user_range_ok() on a *write*.  A page a fork has read-only is
+ * about to be copied, not refused, and the range check cannot tell the two apart. */
+void syscall_prepare_write(uint64_t addr, size_t bytes);
 
 /* Copy out of / into user memory.  These are the only ways a program-supplied address
  * should ever be dereferenced, and both check before touching. */

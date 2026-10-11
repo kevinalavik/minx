@@ -27,6 +27,25 @@ tmp="$out.tmp"
         echo "#include \"${p}_image.h\""
     done
     echo
+    echo "/* The registry's table, generated here rather than written by hand in"
+    echo " * kernel/lib/programs.c."
+    echo " *"
+    echo " * A program's name is the directory it lives in, which is also its file name, so"
+    echo " * there is exactly one place a program is named -- and the one thing that has to be"
+    echo " * true of the table is that it mentions every program that exists.  Hand-written, it"
+    echo " * is a list that can be out of date, and the symptom is a program that the Makefile"
+    echo " * built, put in the initrd and nothing can start."
+    echo " *"
+    echo " * `stack_pages` is a property of the program rather than of whoever starts it: a"
+    echo " * program whose stack is too small for its own recursion should fail the same way"
+    echo " * whoever runs it.  8 pages (32 KiB) is enough for every program here and small"
+    echo " * enough that a stress test forking in the hundreds is bounded by something. */"
+    echo "#define MINX_PROGRAM_TABLE \\"
+    first=1
+    for p in "$@"; do
+        echo "    { \"$p\", ${p}_image, ${p}_image_len, 8, \"$p\" }, \\"
+    done
+    echo
     echo "#endif /* MINX_PROGRAMS_LIST_H */"
 } > "$tmp"
 

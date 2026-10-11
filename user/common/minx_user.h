@@ -23,6 +23,45 @@
 #define SYS_WAIT    9
 #define SYS_PIPE    10
 #define SYS_EXEC    11
+#define SYS_KILL         12
+#define SYS_SIGACTION    13
+#define SYS_SIGRETURN    14
+#define SYS_SIGPROCMASK  15
+#define SYS_SIGPENDING   16
+#define SYS_PAUSE        17
+
+/* Signals.  The same numbers as kernel/include/signal.h, which is the list the names mean
+ * everywhere: a program that says SIGINT means ^C. */
+#define SIGHUP   1
+#define SIGINT   2
+#define SIGQUIT  3
+#define SIGILL   4
+#define SIGTRAP  5
+#define SIGABRT  6
+#define SIGBUS   7
+#define SIGFPE   8
+#define SIGKILL  9
+#define SIGUSR1  10
+#define SIGSEGV  11
+#define SIGUSR2  12
+#define SIGPIPE  13
+#define SIGALRM  14
+#define SIGTERM  15
+#define SIGCHLD  17
+#define SIGCONT  18
+#define SIGSTOP  19
+#define SIGTSTP  20
+
+#define SIG_DFL ((unsigned long)0)
+#define SIG_IGN ((unsigned long)1)
+
+/* sigaction's argument.  Three quadwords, in this order; docs/SYSCALLS.md has the same
+ * table and the kernel copies it in and out whole. */
+struct sigaction {
+    unsigned long handler;
+    unsigned long flags;
+    unsigned long mask;
+};
 
 /* Errors, as the negative return values the kernel uses. */
 #define EBADF   9
@@ -147,6 +186,50 @@ static inline long minx_fork(void) {
  * so the kernel checks it before writing to it. */
 static inline long minx_wait(int *status) {
     return minx_syscall2(SYS_WAIT, (long)(uintptr_t)status, 0);
+}
+
+/* Send `signum` to a process.  `pid` is a process identifier; 0 means this process and
+ * nothing else.  Returns 0, or -errno. */
+static inline long minx_kill(long pid, int signum) {
+    return minx_syscall2(SYS_KILL, pid, signum);
+}
+
+/* Install `act` for `signum`, and put whatever was there into `old` when `old` is not
+ * NULL.  Returns 0, or -errno. */
+static inline long minx_sigaction(int signum, const struct sigaction *act,
+                                 struct sigaction *old) {
+    return minx_syscall3(SYS_SIGACTION, signum, (long)(uintptr_t)act,
+                         (long)(uintptr_t)old);
+}
+
+/* Change what is blocked: `how` is 0 to add, 1 to remove, 2 to replace.  `old_set` may be
+ * NULL.  Returns 0, or -errno. */
+static inline long minx_sigprocmask(int how, const unsigned long *set,
+                                    unsigned long *old_set) {
+    return minx_syscall3(SYS_SIGPROCMASK, how, (long)(uintptr_t)set,
+                         (long)(uintptr_t)old_set);
+}
+
+/* The signals that are pending and not blocked, written into `set`.  Returns 0, or
+ * -errno. */
+static inline long minx_sigpending(unsigned long *set) {
+    return minx_syscall1(SYS_SIGPENDING, (long)(uintptr_t)set);
+}
+
+/* Block until something is delivered.  Returns 0.  There is no error return and there is
+ * no way to tell which signal woke it, which is exactly why `pause` exists: the caller
+ * looks at its own state afterwards. */
+static inline long minx_pause(void) {
+    return minx_syscall1(SYS_PAUSE, 0);
+}
+
+/* Return from a signal handler.
+ *
+ * A handler's `return` goes to a trampoline the kernel put on its stack, which calls this.
+ * Nothing in a program ever calls it directly, and the kernel refuses it when no handler is
+ * running -- there would be nothing to return to. */
+static inline long minx_sigreturn(void) {
+    return minx_syscall1(SYS_SIGRETURN, 0);
 }
 
 /* strlen, because a freestanding program has no libc and the loader's job is not to

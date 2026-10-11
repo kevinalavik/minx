@@ -25,6 +25,7 @@
 #include "percpu.h"
 #include "pmm.h"
 #include "ramfs.h"
+#include "signal.h"
 #include "power.h"
 #include "serial.h"
 #include "smp.h"
@@ -661,6 +662,12 @@ static void kmain_stage2(void) {
     if (syscall_init() != 0)
         kwarn("syscalls: the syscall gate could not be installed; no program "
               "will be able to enter the kernel");
+
+    /* The signal trampoline's page, after the direct map is live (it is allocated out of
+     * it) and before any task can be given one.  Every user address space maps the same
+     * page, so this is the only allocation of its kind. */
+    if (signal_init() != 0)
+        kwarn("signals: no trampoline page; a handler could not return");
 
     /* Interrupts on, before anything that can wait for one.
      *

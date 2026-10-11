@@ -16,6 +16,7 @@
  * wins the transition from TASK_RUNNABLE to TASK_RUNNING, and the loser simply
  * gives the task back.
  */
+#include "signal.h"
 #include "task.h"
 
 #include "apic.h"
@@ -555,6 +556,20 @@ task_t *task_create_user(const char *name, uint64_t entry, uint32_t stack_pages,
 
     t->tables = tables;
     t->is_user = true;
+
+    /* The signal-return trampoline, in every user address space.
+     *
+     * It has to be mapped here rather than on first use because the first use is *inside*
+     * delivery: a handler returning to an unmapped page is a #PF on the instruction after
+     * the handler, with the handler's own work already done and nothing in the report
+     * pointing at the signal.  Read-only and shared, so it is one copy in the machine. */
+    if (signal_map_trampoline(tables) != 0) {
+        kwarn("task: %s could not be given the signal trampoline", name);
+        vmm_address_space_destroy(tables);
+        kfree(tables);
+        kfree(t);
+        return NULL;
+    }
 
     /* The stack: whole pages, allocated, zeroed, mapped user-writable at the top of
      * the user address space.  Mapped only in *this* address space -- a kernel thread
@@ -1893,6 +1908,20 @@ task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight
     if (parent_fds != NULL)
         fd_table_copy(t->fds, parent_fds);
 
+    /* The signal dispositions and the blocked set are inherited; nothing *pending* is.
+     *
+     * That is POSIX's rule and it is the right one: a child does not inherit a signal that
+     * its parent had not yet been told about, because it was not its signal yet.  It also
+     * removes a real hazard -- a SIGCHLD the parent has been sent but not delivered is
+     * still pending in the parent, and copying it would give the child a `wait` that
+     * returns for a child that is not its own. */
+    task_t *parent = sched_current();
+
+    if (parent != NULL) {
+        memcpy(t->sig_slots, parent->sig_slots, sizeof(t->sig_slots));
+        t->sig_blocked = parent->sig_blocked;
+    }
+
     /* Registered rather than given an identifier here: `task_register()` is what puts a
      * task on the all-tasks list and assigns the id, and a task that has an id but is not
      * on that list is invisible to everything that walks it -- `ps`, and the test that
@@ -2014,6 +2043,19 @@ void task_exit_with(int status) {
     task_t *t = sched_current();
 
     if (t != NULL) {
+        /* Tell the parent, here, rather than leaving it to whichever way this task
+         * happened to die.
+         *
+         * A parent blocked in `wait` is off the run queue with nothing to bring it back,
+         * so a child that exits without waking it stops the whole process tree at the
+         * first child -- and reports nothing, because nothing has gone wrong: the parent
+         * is asleep waiting for an event that already happened.  `sys_exit` does this too,
+         * which is harmless because waking a task that is not blocked does nothing; it is
+         * here because a task can also die without ever calling `exit` at all -- killed by
+         * a signal whose default action is to terminate, which is what a `sh` running
+         * `sleep 100 &` and then being told to stop does to that process. */
+        task_t *parent = t->parent;
+
         t->exit_code = status;
 
         /* Publish the status before the flag that says it is there.  A parent on another
@@ -2021,6 +2063,9 @@ void task_exit_with(int status) {
          * "finished" with the status the task has not written yet -- which is a value from
          * whatever ran on that task's slot last. */
         __atomic_store_n(&t->exited, 1, __ATOMIC_RELEASE);
+
+        if (parent != NULL)
+            task_unblock(parent);
     }
 
     task_exit();

@@ -27,6 +27,7 @@
  *    room behind it does not, which is honest and which a program can act on.  What it
  *    must never do is block with interrupts disabled, because that stops the machine.
  */
+#include "signal.h"
 #include "syscall.h"
 
 #include "console.h"
@@ -57,9 +58,17 @@ const char *syscall_name(unsigned nr) {
         [SYS_EXIT]   = "exit",
         [SYS_BRK]    = "brk",
         [SYS_WRITEV] = "writev",
-    [SYS_PIPE]   = "pipe",
-    [SYS_EXEC]   = "exec",
         [SYS_GETPID] = "getpid",
+        [SYS_FORK]   = "fork",
+        [SYS_WAIT]   = "wait",
+        [SYS_PIPE]   = "pipe",
+        [SYS_EXEC]   = "exec",
+        [SYS_KILL]         = "kill",
+        [SYS_SIGACTION]    = "sigaction",
+        [SYS_SIGRETURN]    = "sigreturn",
+        [SYS_SIGPROCMASK]  = "sigprocmask",
+        [SYS_SIGPENDING]   = "sigpending",
+        [SYS_PAUSE]        = "pause",
     };
 
     return (nr < SYS_MAX && names[nr] != NULL) ? names[nr] : "?";
@@ -106,7 +115,7 @@ uint64_t syscall_unknown_count(void) { return unknown_calls; }
  * because then the answer depends on what the program happened to leave in rcx.  So
  * each handler reads exactly the arguments its own call defines, and this only exists
  * to make those six lines one line each. */
-static uint64_t arg(regs_t *regs, unsigned n) {
+uint64_t syscall_arg(regs_t *regs, unsigned n) {
     switch (n) {
     case 0:  return regs->rdi;
     case 1:  return regs->rsi;
@@ -116,6 +125,11 @@ static uint64_t arg(regs_t *regs, unsigned n) {
     case 5:  return regs->r9;
     default: return 0;
     }
+}
+
+/* Every handler in this file and in signal.c reads its arguments through this. */
+static inline uint64_t arg(regs_t *regs, unsigned n) {
+    return syscall_arg(regs, n);
 }
 
 /* --- checking a program's pointer ---------------------------------------- */
@@ -169,9 +183,59 @@ bool syscall_copy_from_user(void *dst, uint64_t src, size_t bytes) {
     return true;
 }
 
+/* Make every page of a write range writable in the *calling task's* address space,
+ * resolving any copy-on-write page it finds on the way.
+ *
+ * This exists because `fork` takes write permission away from *both* sides -- that is what
+ * makes the pair copy-on-write rather than a child protected and a parent writing straight
+ * through to the shared frame -- and the only thing that normally gives the permission back
+ * is the processor taking a write fault.
+ *
+ * Which does not happen here.  `syscall_user_range_ok_in()` walks the range first, on
+ * purpose, and a page that is read-only *because it is about to be copied* is
+ * indistinguishable in that walk from a page that is read-only because the program was not
+ * allowed to write it.  So the check said no and the copy never happened.
+ *
+ * The symptom was not a crash and not a wrong answer, which is what made it take this long:
+ * a process that had forked could no longer `read` into a buffer on its own stack, because
+ * the kernel refused the address.  `fork` followed by a `wait` that reports a status through
+ * a pointer -- the most ordinary thing a process does -- failed with EFAULT, and EFAULT is a
+ * statement about the pointer, so the report pointed at the caller instead of at `fork`.
+ *
+ * Resolving it here rather than faulting is the same choice the rest of this file makes:
+ * a walk that knows what it is looking at, rather than a fault the handler has to recognise
+ * as one it caused on purpose.  A page that is read-only for any *other* reason is left
+ * alone, and the check afterwards refuses it exactly as before.
+ *
+ * Returns nothing: whether the range is writable is still the range check's answer, and
+ * this only removes the one reason that answer would be wrong. */
+void syscall_prepare_write(uint64_t addr, size_t bytes) {
+    task_t *t = sched_current();
+    page_table_t *tables = vmm_tables();
+
+    if (t == NULL || t->cow == NULL || t->cow->count == 0 || tables == NULL)
+        return;
+
+    if (!vmm_is_user_addr(addr) || (bytes != 0 && addr + bytes < addr))
+        return;
+
+    for (uint64_t off = 0; off < bytes; off += page_size) {
+        pte_t leaf = pt_get(tables, addr + off);
+
+        if (!pte_present(leaf) || !pte_user(leaf) || pte_writable(leaf))
+            continue;
+
+        /* Not ours to fix: the page is read-only for a reason of its own, and the range
+         * check that follows will say so with the right error. */
+        (void)vmm_cow_fault(tables, t->cow, addr + off);
+    }
+}
+
 bool syscall_copy_to_user(uint64_t dst, const void *src, size_t bytes) {
     if (bytes == 0)
         return true;
+
+    syscall_prepare_write(dst, bytes);
 
     if (!syscall_user_range_ok(dst, bytes, true))
         return false;
@@ -288,7 +352,14 @@ long sys_read(regs_t *regs) {
 
     /* The whole range is checked before anything is copied, for the same reason `write`
      * checks it: one unmapped byte in the middle must not produce a partial read whose
-     * length depends on where the hole was. */
+     * length depends on where the hole was.
+     *
+     * The destination is a *write* into this process's own address space, so any page a
+     * fork has left read-only for copying has to be resolved first -- see
+     * syscall_prepare_write().  Without it every read a process makes after a fork fails
+     * with EFAULT on a perfectly good buffer, which is what this did. */
+    syscall_prepare_write(buf, count);
+
     if (!syscall_user_range_ok(buf, count, true))
         errno_return(EFAULT);
 
@@ -596,6 +667,18 @@ task_t *program_exec_into(task_t *t, const char *name, const void *image,
     page_table_t *old_tables = t->tables;
     void *scratch_stack = fresh->stack;
 
+    /* The new program's signals start clean: caught signals go back to their default
+     * disposition and anything pending is dropped, while the *blocked* set is kept.  That
+     * asymmetry is deliberate and is POSIX's.  A new program must not run the old one's
+     * handler -- the handler's address is a user address in an address space that no longer
+     * exists, so leaving one installed would be a #PF on the first delivery to it.  The
+     * blocked set, on the other hand, is the process's own choice about what it wants to
+     * see, and `exec` is not a signal that anything has gone wrong. */
+    memset(t->sig_slots, 0, sizeof(t->sig_slots));
+    t->sig_pending = 0;
+    t->sig_active = 0;
+    t->sig_stopped = 0;
+
     t->tables = fresh->tables;
     t->user_frame = fresh->user_frame;
     t->user_stack_phys = fresh->user_stack_phys;
@@ -857,6 +940,12 @@ int syscall_init(void) {
     handlers[SYS_GETPID] = sys_getpid;
     handlers[SYS_FORK] = sys_fork;
     handlers[SYS_WAIT] = sys_wait;
+    handlers[SYS_KILL] = sys_kill;
+    handlers[SYS_SIGACTION] = sys_sigaction;
+    handlers[SYS_SIGRETURN] = sys_sigreturn;
+    handlers[SYS_SIGPROCMASK] = sys_sigprocmask;
+    handlers[SYS_SIGPENDING] = sys_sigpending;
+    handlers[SYS_PAUSE] = sys_pause;
 
     /* DPL 3: the gate has to be reachable from ring 3, which is the entire point.  A
      * kernel gate is DPL 0, and a user `int $0x80` against one raises #GP -- which is

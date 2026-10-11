@@ -11,22 +11,11 @@
 
 /* `stack_pages` is 8, and it is in the table rather than at each call site because it is a
  * property of the program, not of whoever started it: a program whose stack is too small
- * for its own recursion should fail the same way whoever runs it. */
+ * for its own recursion should fail the same way whoever runs it.  The table itself is
+ * generated (tools/gen-programs-list.sh), so adding a program is a directory under user/
+ * and nothing else -- see programs.h for why that matters. */
 static const program_image_t programs[] = {
-    {
-        "exectest",
-        exectest_image,
-        exectest_image_len,
-        4,
-        "exectest, which replaces itself with hello",
-    },
-    {
-        "hello",
-        hello_image,
-        hello_image_len,
-        8,
-        "hello, the ring-3 self-test program",
-    },
+    MINX_PROGRAM_TABLE
 };
 
 /* Read as a count rather than kept beside the table, so adding an entry cannot leave the
