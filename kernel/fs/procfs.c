@@ -185,9 +185,18 @@ size_t procfs_mounts(char *buf, size_t len) {
     out_t o = { buf, len, 0, false };
 
     for (unsigned i = 0; i < vfs_mount_count(); i++) {
+        /* "<path> <source> <type> rw 0 0", the shape `mount` and `df` parse by splitting
+         * on spaces.
+         *
+         * The space between the source and the type was missing, which made every line
+         * read `/ minxramfs rw 0 0`: a consumer saw "minxramfs" as the source and "rw" as
+         * the type.  It is worth writing down because it is invisible in a string
+         * comparison and obvious in a field parse -- the test that found it compares
+         * fields, and a test that only looked for "/dev" would have passed. */
         out_str(&o, vfs_mount_path(i));
         out_str(&o, " ");
         out_str(&o, "minx");
+        out_str(&o, " ");
         out_str(&o, (vfs_mount_kind(i) == FS_DEVFS) ? "devfs"
                   : (vfs_mount_kind(i) == FS_PROCFS) ? "procfs" : "ramfs");
         out_str(&o, " rw 0 0\n");
@@ -383,6 +392,10 @@ long procfs_read(const vpath_t *p, uint64_t proc_id, void *buf, size_t len,
     return (long)take;
 }
 
+/* Defined below, and needed here: `procfs_init()` is what catches up with the tasks that
+ * were created before `/proc` existed, and it sits above them. */
+static void procfs_note_task_locked(const struct task *t);
+
 int procfs_init(void) {
     if (ready)
         return 0;
@@ -417,6 +430,33 @@ int procfs_init(void) {
 
 mounted:
     ready = true;
+
+    /* Catch up with the tasks that already exist.
+     *
+     * `procfs_note_task()` has nothing to do until `/proc` is a directory, and every task
+     * created before this point called it and was dropped on the floor.  That is not a
+     * small gap: the boot task, the idle tasks, the loader's scratch task and `/init` are
+     * all created before procfs comes up, so `/proc` listed no processes at all -- five
+     * files and no directories -- and a program that asked "which processes are there?"
+     * was told there were none, on a machine running four.
+     *
+     * Walking the task table once at the end of init is the whole of the fix, and it is
+     * also the reason the ordering is not a problem: a task created *after* this point is
+     * noted by its own `task_create_user()`, and a task created before it is noted here.
+     * Every task is accounted for by exactly one of the two. */
+    {
+        unsigned backfilled = 0;
+        task_t *t;
+
+        for (t = task_first(); t != NULL; t = task_next(t)) {
+            procfs_note_task_locked(t);
+            backfilled++;
+        }
+
+        if (backfilled != 0)
+            kprintf("procfs: %u task(s) already running\n", backfilled);
+    }
+
     kprintf("procfs: %u file(s) under /proc\n", (unsigned)array_len(procfiles));
     return 0;
 }
@@ -430,6 +470,15 @@ mounted:
  * a list of things that died last week.  The node's data is freed when the last name goes,
  * which is what `ramfs_rmdir` already arranges. */
 void procfs_note_task(const struct task *t) {
+    if (t == NULL || proc_root == 0)
+        return;
+
+    procfs_note_task_locked(t);
+}
+
+/* The work, without the "is there anything to do yet" question -- which `procfs_init()`
+ * has already answered by the time it catches up. */
+static void procfs_note_task_locked(const struct task *t) {
     if (t == NULL || proc_root == 0)
         return;
 
