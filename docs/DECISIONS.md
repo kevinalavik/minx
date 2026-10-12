@@ -1026,3 +1026,22 @@ A pipe is freed with its last end, and read ends and write ends are counted sepa
 `fork` counts too: the child holds a descriptor for the same pipe, so closing its inherited
 copy of the read end -- which every program does, or it could never see end of file -- must
 not make the parent's next write fail with `EPIPE` against a reader that is right there.
+
+## `user/hello/hello.h` is kept, and nothing includes it
+
+**Date: 2026-10-12**
+
+An earlier commit deleted `user/hello/hello.h` when the user-visible ABI moved out of it and
+into `user/common/minx_user.h`, shared by every program. That is a removal of committed code,
+which AGENTS.md forbids, so the file is back -- verbatim, with a banner saying it is
+deprecated, and with its include guard renamed so that it cannot collide with the real
+header if anything ever pulled in both.
+
+It is restored rather than deleted because the rule exists for a reason, and the reason is
+visible in this file's own contents: that header's call numbers were a hand-written copy of
+the kernel's enum, and the copy is exactly what went stale when the enum was renumbered and
+`user/common/start.S` kept the old `SYS_EXIT`. The interesting part was never the working
+code, which was replaced properly; it was the failure, and it is worth being able to read.
+
+Nothing builds against it. The numbers in it are years out of date and a program that
+included it would get an exit syscall that is now `lseek`.
