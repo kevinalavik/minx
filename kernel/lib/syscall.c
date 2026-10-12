@@ -857,6 +857,17 @@ task_t *program_exec_into(task_t *t, const char *name, const void *image,
     fresh->tables = NULL;
     fresh->stack = NULL;
     kfree(scratch_stack);
+
+    /* Off the all-tasks list and out of `/proc` before the memory goes.
+     *
+     * `task_create_user()` registered `fresh` -- it is a task like any other as far as
+     * `task_create()` is concerned -- so freeing it without taking it off leaves the list
+     * pointing at freed memory.  Every walk of that list then follows the dangling entry:
+     * `ps` prints whatever is there now, `task_by_pid()` hands out a freed pointer, and
+     * `/proc/<pid>/status` reads a `parent` field out of a recycled block.  That last one
+     * is how this was found, as a page fault inside procfs reading a task that had been
+     * freed an `exec` earlier. */
+    task_unregister(fresh);
     kfree(fresh);
 
     /* Load the new address space *before* returning, because this call is going to return

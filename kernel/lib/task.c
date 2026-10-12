@@ -24,6 +24,8 @@
 #include "cpu.h"
 #include "delay.h"
 #include "fd.h"
+#include "procfs.h"
+#include "ramfs.h"
 #include "io.h"
 #include "kmalloc.h"
 #include "kprintf.h"
@@ -434,6 +436,21 @@ static task_t *task_alloc(void) {
         t->fds[i].closable = false;
     }
 
+    /* Root, and the root of the filesystem as a node.
+     *
+     * Both are set here rather than by whoever creates the task, because a task that
+     * reached the point of being switched into without them has a current directory of
+     * nothing, and every relative path it uses fails -- which reads as "the kernel has no
+     * files" rather than as "the task has no directory". */
+    strlcpy(t->cwd, "/", sizeof(t->cwd));
+    t->cwd_ino = ramfs_root();
+    t->cwd_mount = 0;
+    t->uid = 0;
+    t->gid = 0;
+    t->umask = 0022;
+    t->session = 0;
+    t->pgrp = 0;
+
     return t;
 }
 
@@ -454,6 +471,24 @@ static void task_register(task_t *t) {
     all_tasks.count++;
 
     spin_unlock_irqrestore(&all_tasks.lock, flags);
+
+    /* The `/proc` entry, here and not at the call sites.
+     *
+     * This is the one point where a task stops being anonymous: it has an identifier and
+     * it is on the list everything walks.  `ps` starts listing it here, so `/proc` has to
+     * as well, or the two disagree about which processes exist -- and `ps` reading a
+     * process that `/proc` does not have is a program that cannot report anything about
+     * it.
+     *
+     * It was at the call sites instead, in `task_create_forked()` only, and that is not a
+     * narrower rule than it sounds: it meant *children* had a directory and programs the
+     * kernel started did not.  `fstest` asked for `/proc/self/status` and was told there
+     * was no such file, on a machine with four processors and fifty-odd processes in it.
+     *
+     * After the all-tasks lock, deliberately: `procfs_note_task()` allocates, and the
+     * order that is safe is the one where a task is fully published before anything more
+     * expensive is done on its behalf. */
+    procfs_note_task(t);
 }
 
 /* Lay a fresh kernel stack out for task_switch's pops, and for the `ret` at the
@@ -516,6 +551,55 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg,
 
     task_register(t);
     return t;
+}
+
+/* Take a task off the all-tasks list.
+ *
+ * Only for a task that is being *thrown away*, not one that has finished: a task that has
+ * exited stays on the list, because a parent blocked in `wait` is looking for it there and
+ * `ps` wants to show it.  This is for the other case, where the task was built only to
+ * have something built in and is about to be freed.
+ *
+ * The pairing is the point.  `task_register()` puts a task on this list and gives it an
+ * identifier; anything that frees a `task_t` has to call this first, because a list entry
+ * pointing at freed memory is a dangling pointer that every walk of the list -- `ps`,
+ * `wait`, `task_by_pid()`, `/proc/<pid>` -- follows into whatever the allocator handed
+ * that block out as next.  `program_exec_into()` built a scratch task to load a program
+ * into and freed it without this, and the symptom was `/proc` reporting a task whose
+ * fields were whatever a later allocation had put there. */
+void task_unregister(task_t *t) {
+    if (t == NULL)
+        return;
+
+    uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+    task_t **linkp = &all_tasks.head;
+
+    while (*linkp != NULL && *linkp != t)
+        linkp = &(*linkp)->all_next;
+
+    if (*linkp == t) {
+        *linkp = t->all_next;
+        all_tasks.count--;
+
+        /* The tail moves too, and to the task *before* the one removed -- which is not
+         * the one that followed it.  Getting this wrong leaves `all_tasks.tail` pointing
+         * at the task that just left, and every later registration walks the list again
+         * from the head anyway, so the list would look right while the tail was not. */
+        if (all_tasks.tail == t) {
+            task_t *last = NULL;
+
+            for (task_t *w = all_tasks.head; w != NULL; w = w->all_next)
+                last = w;
+            all_tasks.tail = last;
+        }
+    }
+
+    t->all_next = NULL;
+    spin_unlock_irqrestore(&all_tasks.lock, flags);
+
+    /* And out of `/proc`, which the list alone does not cover.  A `/proc` entry naming a
+     * task that no longer exists is a program that reads a name and gets nothing. */
+    procfs_forget_task(t);
 }
 
 /* Lay out a user task's stack with a return frame that enters ring 3.
@@ -778,6 +862,50 @@ task_t *task_by_index(unsigned i) {
     ticket_unlock(&all_tasks.lock);
 
     return t;
+}
+
+/* The task with this identifier.
+ *
+ * A linear walk rather than a table keyed by pid, for the same reason `task_by_index` is
+ * one: the list is permanent and a task is never removed from it, so a table would have to
+ * be a second structure kept in step with the first, and the thing that goes wrong when two
+ * structures are in step by hand is that they stop being.  A process table with a few
+ * hundred entries is a walk a `kill` does once. */
+task_t *task_by_pid(uint64_t pid) {
+    task_t *found = NULL;
+    uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+
+    for (task_t *t = all_tasks.head; t != NULL; t = t->all_next) {
+        if (t->id == pid) {
+            found = t;
+            break;
+        }
+    }
+
+    spin_unlock_irqrestore(&all_tasks.lock, flags);
+    return found;
+}
+
+/* The first task in creation order, and the one after it.  Together they are a walk that
+ * needs no index and no count, so `ps` and the tests cannot be surprised by a task being
+ * created between the two halves of an index-based walk. */
+task_t *task_first(void) {
+    uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+    task_t *t = all_tasks.head;
+
+    spin_unlock_irqrestore(&all_tasks.lock, flags);
+    return t;
+}
+
+task_t *task_next(task_t *t) {
+    if (t == NULL)
+        return NULL;
+
+    uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+    task_t *next = t->all_next;
+
+    spin_unlock_irqrestore(&all_tasks.lock, flags);
+    return next;
 }
 
 /* A task's entry point, reached for the first time.  When it returns, the task is
@@ -1371,8 +1499,16 @@ void task_exit(void) {
     unsigned index = percpu_self_index();
     task_t *t = sched_current();
 
-    if (t != NULL)
+    if (t != NULL) {
         __atomic_store_n(&t->state, TASK_DEAD, __ATOMIC_RELEASE);
+        /* And /proc loses it.  A /proc that keeps an entry for every process the machine
+         * has ever run is a filesystem that fills up, and a shell that lists it gets a
+         * list of things that died last week -- so the entry goes when the process does.
+         * After the `exited` flag, because a parent that reads status and finds the
+         * directory already gone should see the status it was promised, not a missing
+         * file. */
+        procfs_forget_task(t);
+    }
 
     /* Nothing will ever run this processor again unless it has an idle task, and
      * an idle task that exits would leave the processor with nothing. */
@@ -1932,6 +2068,13 @@ task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight
     t->is_user = true;
     t->weight = weight;
     t->state = TASK_NEW;
+
+    /* Its own group and session.  Its `/proc` entry was made by `task_register()`, which
+     * is where its identifier came from and where every other list that names it is built;
+     * doing it here as well would have meant a second rule about when a process exists,
+     * and the two would not have agreed. */
+    t->pgrp = (uint32_t)t->id;
+    t->session = (uint32_t)t->id;
 
     uint8_t *stack = (uint8_t *)kmalloc(TASK_STACK_SIZE);
 

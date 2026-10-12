@@ -28,9 +28,16 @@
 #include "pagetables.h"
 #include "percpu.h"
 #include "signal.h"
+#include "tty.h"
+#include "types.h"
 #include "spinlock.h"
 #include "cpu.h"
 #include "vmm.h"
+
+/* How long a task's current-directory path is.  Sized to hold the longest mount point plus
+ * one component, which is the longest thing a relative path can grow into before
+ * normalisation. */
+#define VFS_MOUNT_PATH_PLACEHOLDER_ 256
 
 /* Task states.  A task is on exactly one list -- a run queue, a sleep list, a
  * wait queue, or nowhere -- and its state is what says which. */
@@ -58,10 +65,18 @@ enum {
  * `wait_queue_t` from this file, so the header that defines them cannot include fd.h
  * without going in a circle.  fd.h includes this one and is what programs of the kernel
  * use. */
+/* An open file.  Forward-declared here because task_t holds descriptors that can name one,
+ * and because fd.h needs the name; the structure itself lives in vfs.h, which is the only
+ * file that has to know what a file is.  A duplicate typedef of the same type is legal in
+ * C11, which is what lets both headers say `file_t`. */
+struct file;
+typedef struct file file_t;
+
 typedef enum {
     FD_NONE = 0,
     FD_CONSOLE,      /* the framebuffer and its serial mirror, as one thing */
     FD_PIPE,         /* pipe_t, one particular end of it */
+    FD_FILE,         /* file_t: something with a name, a length and a position */
 } fd_kind_t;
 
 /* Which end of a pipe a descriptor is, so a number cannot be used for the other end by
@@ -133,7 +148,18 @@ typedef struct task {
      * from `brk`.  Read by the self tests, and by /proc later; a task's exit status is
      * the one piece of state a program cannot set for itself. */
     int          exit_code;
+
+    /* The heap break, where it started, and where this process's anonymous mappings end.
+     *
+     * Three numbers because the heap and the mmap area are three different questions: the
+     * break is a growing bump, the mmap area is a separate bump above it, and a program
+     * that `mmap`s at an address of its own choosing needs to be able to find out whether
+     * anything is already there.  A single "the next free address" would be one number to
+     * keep right and would make a program that asked for a fixed address at the top of its
+     * own heap fail for a reason it could not find. */
     uint64_t     brk;
+    uint64_t     brk_start;
+    uint64_t     mmap_next;
 
     volatile int state;
     uint32_t     weight;
@@ -203,6 +229,44 @@ typedef struct task {
      * argv/envp/auxv block in it. */
     uint64_t     user_stack_phys;
     uint32_t     user_stack_pages;
+
+    /* Where this process is, as a path *and* as the node that path names.
+     *
+     * Both, because they answer different questions and each is the right one half the
+     * time.  `getcwd` has to print something a person recognises, and that is the path.
+     * A relative lookup has to find the directory even after something has been renamed
+     * underneath the process, and that is the node.  Keeping only the path means a
+     * process whose directory has been renamed is in a directory that does not exist and
+     * every relative path it uses fails; keeping only the node means `getcwd` prints the
+     * name the directory had when the process entered it.
+     *
+     * The path is *not* normalised on entry: `cd /tmp/..` leaves `/tmp/..` as the current
+     * directory and `getcwd` prints back what was asked for.  A kernel that rewrites it
+     * into a canonical path is second-guessing the user, and a program that compares its
+     * `cd` argument against `getcwd` would then disagree with the shell. */
+    char         cwd[VFS_MOUNT_PATH_PLACEHOLDER_];
+    uint64_t     cwd_ino;
+    uint32_t     cwd_mount;
+
+    /* Who this process is.  All three default to root, and every process in this kernel
+     * runs as root because there is one user; the fields exist because the permission
+     * checks above them are written in terms of them, and a check written against a
+     * constant is a check that cannot be tested. */
+    uint64_t     uid;
+    uint64_t     gid;
+    uint32_t     pgrp;              /* the process group, for job control */
+    uint32_t     session;           /* the session, for a controlling terminal */
+    mode_t       umask;
+
+    /* This task's terminal settings, and whether it has any.
+     *
+     * Per task rather than one global, because the settings belong to whichever program is
+     * attached to the terminal and there is more than one program: a shell that turns off
+     * echo turns it off for itself, and a program it runs afterwards gets the defaults
+     * until it says otherwise.  `tty_configured` is what tells "has never asked" apart from
+     * "asked for the defaults", which are different and only one of which is a decision. */
+    termios_t   tty_termios;
+    bool        tty_configured;
 
     /* This task's open descriptors, and nothing else's.
      *
@@ -467,6 +531,21 @@ uint32_t wait_queue_count(const wait_queue_t *q);
  * and the walk are two separate calls and the second may see more. */
 unsigned task_count(void);
 task_t  *task_by_index(unsigned i);
+
+/* Take a task off the all-tasks list before freeing it.  A task that has *exited* is not
+ * removed -- `wait` and `ps` are still looking for it there -- so this is only for a task
+ * that was built to be thrown away, and it must be paired with every `kfree(task_t *)`. */
+void task_unregister(task_t *t);
+
+/* The task with this process identifier, or NULL.  `kill` and `/proc/<pid>` both ask by
+ * name rather than by index, because a process identifier is the only name a user has. */
+task_t  *task_by_pid(uint64_t pid);
+
+/* Every task, for a walk that cannot be expressed as a lookup.  The self tests and the
+ * shell's `ps` both need it, and both want a *snapshot*: the count and the walk are two
+ * calls and the second may see more than the first. */
+task_t  *task_first(void);
+task_t  *task_next(task_t *t);
 
 /* --- diagnostics -------------------------------------------------------- */
 
