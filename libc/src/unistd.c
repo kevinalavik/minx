@@ -376,10 +376,9 @@ void exit(int status) {
     _exit(status);
 }
 
-void abort(void) {
-    raise(SIGABRT);
-    _exit(127);
-}
+/* `abort()` lives in stdlib.c, with `exit()` and `atexit()` -- it is one of the three ways
+ * a program ends, and splitting them across two files is a way to end up with two of them
+ * and one `abort`.  Declared in <stdlib.h>, which this file includes. */
 
 /* --- pipes and duplication --------------------------------------------------- */
 

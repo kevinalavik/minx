@@ -1779,6 +1779,23 @@ static void test_signal_program(void) {
     test_pass("phase7-signal");
 }
 
+/* Phase 9's libc, exercised by a program that links it.
+ *
+ * Every other program in `user/` is written against the raw door -- `minx_main()`, no libc,
+ * `user/common/start.S` -- on purpose: a test of the kernel's syscall handling, its loader
+ * or its signal trampoline has to have nothing in between that could be the bug.  This one
+ * is the opposite and is the only test here that fails when `printf()` pads wrongly or
+ * `malloc()` fragments its own heap.
+ *
+ * It runs through the same `run_program()` as the others, so its exit status is checked the
+ * same way -- which also means it is a live test of the libc's own `exit()`, on the path
+ * where a program that never exits is a test that never reports. */
+static void test_libc_program(void) {
+    if (!run_program("libctest", "phase9-libc", "libctest would not load"))
+        return;
+    test_pass("phase9-libc");
+}
+
 /* Phase 8's program, and the only filesystem test that goes through `int $0x80`.
  *
  * `test_ramfs()` below tests the same tree from inside the kernel, and both are here on
@@ -2872,6 +2889,7 @@ void test_run_all(void) {
     test_signal_program();
     test_ramfs();
     test_fs_program();
+    test_libc_program();
     test_sched_queues();
     test_sched_parallel();
     test_sched_preempt();

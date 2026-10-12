@@ -124,6 +124,20 @@ struct tty_winsize {
     uint16_t ws_ypixel;
 };
 
+/* The two structures a program hands this kernel are its own `struct termios` and `struct
+ * winsize`, and it fills them in with one `copy_to_user` each -- so the layouts have to
+ * agree exactly.  They cannot include each other's headers (the kernel is a freestanding
+ * build with no include path to a libc, and libc is built against these), so the
+ * agreement is checked here and again at the libc end, in libc/src/unistd/termios.c.
+ *
+ * The check is a build failure rather than a runtime one on purpose.  A layout that has
+ * drifted by a field does not crash: it puts `c_lflag` where `c_cflag` was, so the terminal
+ * quietly behaves as though a flag the program never set were set.  `termios_t` is
+ * 16 bytes of flags, then a byte and 19 bytes, then two 32-bit speeds -- 44 in total,
+ * because 36 is already 4-aligned and there is no padding after `c_cc`. */
+typedef char assert_termios_layout[(sizeof(termios_t) == 44) ? 1 : -1];
+typedef char assert_winsize_layout[(sizeof(struct tty_winsize) == 8) ? 1 : -1];
+
 /* Put a character into the line discipline from outside -- the keyboard driver calls this,
  * and so does anything that wants to type at a program. */
 void tty_input(char c);

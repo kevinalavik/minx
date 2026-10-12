@@ -53,11 +53,18 @@ int atexit(void (*fn)(void));
 
 /* --- environment ------------------------------------------------------------- */
 
-/* A static array of pointers into one static buffer.  A program can put a name in its own
- * string literal and `putenv()` it, which is what every shell does and what makes the
- * "the environment belongs to the process" story true: the strings are the program's, and
- * `putenv` does not copy them. */
-char **environ;
+/* The environment, as a NULL-terminated array of "NAME=VALUE" strings.
+ *
+ * Declared `extern` because without it this is a *tentative* definition, and the compiler
+ * puts one in every translation unit that includes this header -- so six libc files and the
+ * program's own file each get their own `environ`, and they disagree.  It was
+ * `char **environ;` here first, and the link error named five files that had never heard
+ * of the environment.
+ *
+ * A program can put a name in its own string literal and `putenv()` it, which is what
+ * every shell does and what makes "the environment belongs to the process" true: the
+ * strings are the program's, and `putenv` does not copy them. */
+extern char **environ;
 
 char *getenv(const char *name);
 int   setenv(const char *name, const char *value, int overwrite);

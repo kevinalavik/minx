@@ -356,7 +356,7 @@ libc: $(LIBC)
 # links with a warning has a problem the loader will not find for it.
 USER_PROGRAM_CFLAGS := -Wno-unused-function
 # The archive last, which is where a static archive has to be.
-USER_PROGRAM_LDFLAGS := -static -nostdlib -z noexecstack \
+USER_PROGRAM_LDFLAGS := -static -nostdlib -no-pie -z noexecstack \
             -Wl,--build-id=none -Wl,-Ttext=$(USER_TEXT_BASE) -Wl,--fatal-warnings \
             -L$(BUILD)/lib -lc
 
@@ -374,22 +374,55 @@ USER_HDRS      := $(wildcard user/*/*.h) $(wildcard user/common/*.h)
 
 COMMON_SRC := $(wildcard user/common/*.c) $(wildcard user/common/*.S)
 
-# One explicit rule per program rather than a pattern rule over all of them at once.
+# A program is written in one of two styles, and which one is a fact about the program
+# rather than something to be guessed at:
 #
-# A pattern rule here would have every program's sources as one prerequisite list, and
-# `$?` -- the only thing a pattern rule can use to say which program to build -- then lists
-# headers and the recipe's own line continuation along with the sources.  Naming them
-# outright is no more code and cannot go wrong that way.
+#   no `libc` marker   freestanding.  `minx_main()`, no libc, `user/common/start.S` as the
+#                      entry point.  This is what every ring-3 *test* program is, and the
+#                      reason is that a test of the kernel's syscall door, loader or signal
+#                      trampoline has to have nothing in between that could be the bug.
+#
+#   `libc` marker      a normal program.  `main()`, the libc, `libc/src/exit.S` as the entry
+#                      point.  This is what `sh` and the coreutils are.
+#
+# A marker file rather than a guess from the source.  "Does this program define `main`" is
+# a question about a compiled symbol, and answering it means compiling the program twice or
+# linking it wrongly once; an empty file in the directory is unambiguous, greppable, and
+# one line of `touch` to add.
+#
+# One explicit rule per program rather than a pattern rule over all of them at once.  A
+# pattern rule here would have every program's sources as one prerequisite list, and `$?` --
+# the only thing a pattern rule can use to say which program to build -- then lists headers
+# and the recipe's own line continuation along with the sources.  Naming them outright is
+# no more code and cannot go wrong that way.
+# The entry point and the shared sources, both decided per program rather than in a shell
+# inside the recipe.  A shell would work, but make would expand `${start}` itself before the
+# shell ever saw it -- so the variable arrives empty and the program is linked with neither
+# an entry point nor a libc, which fails as "undefined reference to _start" and reads like
+# a missing file rather than like a quoting mistake.
+define USER_PROGRAM_START
+$(if $(wildcard user/$(1)/libc),libc/src/exit.S,user/common/start.S)
+endef
+
+define USER_PROGRAM_COMMON
+$(if $(wildcard user/$(1)/libc),$(filter-out user/common/start.S,$(COMMON_SRC)),$(COMMON_SRC))
+endef
+
 define USER_PROGRAM_RULE
 $(BUILD)/bin/$(1): $$(wildcard user/$(1)/*.c) $$(wildcard user/$(1)/*.S) \
-                     $$(COMMON_SRC) $$(USER_HDRS) $(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC)
+                     $$(COMMON_SRC) $$(USER_HDRS) $(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC) \
+                     $(if $(wildcard user/$(1)/libc),$(LIBC),)
 	@mkdir -p $$(dir $$@)
 	$(CC) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS) -Iuser/common -Iuser/$(1) \
-	    $$(wildcard user/$(1)/*.c) $$(wildcard user/$(1)/*.S) $(COMMON_SRC) \
+	    -Wno-unused-command-line-argument \
+	    $$(wildcard user/$(1)/*.c) $$(wildcard user/$(1)/*.S) \
+	    $(call USER_PROGRAM_START,$(1)) $(call USER_PROGRAM_COMMON,$(1)) \
 	    $(USER_PROGRAM_LDFLAGS) -o $$@
 	@readelf -h $$@ | grep -q 'Type:.*EXEC' || \
 	    { echo "$$@ is not an ET_EXEC ELF; the loader only loads those" >&2; \
 	      exit 1; }
+	@nm $$@ | grep -q ' T _start' || \
+	    { echo "$$@ has no _start; the loader would jump to nothing" >&2; exit 1; }
 endef
 
 $(foreach p,$(USER_PROGS),$(eval $(call USER_PROGRAM_RULE,$(p))))

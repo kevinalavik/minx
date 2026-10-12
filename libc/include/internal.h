@@ -20,4 +20,9 @@ void __stdio_flush_all(void);
 /* The one exit path every program ends in, whatever it calls to get there. */
 int  __stdio_fd_count(void);
 
+/* Decide how the three standard streams are buffered, once, before `main()`.  Called by
+ * `__libc_start_main()`; a program that starts without it gets the defaults, which are the
+ * same decisions taken later. */
+void __stdio_init(void);
+
 #endif /* MINX_INTERNAL_H */
