@@ -1105,14 +1105,50 @@ long sys_fork(regs_t *regs) {
  * thing in this kernel where a task's progress depends on another task finishing. */
 long sys_wait(regs_t *regs) {
     uint64_t status_ptr = arg(regs, 0);
-    task_t *parent = sched_current();
 
-    if (parent == NULL || parent->child == NULL) {
-        errno_return(ENOENT);
+    /* Which child, and whether to block.  Both were added for a shell's job control, and
+     * both are *additional* arguments rather than a change: argument 0 is still the status
+     * pointer, so every caller that passed only that is unaffected and keeps meaning "any
+     * child of mine".  Argument 1 defaults to 0 for the same reason, and 0 means any
+     * child -- which is what the one-argument form always meant.
+     *
+     * `pid` is the POSIX selector: -1 for any child, a positive number for that child, 0
+     * for any child in this process's own group.  The group case is the one POSIX
+     * distinguishes and this kernel does not yet: a process group is its own id here (see
+     * `task_create_forked()`), so "any child in my group" and "any child" are the same set
+     * until `setpgid()` starts moving tasks between groups.  Saying so is better than
+     * implementing the distinction and having it be a lie for every program that uses it.
+     *
+     * All three arguments are read, so all three must be passed.  The registers the SysV
+     * ABI does not name are scratch, and a caller that supplies two arguments to a
+     * three-argument call supplies a third one out of whatever it happened to be using --
+     * which for `options` is a word whose bit 0 means `WNOHANG`, so `wait()` came back
+     * with "nothing yet" for a child that had already exited. */
+    int64_t     pid     = (int64_t)arg(regs, 1);
+    uint64_t    options = arg(regs, 2);
+    const bool  nohang  = (options & WNOHANG) != 0;
+    task_t     *parent  = sched_current();
+
+    if (pid < -1)
+        errno_return(EINVAL);
+
+    if (parent == NULL) {
+        errno_return(ECHILD);
     }
+
+    /* No children at all is ECHILD and not ENOENT.  They are different facts: ENOENT is
+     * "that does not exist", and a parent with no children is not looking for something
+     * that failed to be found -- it has run out of children, which is what ECHILD is for,
+     * and what a shell's `wait` with nothing to wait for has to be able to tell apart from
+     * an error. */
+    if (parent->child == NULL)
+        errno_return(ECHILD);
 
     for (;;) {
         for (task_t *c = parent->child; c != NULL; c = c->sibling) {
+            if (pid > 0 && (int64_t)c->id != pid)
+                continue;
+
             if (__atomic_load_n(&c->exited, __ATOMIC_ACQUIRE)) {
                 /* Unlink before reporting, so a second `wait` cannot collect the same
                  * child again -- and so the list does not grow a chain of already-reported
@@ -1138,6 +1174,17 @@ long sys_wait(regs_t *regs) {
                 return (long)c->id;
             }
         }
+
+        /* `WNOHANG` is not "do not wait", it is "do not wait *if there is nothing to
+         * report*".  A caller that asks a live child to wait with WNOHANG still waits --
+         * that is what it asked for -- and the difference only shows when the child is
+         * still running, which is the case a job-control loop is in every time it looks.
+         *
+         * The status is deliberately not written in this case: POSIX says the contents are
+         * unspecified, and writing a zero would be a zero that a caller who ignored the
+         * return value would read as "exited successfully". */
+        if (nohang)
+            return 0;
 
         task_wait();
     }

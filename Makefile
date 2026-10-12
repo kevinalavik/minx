@@ -143,8 +143,12 @@ USER_CFLAGS := -std=gnu11 -ffreestanding -nostdlib -nostdinc \
             -fno-asynchronous-unwind-tables -mno-red-zone -mno-mmx -mno-sse \
             -mno-sse2 -m64 -MMD -MP $(OPT) $(WARN) \
             -I$(LIBC_DIR)/include -I$(LIBC_DIR)/src -I$(GEN_INC) -D__MINX__=1
-USER_LDFLAGS := -static -nostdlib -no-pie -z noexecstack --build-id=none \
-            -L$(BUILD)/lib -lc
+# No `-lc` here.  A static archive is searched *left to right* and only for symbols that
+# are undefined at that point, so an archive named before the object files is an archive
+# that resolves nothing: every user program linked with `-lc` in front of it would fail with
+# an undefined reference to the first libc function it called, and the fix -- moving `-lc`
+# to the end -- is a one-character change whose absence looks like a broken libc.
+USER_LDFLAGS := -static -nostdlib -no-pie -z noexecstack --build-id=none
 
 # Where a user program is linked, and therefore where it is loaded.  4 MiB: inside the
 # 32-bit part of the space, well above anything the loader puts below it (the program
@@ -308,9 +312,16 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 
 # ------------------------------------------------------------------ libc ---
 
+# `strtoll()` and `strtoul()` return 64-bit integers, and the x86-64 SysV ABI answers those
+# in RAX and RDX.  With SSE disabled -- which the userspace flags do, for the same reason the
+# kernel's do -- clang would otherwise have to answer in memory, and a libc whose 64-bit
+# returns go through memory is a libc that is slower than one that does not.  The flag is
+# per-function: it applies to this file only, because a program is not generally entitled to
+# it and the kernel has no business having it.
+$(BUILD)/u/$(LIBC_DIR)/src/stdlib.o: LIBC_INT128 := -mgeneral-regs-only
 $(BUILD)/u/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+	$(CC) $(USER_CFLAGS) $(LIBC_INT128) -c $< -o $@
 
 $(BUILD)/u/%.o: %.S
 	@mkdir -p $(dir $@)
@@ -322,6 +333,11 @@ $(LIBC): $(LIBC_OBJ)
 	$(AR) rcs $@ $(LIBC_OBJ)
 
 userspace: $(LIBC) $(ALL_BIN)
+
+# `make libc` on its own, because that is the thing being worked on for most of phase 9
+# and rebuilding six ring-3 programs to find out that a header does not compile is a slow
+# way to learn a one-line fix.
+libc: $(LIBC)
 
 # --- ring-3 programs -----------------------------------------------------
 #
@@ -339,8 +355,10 @@ userspace: $(LIBC) $(ALL_BIN)
 # reports a function that is very much used.  --fatal-warnings because a program that
 # links with a warning has a problem the loader will not find for it.
 USER_PROGRAM_CFLAGS := -Wno-unused-function
+# The archive last, which is where a static archive has to be.
 USER_PROGRAM_LDFLAGS := -static -nostdlib -z noexecstack \
-            -Wl,--build-id=none -Wl,-Ttext=$(USER_TEXT_BASE) -Wl,--fatal-warnings
+            -Wl,--build-id=none -Wl,-Ttext=$(USER_TEXT_BASE) -Wl,--fatal-warnings \
+            -L$(BUILD)/lib -lc
 
 # Every directory under user/ that holds sources is a ring-3 program.  One rule for all
 # of them, so adding a program is a directory and not a Makefile edit -- which is what
@@ -378,11 +396,11 @@ $(foreach p,$(USER_PROGS),$(eval $(call USER_PROGRAM_RULE,$(p))))
 
 $(BUILD)/bin/%: $(USER_DIR)/%
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_LDFLAGS) $(USER_CFLAGS) $< -o $@
+	$(CC) $(USER_LDFLAGS) $(USER_CFLAGS) $< -L$(BUILD)/lib -lc -o $@
 
 $(BUILD)/bin/%: $(TESTS_DIR)/%
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_LDFLAGS) $(USER_CFLAGS) $< -o $@
+	$(CC) $(USER_LDFLAGS) $(USER_CFLAGS) $< -L$(BUILD)/lib -lc -o $@
 
 # ---------------------------------------------------------------- initrd ---
 

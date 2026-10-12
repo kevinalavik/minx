@@ -1,74 +1,31 @@
-/* minx - the user/kernel boundary, and nothing else.
+/* minx - the user/kernel boundary for programs with no libc.
  *
- * This is the whole of the user-visible interface: the call numbers, the structures, and
- * the instructions that reach the kernel.  There is no libc here -- `libc/` is that, and it
- * includes this -- so what lives here is the part a program gets whether or not it links
- * anything at all.
+ * Everything here is also in <sys/sysdep.h> and <unistd.h>, and this header exists for the
+ * programs that link *neither*: `hello`, `forktest`, `sigtest`, `fstest` and the rest of
+ * the ring-3 test programs, which are written against the raw door so that a libc bug
+ * cannot be what a test is measuring.
  *
- * The numbers must match kernel/include/syscall.h.  They are written out rather than shared
- * because the kernel is a freestanding build with no libc and no way to include a user's
- * header, so the agreement between the two is kept by both being in one place each and by
- * docs/SYSCALLS.md being the third.
+ * It is also the structures -- `minx_stat`, `minx_dirent` -- which the kernel fills in, and
+ * which a program needs whether or not it has a libc.
+ *
+ * The call numbers are not here.  They come from <sys/sysdep.h>, which generates them from
+ * the kernel's own enum; they used to be a second hand-written copy of that enum and the
+ * copy is what went stale, when renumbering left this file and user/common/start.S
+ * disagreeing about what `exit` is.
  */
-#include <stddef.h>
-#include <stdint.h>
-
 #ifndef MINX_USER_H
 #define MINX_USER_H
 
-/* --- call numbers --------------------------------------------------------- */
-
-/* Read out of the kernel's enum rather than copied from it.
- *
- * This list used to be a second, hand-written copy of kernel/include/syscall.h's, which is
- * a copy that is silently out of date the next time the numbers move.  It was: the enum was
- * regrouped and renumbered, this file was updated, and user/common/start.S -- assembly, and
- * so a literal -- kept the old number for exit().  Every program's last syscall became
- * `lseek`, so every program printed its last line and then spun in the entry stub's "exit
- * does not return either" loop, for ever.  Three programs passed every check they had
- * printed and none of them exited.
- *
- * `SYS_MAX` is generated too: the user side uses it to size the "a program may call
- * anything" bound, and a stale one would quietly mean something else. */
-#include "minx_syscall_table.h"
+#include <sys/sysdep.h>
 
 /* --- errors ---------------------------------------------------------------- */
 
-/* The negative return a failed call gives.  The numbers are the same as the kernel's,
- * which are the same as every other Unix's, so a program that prints one of them with
- * perror() gets the text it expects. */
-#define EPERM    1
-#define ENOENT   2
-#define ESRCH    3
-#define EINTR    4
-#define EIO      5
-#define ENOEXEC  8
-#define EBADF    9
-#define ECHILD  10
-#define EAGAIN  11
-#define ENOMEM  12
-#define EACCES  13
-#define EFAULT  14
-#define EBUSY   16
-#define EEXIST  17
-#define EXDEV   18
-#define ENODEV  19
-#define ENOTDIR 20
-#define EISDIR  21
-#define EINVAL  22
-#define ENFILE  23
-#define EMFILE  24
-#define ENOTTY  25
-#define ESPIPE  29
-#define EROFS   30
-#define EMLINK  31
-#define EPIPE   32
-#define ERANGE  34
-#define ENAMETOOLONG 36
-#define ENOSYS  38
-#define ENOTEMPTY 39
-#define ELOOP   40
-#define EWOULDBLOCK EAGAIN
+/* Not here any more: <errno.h>, reached through <sys/sysdep.h>.  This list was a subset
+ * of that one, written out again, and a subset is the worst kind of copy -- it looks
+ * complete to every program that only uses the calls it covers, and silently disagrees
+ * with the kernel for a program that uses one it does not.  `ENOTEMPTY` and `ELOOP` are
+ * the two this tree actually needed and that a stock list would not have had, which is
+ * exactly why the kernel's list is the one that has to be authoritative. */
 
 /* --- open flags ------------------------------------------------------------- */
 
@@ -204,61 +161,6 @@ struct minx_dirent {
 #define S_IFBLK  0060000u
 #define S_IFIFO  0010000u
 #define S_IFSOCK 0140000u
-
-/* --- the door ------------------------------------------------------------------ */
-
-/* `int $0x80` rather than `syscall`, for the reason recorded in docs/DECISIONS.md: it
- * reuses the interrupt path the kernel already has, including the TSS stack switch, so a
- * syscall costs nothing in new machinery and cannot get the privilege transition subtly
- * wrong. */
-#define MINX_SYSCALL "int $0x80"
-
-static inline long minx_syscall1(long nr, long a0) {
-    long ret;
-
-    __asm__ volatile(MINX_SYSCALL
-                     : "=a"(ret)
-                     : "a"(nr), "D"(a0)
-                     : "rcx", "r11", "memory");
-    return ret;
-}
-
-static inline long minx_syscall2(long nr, long a0, long a1) {
-    long ret;
-
-    __asm__ volatile(MINX_SYSCALL
-                     : "=a"(ret)
-                     : "a"(nr), "D"(a0), "S"(a1)
-                     : "rcx", "r11", "memory");
-    return ret;
-}
-
-static inline long minx_syscall3(long nr, long a0, long a1, long a2) {
-    long ret;
-
-    __asm__ volatile(MINX_SYSCALL
-                     : "=a"(ret)
-                     : "a"(nr), "D"(a0), "S"(a1), "d"(a2)
-                     : "rcx", "r11", "memory");
-    return ret;
-}
-
-/* The sixth argument lives in r10 and the seventh in r8, and the compiler cannot know
- * that without being told, so they are bound by name and initialised.  `initialise` is
- * only here to satisfy the "uninitialised" analysis; the register constraint means the
- * value the compiler puts there is the fifth argument's, not zero. */
-static inline long minx_syscall6(long nr, long a0, long a1, long a2,
-                                 long a3, long a4, long a5) {
-    long ret;
-    register long r10 __asm__("r10") = 0;
-
-    __asm__ volatile(MINX_SYSCALL
-                     : "=a"(ret)
-                     : "a"(nr), "D"(a0), "S"(a1), "d"(a2),
-                       "r"(r10), "r"(a3), "r"(a4), "r"(a5)
-                     : "rcx", "r11", "memory");
-    return ret;
-}
 
 /* --- the calls ------------------------------------------------------------------ */
 
@@ -445,7 +347,17 @@ static inline long minx_fork(void) {
  * -1 with nothing left to wait for.  `status` may be NULL; it is a pointer like any other,
  * so the kernel checks it before writing to it. */
 static inline long minx_wait(int *status) {
-    return minx_syscall2(SYS_WAIT, (long)(uintptr_t)status, 0);
+    /* Three arguments, all of them, because the kernel reads three.
+     *
+     * `sys_wait()` takes the status pointer, a pid selector and an options word, and a
+     * caller that supplies only the first leaves the other two in whatever registers it
+     * happened to have.  Those are *scratch* registers in the SysV ABI: nothing promises
+     * them to be zero, so the options word arrived with a bit set and `WNOHANG` came back
+     * on, and `wait()` returned 0 for a child that had already exited.  The rule this
+     * follows is the rule every syscall ABI has -- pass what the call reads, or it reads
+     * whatever was there -- and it is spelled out at the call because that is where it is
+     * easy to get wrong when a call grows an argument. */
+    return minx_syscall3(SYS_WAIT, (long)(uintptr_t)status, -1, 0);
 }
 
 /* Create a pipe and write its two ends into `fds`, which must be a pointer to two ints.

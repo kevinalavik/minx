@@ -146,6 +146,14 @@ enum {
 #define ENODEV 19
 #define ENOSYS 38
 #define ENOTTY 25
+#define ECHILD 10
+#define ELOOP  40
+#define ERANGE 34
+#define E2BIG   7
+
+/* The `wait` options, which live beside the errors because both are "answers a caller gets
+ * back from a call" rather than things a call returns. */
+#define WNOHANG 1
 #define EXDEV   18
 #define ELOOP   40
 #define ERANGE  34
