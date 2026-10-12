@@ -132,8 +132,33 @@ static bool load_segment(page_table_t *tables, const uint8_t *image, uint64_t vi
         uint64_t seg_from = (virt > page) ? virt - page : 0;
         uint64_t seg_to = (virt + memsz < page + page_size) ? virt + memsz - page
                                                              : page_size;
-        uint64_t file_from = (filesz > seg_from) ? seg_from : filesz;
-        uint64_t file_to = (filesz > seg_to) ? seg_to : filesz;
+
+        /* Where this page's slice of the *file* content starts and ends.
+         *
+         * The file provides `filesz` bytes, beginning where the segment begins -- which on
+         * the first page is `seg_from` bytes into it, not at the page's start.  So the two
+         * ends are `seg_from` and `seg_from + filesz`, both clamped to the segment's own
+         * extent in this page.
+         *
+         * They used to be clamped against `filesz` *as if it were a page offset*, which is
+         * right only when the segment happens to start at the top of a page.  A `.data`
+         * that starts 0x4a0 bytes into its page and is 0x160 bytes long has
+         * `filesz < seg_from`, so both ends collapsed onto `filesz` and the segment was
+         * never copied: its `.data` came up **zeroed**, silently, with the loader reporting
+         * success.
+         *
+         * What that looks like is a program whose initialised globals are all NULL.  It
+         * showed up when libc arrived, because libc is the first thing in this tree with a
+         * `.data` big enough to be shorter than its own offset into the page: `stdout` was
+         * a NULL `FILE *`, `printf()` wrote through it and did nothing, and `write(1, ...)`
+         * from the same program worked perfectly.  A loader that drops a segment's contents
+         * is worse than one that refuses the segment, because nothing says it happened. */
+        uint64_t file_from = seg_from;
+        uint64_t file_to = seg_from + filesz;
+
+        if (file_to > seg_to)
+            file_to = seg_to;
+
         uint64_t phys;
         pte_t leaf = pt_get(tables, page);
 
