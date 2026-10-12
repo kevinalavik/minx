@@ -104,6 +104,40 @@ void isr_report_exception(regs_t *regs) {
     if (vector == 14)
         report_page_fault(regs);
 
+    /* The top of a ring-3 task's own stack, when the exception came from one.
+     *
+     * The register dump above says what the CPU held; it cannot say where the program was
+     * *going*, and for the failure this was written for -- a `longjmp()` that restored a
+     * stack pointer one word too low, so the epilogue's `ret` popped a return address that
+     * was not one and the program jumped to address 0 -- the answer was sitting in the
+     * second stack slot.  Every register was correct at every instruction; only the return
+     * chain was wrong, and nothing above says so.
+     *
+     * Read through the direct map of whatever frame backs that address rather than by
+     * touching the user address: the page may not even be present, which is often why the
+     * exception happened, and the kernel does not fault on its own diagnostic.  Sixteen
+     * words is four return addresses' worth, which is enough to name the function. */
+    if ((regs->cs & 3) != 0) {
+        task_t *t = sched_current();
+
+        if (t != NULL) {
+            uint64_t base = regs->rsp & ~(uint64_t)(page_size - 1);
+            uint64_t phys = vmm_translate_in(t->tables, base);
+
+            if (phys != 0) {
+                const uint64_t *w = (const uint64_t *)phys_to_virt(phys)
+                                  + (regs->rsp - base) / 8;
+
+                kprintf("  user stack at %#lx:\n", (unsigned long)regs->rsp);
+
+                for (int i = 0; i < 16; i++)
+                    kprintf("    +%#04lx  %#018lx\n", (unsigned long)(i * 8), w[i]);
+            } else {
+                kprintf("  user stack at %#lx: not mapped\n", (unsigned long)regs->rsp);
+            }
+        }
+    }
+
     /* Where are we in the kernel?  */
     if (regs->rip >= (uint64_t)__kernel_start && regs->rip < (uint64_t)__kernel_end)
         kprintf("  -> kernel address (image %016lx..%016lx)\n",
