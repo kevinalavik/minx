@@ -138,10 +138,21 @@ KERNEL_LDFLAGS := -n -T $(KERNEL_DIR)/boot/linker.ld -z max-page-size=4096 \
             -static --no-dynamic-linker -z noexecstack --build-id=none
 
 # Userspace and libc: normal hosted-less static build.
+# `-fno-builtin-setjmp` and its three neighbours are not pedantry.  A compiler recognises
+# `setjmp`, `longjmp`, `sigsetjmp` and `siglongjmp` as builtins and will *lower them
+# itself*, emitting its own register-save and register-restore sequence inline and never
+# calling the libc's.  So a working `setjmp()` in libc/src/setjmp/asm.S can be linked,
+# listed by `nm`, and never executed: `libctest` "passed" every setjmp check and then
+# jumped to address 0 on its way out of `main`, because what actually ran was the
+# compiler's idea of a `longjmp` rather than this libc's.
+#
+# The libc's version is the one that has to run, because the whole of `sh` is built on it.
 USER_CFLAGS := -std=gnu11 -ffreestanding -nostdlib -nostdinc \
             -isystem $(FREESTD_INC) -fno-stack-protector -fno-pic -fno-pie \
             -fno-asynchronous-unwind-tables -mno-red-zone -mno-mmx -mno-sse \
             -mno-sse2 -m64 -MMD -MP $(OPT) $(WARN) \
+            -fno-builtin-setjmp -fno-builtin-longjmp \
+            -fno-builtin-sigsetjmp -fno-builtin-siglongjmp \
             -I$(LIBC_DIR)/include -I$(LIBC_DIR)/src -I$(GEN_INC) -D__MINX__=1
 # No `-lc` here.  A static archive is searched *left to right* and only for symbols that
 # are undefined at that point, so an archive named before the object files is an archive
@@ -201,6 +212,14 @@ SYSCALL_TABLE_INC := $(GEN_INC)/minx_syscall.inc
 
 LIBC_C   := $(shell find $(LIBC_DIR)/src -name '*.c' 2>/dev/null | sort)
 LIBC_ASM := $(shell find $(LIBC_DIR)/src -name '*.S' 2>/dev/null | sort)
+
+# An object's path comes from its source's path with the extension replaced -- so `setjmp.c`
+# and `setjmp.S` in one directory are the *same object file*, and whichever the makefile
+# happened to build last is the one that ends up in the archive.  The assembly half of
+# `setjmp()` was silently missing because the C half overwrote it, and the link failed with
+# four undefined references to functions that are plainly, visibly defined a few lines above
+# in the same file.  Hence `libc/src/setjmp/asm.S` rather than `setjmp.S`: different name,
+# different object.
 LIBC_OBJ := $(LIBC_C:%.c=$(BUILD)/u/%.o) $(LIBC_ASM:%.S=$(BUILD)/u/%.o)
 LIBC     := $(BUILD)/lib/libc.a
 

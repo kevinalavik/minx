@@ -21,6 +21,7 @@
  *
  * The return is zero only if everything passed.
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -289,6 +290,67 @@ int main(int argc, char **argv, char **envp) {
             check(stat("/tmp/libctest", &st) == -1 && errno == ENOENT,
                   "unlink, and the file is gone");
         }
+    }
+
+    /* --- directories ----------------------------------------------------------- */
+
+    {
+        mkdir("/tmp/libctest-dir", 0755);
+
+        FILE *mk = fopen("/tmp/libctest-dir/one", "w");
+        if (mk != NULL) { fputs("x", mk); fclose(mk); }
+        mk = fopen("/tmp/libctest-dir/two", "w");
+        if (mk != NULL) { fputs("y", mk); fclose(mk); }
+        mkdir("/tmp/libctest-dir/inner", 0755);
+
+        DIR *d = opendir("/tmp/libctest-dir");
+
+        check(d != NULL, "opendir");
+
+        if (d != NULL) {
+            int saw_dot = 0, saw_dotdot = 0, saw_one = 0, saw_two = 0, saw_inner = 0;
+            int saw_reg = 0, saw_dir = 0, entries = 0;
+            struct dirent *e;
+
+            /* `.` and `..` are returned by every Unix and `find` cannot terminate without
+             * `..`, so a libc that hid them would be hiding the end of the walk. */
+            while ((e = readdir(d)) != NULL) {
+                entries++;
+
+                if (strcmp(e->d_name, ".") == 0)       saw_dot++;
+                else if (strcmp(e->d_name, "..") == 0) saw_dotdot++;
+                else if (strcmp(e->d_name, "one") == 0) {
+                    saw_one++;
+                    saw_reg = (e->d_type == DT_REG);
+                } else if (strcmp(e->d_name, "two") == 0) {
+                    saw_two++;
+                } else if (strcmp(e->d_name, "inner") == 0) {
+                    saw_inner++;
+                    saw_dir = (e->d_type == DT_DIR);
+                }
+            }
+
+            check(entries == 5, "readdir lists every entry, including . and ..");
+            check(saw_dot == 1 && saw_dotdot == 1, "readdir returns . and .. exactly once");
+            check(saw_one == 1 && saw_two == 1 && saw_inner == 1,
+                  "readdir lists each file");
+            check(saw_reg, "d_type says a regular file is DT_REG");
+            check(saw_dir, "d_type says a directory is DT_DIR");
+            check(readdir(d) == NULL, "readdir returns NULL at the end of the directory");
+
+            /* Rewinding, because `find` does it and because a directory walk that cannot
+             * go back is a walk a program can only make once. */
+            rewinddir(d);
+            check(readdir(d) != NULL, "rewinddir puts the walk back at the start");
+
+            check(closedir(d) == 0, "closedir");
+        }
+
+        /* And the directory is gone once everything in it is. */
+        unlink("/tmp/libctest-dir/one");
+        unlink("/tmp/libctest-dir/two");
+        rmdir("/tmp/libctest-dir/inner");
+        check(rmdir("/tmp/libctest-dir") == 0, "the test directory is removed");
     }
 
     /* --- the standard streams -------------------------------------------------- */

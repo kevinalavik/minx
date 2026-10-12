@@ -60,7 +60,7 @@ typedef unsigned long sigset_t;
  * return from one: the handlers, the blocked set, and the return address.  A `sigjmp_buf`
  * is larger than a `jmp_buf` because of that, and a program that uses the smaller one to
  * leave a handler does so by leaving the *stack* back to where it was, not the handler. */
-typedef unsigned long sigjmp_buf[32];
+typedef unsigned long sigjmp_buf[10];
 
 struct sigaction {
     sighandler_t sa_handler;
@@ -78,6 +78,13 @@ sighandler_t signal(int signum, sighandler_t handler);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *old);
 int sigprocmask(int how, const sigset_t *set, sigset_t *old);
 int sigpending(sigset_t *out);
+/* How `sigprocmask()` changes the blocked set: add to it, remove from it, or replace it
+ * outright.  `SIG_SETMASK` with a NULL set *asks* for the current mask, which is a question
+ * with an answer and no side effect -- and that is what `sigsetjmp()` uses it for. */
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
 int sigemptyset(sigset_t *out);
 int sigfillset(sigset_t *out);
 int sigaddset(sigset_t *out, int signum);

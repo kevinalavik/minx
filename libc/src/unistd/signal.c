@@ -37,15 +37,6 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *old) {
                            (long)(uintptr_t)old);
 }
 
-/* How the blocked set is changed: add to it, remove from it, or become it.
- *
- * `SIG_BLOCK` adds `set` to what is already blocked, `SIG_UNBLOCK` removes it and
- * `SIG_SETMASK` replaces it outright.  All three take `old`, and `old` may be NULL -- which
- * is the common case and the reason the kernel checks the pointer rather than requiring it. */
-#define SIG_BLOCK   0
-#define SIG_UNBLOCK 1
-#define SIG_SETMASK 2
-
 int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
     return (int)__syscall3(SYS_SIGPROCMASK, how, (long)(uintptr_t)set,
                            (long)(uintptr_t)old);
