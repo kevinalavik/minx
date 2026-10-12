@@ -102,14 +102,32 @@ static void block_free(block_t *b) {
 
     /* Backward: this block starts exactly where the previous one ends.  Only possible if
      * there is a previous one; `b` at the very bottom of the heap has nothing below it and
-     * merging with a NULL would be a merge with a page header. */
+     * merging with a NULL would be a merge with a page header.
+     *
+     * Two updates, and only two.  `p` already points at `b` -- `prev` is the slot the walk
+     * stopped on and `slot` was derived from it, so `*slot == p` -- which is what makes
+     * `p->next = b->next` enough on its own: it unlinks `b` and links `p` to whatever `b`
+     * was linked to.
+     *
+     * There used to be a third statement here, `*slot = p`, and it was the most expensive
+     * line this allocator ever had.  `slot` *is* `&p->next` whenever `prev` is not NULL --
+     * the walk sets `prev = slot` and then `slot = &(*slot)->next`, one step apart and never
+     * further -- so `*slot = p` is `p->next = p`.  The backward merge therefore did not
+     * merge anything; it turned a list of n nodes into a list of n nodes with a ring of one
+     * in the middle, and every `malloc()` or `free()` after that walked into it and spun for
+     * ever.
+     *
+     * It survived the test suite because the backward merge needs three things at once: the
+     * block below `b` free, exactly adjacent, and reached by a walk of at least one step.
+     * The allocator's own tests freed in an order that never lined all three up.  It was
+     * `glob()`'s test that did it -- twenty-four allocations in a row and then twenty-four
+     * `free()`s in the same order, which is the shape every program has and no test had. */
     if (prev != NULL) {
         block_t *p = *prev;
 
         if ((char *)b == (char *)p + BLOCK_HDR + p->size) {
             p->size += BLOCK_HDR + b->size;
             p->next = b->next;
-            *slot = p;
         }
     }
 }
