@@ -1,37 +1,93 @@
-/* minx user programs - the kernel ABI, and nothing else.
+/* minx - the user/kernel boundary, and nothing else.
  *
- * This is the whole of the user-visible interface: four call numbers, one structure,
- * and the two instructions that reach the kernel.  There is no libc here and no
- * intention of one yet -- phase 9 brings mlibc, which will have its own idea of all of
- * this and will need to agree with it.
+ * This is the whole of the user-visible interface: the call numbers, the structures, and
+ * the instructions that reach the kernel.  There is no libc here -- `libc/` is that, and it
+ * includes this -- so what lives here is the part a program gets whether or not it links
+ * anything at all.
+ *
+ * The numbers must match kernel/include/syscall.h.  They are written out rather than shared
+ * because the kernel is a freestanding build with no libc and no way to include a user's
+ * header, so the agreement between the two is kept by both being in one place each and by
+ * docs/SYSCALLS.md being the third.
  */
 #include <stdint.h>
 
 #ifndef MINX_USER_H
 #define MINX_USER_H
 
-/* Call numbers.  These must match kernel/include/syscall.h. */
-#define SYS_READ    0
-#define SYS_WRITE   1
-#define SYS_OPEN    2
-#define SYS_CLOSE   3
-#define SYS_EXIT    4
-#define SYS_BRK     5
-#define SYS_WRITEV  6
-#define SYS_GETPID  7
-#define SYS_FORK    8
-#define SYS_WAIT    9
-#define SYS_PIPE    10
-#define SYS_EXEC    11
-#define SYS_KILL         12
-#define SYS_SIGACTION    13
-#define SYS_SIGRETURN    14
-#define SYS_SIGPROCMASK  15
-#define SYS_SIGPENDING   16
-#define SYS_PAUSE        17
+/* --- call numbers --------------------------------------------------------- */
 
-/* Signals.  The same numbers as kernel/include/signal.h, which is the list the names mean
- * everywhere: a program that says SIGINT means ^C. */
+/* Read out of the kernel's enum rather than copied from it.
+ *
+ * This list used to be a second, hand-written copy of kernel/include/syscall.h's, which is
+ * a copy that is silently out of date the next time the numbers move.  It was: the enum was
+ * regrouped and renumbered, this file was updated, and user/common/start.S -- assembly, and
+ * so a literal -- kept the old number for exit().  Every program's last syscall became
+ * `lseek`, so every program printed its last line and then spun in the entry stub's "exit
+ * does not return either" loop, for ever.  Three programs passed every check they had
+ * printed and none of them exited.
+ *
+ * `SYS_MAX` is generated too: the user side uses it to size the "a program may call
+ * anything" bound, and a stale one would quietly mean something else. */
+#include "minx_syscall_table.h"
+
+/* --- errors ---------------------------------------------------------------- */
+
+/* The negative return a failed call gives.  The numbers are the same as the kernel's,
+ * which are the same as every other Unix's, so a program that prints one of them with
+ * perror() gets the text it expects. */
+#define EPERM    1
+#define ENOENT   2
+#define ESRCH    3
+#define EINTR    4
+#define EIO      5
+#define ENOEXEC  8
+#define EBADF    9
+#define ECHILD  10
+#define EAGAIN  11
+#define ENOMEM  12
+#define EACCES  13
+#define EFAULT  14
+#define EBUSY   16
+#define EEXIST  17
+#define EXDEV   18
+#define ENODEV  19
+#define ENOTDIR 20
+#define EISDIR  21
+#define EINVAL  22
+#define ENFILE  23
+#define EMFILE  24
+#define ENOTTY  25
+#define ESPIPE  29
+#define EROFS   30
+#define EMLINK  31
+#define EPIPE   32
+#define ERANGE  34
+#define ENAMETOOLONG 36
+#define ENOSYS  38
+#define ENOTEMPTY 39
+#define ELOOP   40
+#define EWOULDBLOCK EAGAIN
+
+/* --- open flags ------------------------------------------------------------- */
+
+#define O_RDONLY    0x0000
+#define O_WRONLY    0x0001
+#define O_RDWR      0x0002
+#define O_CREAT     0x0040
+#define O_EXCL      0x0080
+#define O_TRUNC     0x0200
+#define O_APPEND    0x0400
+#define O_DIRECTORY 0x10000
+
+/* --- whence ----------------------------------------------------------------- */
+
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+/* --- signals ---------------------------------------------------------------- */
+
 #define SIGHUP   1
 #define SIGINT   2
 #define SIGQUIT  3
@@ -51,9 +107,16 @@
 #define SIGCONT  18
 #define SIGSTOP  19
 #define SIGTSTP  20
+#define SIGTTIN  21
+#define SIGTTOU  22
 
 #define SIG_DFL ((unsigned long)0)
 #define SIG_IGN ((unsigned long)1)
+#define SIG_ERR ((unsigned long)-1)
+
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
 
 /* sigaction's argument.  Three quadwords, in this order; docs/SYSCALLS.md has the same
  * table and the kernel copies it in and out whole. */
@@ -63,25 +126,79 @@ struct sigaction {
     unsigned long mask;
 };
 
-/* Errors, as the negative return values the kernel uses. */
-#define EBADF   9
-#define EFAULT  14
-#define ENOSYS  38
-#define ENOMEM  12
-#define EPIPE   32
+/* --- memory ------------------------------------------------------------------ */
+
+#define PROT_NONE  0
+#define PROT_READ  1
+#define PROT_WRITE 2
+#define PROT_EXEC  4
+
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_FIXED     0x10
+#define MAP_ANONYMOUS 0x20
+
+/* --- types -------------------------------------------------------------------- */
 
 typedef unsigned long size_t_;
 typedef long ssize_t_;
+typedef long off_t_;
 
 struct iovec {
     unsigned long base;
     unsigned long len;
 };
 
-/* The door.  `int $0x80` rather than `syscall`, for the reason recorded in
- * docs/DECISIONS.md: it reuses the interrupt path the kernel already has, including the
- * TSS stack switch, so a syscall costs nothing in new machinery and cannot get the
- * privilege transition subtly wrong. */
+/* `stat`, as the kernel fills it in.  The layout is the kernel's own and is the same in
+ * every user program, which is what makes it possible for a program to hand the kernel a
+ * buffer and have the fields land where the program's names are.  The kernel copies the
+ * whole structure in one go rather than field by field, so the two definitions have to
+ * agree exactly -- which they do because they are the same thirteen fields in the same
+ * order with the same widths. */
+struct minx_stat {
+    unsigned long st_dev;
+    unsigned long st_ino;
+    unsigned int  st_mode;
+    unsigned int  st_nlink;
+    unsigned int  st_uid;
+    unsigned int  st_gid;
+    unsigned long st_rdev;
+    unsigned long st_size;
+    unsigned long st_blksize;
+    unsigned long st_blocks;
+    unsigned long st_atime;
+    unsigned long st_mtime;
+    unsigned long st_ctime;
+};
+
+/* One entry from `getdents`.  The record length is in the structure, so a caller that does
+ * not like the name length can skip to the next entry by adding it rather than having to
+ * work out how long the name was. */
+struct minx_dirent {
+    unsigned long d_ino;
+    unsigned long d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    unsigned char  d_pad[7];
+    char           d_name[256];
+};
+
+/* Mode bits, the same as in kernel/include/types.h. */
+#define S_IFMT   0170000u
+#define S_IFDIR  0040000u
+#define S_IFREG  0100000u
+#define S_IFLNK  0120000u
+#define S_IFCHR  0020000u
+#define S_IFBLK  0060000u
+#define S_IFIFO  0010000u
+#define S_IFSOCK 0140000u
+
+/* --- the door ------------------------------------------------------------------ */
+
+/* `int $0x80` rather than `syscall`, for the reason recorded in docs/DECISIONS.md: it
+ * reuses the interrupt path the kernel already has, including the TSS stack switch, so a
+ * syscall costs nothing in new machinery and cannot get the privilege transition subtly
+ * wrong. */
 #define MINX_SYSCALL "int $0x80"
 
 static inline long minx_syscall1(long nr, long a0) {
@@ -131,12 +248,126 @@ static inline long minx_syscall6(long nr, long a0, long a1, long a2,
     return ret;
 }
 
+/* --- the calls ------------------------------------------------------------------ */
+
 static inline ssize_t_ minx_write(int fd, const void *buf, size_t_ n) {
     return minx_syscall3(SYS_WRITE, fd, (long)buf, (long)n);
 }
 
 static inline ssize_t_ minx_read(int fd, void *buf, size_t_ n) {
     return minx_syscall3(SYS_READ, fd, (long)buf, (long)n);
+}
+
+static inline long minx_open(const char *path, int flags, int mode) {
+    return minx_syscall3(SYS_OPEN, (long)(uintptr_t)path, flags, mode);
+}
+
+static inline long minx_close(int fd) {
+    return minx_syscall1(SYS_CLOSE, fd);
+}
+
+static inline off_t_ minx_lseek(int fd, off_t_ off, int whence) {
+    return minx_syscall3(SYS_LSEEK, fd, (long)off, whence);
+}
+
+static inline long minx_stat(const char *path, struct minx_stat *st) {
+    return minx_syscall2(SYS_STAT, (long)(uintptr_t)path, (long)(uintptr_t)st);
+}
+
+static inline long minx_lstat(const char *path, struct minx_stat *st) {
+    return minx_syscall2(SYS_LSTAT, (long)(uintptr_t)path, (long)(uintptr_t)st);
+}
+
+static inline long minx_fstat(int fd, struct minx_stat *st) {
+    return minx_syscall2(SYS_FSTAT, fd, (long)(uintptr_t)st);
+}
+
+static inline long minx_getdents(int fd, void *buf, size_t_ n) {
+    return minx_syscall3(SYS_GETDENTS, fd, (long)(uintptr_t)buf, (long)n);
+}
+
+static inline long minx_dup(int fd) { return minx_syscall1(SYS_DUP, fd); }
+
+static inline long minx_dup2(int a, int b) { return minx_syscall2(SYS_DUP2, a, b); }
+
+static inline long minx_mkdir(const char *path, int mode) {
+    return minx_syscall2(SYS_MKDIR, (long)(uintptr_t)path, mode);
+}
+
+static inline long minx_rmdir(const char *path) {
+    return minx_syscall1(SYS_RMDIR, (long)(uintptr_t)path);
+}
+
+static inline long minx_unlink(const char *path) {
+    return minx_syscall1(SYS_UNLINK, (long)(uintptr_t)path);
+}
+
+static inline long minx_rename(const char *from, const char *to) {
+    return minx_syscall2(SYS_RENAME, (long)(uintptr_t)from, (long)(uintptr_t)to);
+}
+
+static inline long minx_link(const char *from, const char *to) {
+    return minx_syscall2(SYS_LINK, (long)(uintptr_t)from, (long)(uintptr_t)to);
+}
+
+static inline long minx_symlink(const char *target, const char *path) {
+    return minx_syscall2(SYS_SYMLINK, (long)(uintptr_t)target, (long)(uintptr_t)path);
+}
+
+static inline long minx_readlink(const char *path, char *buf, size_t_ n) {
+    return minx_syscall3(SYS_READLINK, (long)(uintptr_t)path, (long)(uintptr_t)buf,
+                         (long)n);
+}
+
+static inline long minx_chmod(const char *path, int mode) {
+    return minx_syscall2(SYS_CHMOD, (long)(uintptr_t)path, mode);
+}
+
+static inline long minx_chown(const char *path, int uid, int gid) {
+    return minx_syscall3(SYS_CHOWN, (long)(uintptr_t)path, uid, gid);
+}
+
+static inline long minx_truncate(const char *path, off_t_ len) {
+    return minx_syscall2(SYS_TRUNCATE, (long)(uintptr_t)path, (long)len);
+}
+
+static inline long minx_ftruncate(int fd, off_t_ len) {
+    return minx_syscall2(SYS_FTRUNCATE, fd, (long)len);
+}
+
+static inline long minx_utimes(const char *path, const unsigned long *times) {
+    return minx_syscall2(SYS_UTIMES, (long)(uintptr_t)path, (long)(uintptr_t)times);
+}
+
+static inline long minx_chdir(const char *path) {
+    return minx_syscall1(SYS_CHDIR, (long)(uintptr_t)path);
+}
+
+static inline long minx_getcwd(char *buf, size_t_ n) {
+    return minx_syscall2(SYS_GETCWD, (long)(uintptr_t)buf, (long)n);
+}
+
+static inline long minx_umask(int mask) { return minx_syscall1(SYS_UMASK, mask); }
+
+static inline long minx_access(const char *path, int mode) {
+    return minx_syscall2(SYS_ACCESS, (long)(uintptr_t)path, mode);
+}
+
+static inline long minx_mount(const char *src, const char *target, const char *type) {
+    return minx_syscall3(SYS_MOUNT, (long)(uintptr_t)src, (long)(uintptr_t)target,
+                         (long)(uintptr_t)type);
+}
+
+static inline long minx_umount(const char *target) {
+    return minx_syscall1(SYS_UMOUNT, (long)(uintptr_t)target);
+}
+
+static inline long minx_fcntl(int fd, int cmd, long arg) {
+    return minx_syscall3(SYS_FCNTL, fd, cmd, arg);
+}
+
+static inline long minx_ioctl(int fd, unsigned long request, unsigned long arg) {
+    return minx_syscall3(SYS_IOCTL, fd, (long)request, (long)arg);
 }
 
 /* Replace this process with the program called `path`.
@@ -152,26 +383,43 @@ static inline long minx_exec(const char *path, char *const *argv, char *const *e
                          (long)(uintptr_t)envp);
 }
 
-/* Close a descriptor.  The kernel returns EBADF for a number that is not open, and for
- * 0, 1 and 2 as well: the console belongs to the process table, not to the program, so a
- * program that closes its own stdout loses its output rather than taking the console away
- * from every other process on the machine. */
-static inline long minx_close(int fd) {
-    return minx_syscall1(SYS_CLOSE, fd);
-}
-
-/* Create a pipe and write its two ends into `fds`, which must be a pointer to two ints.
- * Returns 0, or -errno. */
-static inline long minx_pipe(int *fds) {
-    return minx_syscall1(SYS_PIPE, (long)(uintptr_t)fds);
-}
-
+/* The console's descriptor is not the program's to close: it belongs to the process table,
+ * so a program that closes its own stdout loses its output rather than taking the console
+ * away from every other process on the machine. */
 static inline long minx_exit(int code) {
     return minx_syscall1(SYS_EXIT, code);
 }
 
 static inline long minx_getpid(void) {
     return minx_syscall1(SYS_GETPID, 0);
+}
+
+static inline long minx_getppid(void) {
+    return minx_syscall1(SYS_GETPPID, 0);
+}
+
+static inline long minx_getuid(void) {
+    return minx_syscall1(SYS_GETUID, 0);
+}
+
+static inline long minx_getgid(void) {
+    return minx_syscall1(SYS_GETGID, 0);
+}
+
+static inline long minx_getpgid(long pid) {
+    return minx_syscall1(SYS_GETPGID, pid);
+}
+
+static inline long minx_setpgid(long pid, long pgid) {
+    return minx_syscall2(SYS_SETPGID, pid, pgid);
+}
+
+static inline long minx_setsid(void) {
+    return minx_syscall1(SYS_SETSID, 0);
+}
+
+static inline void *minx_brk(void *addr) {
+    return (void *)(uintptr_t)minx_syscall1(SYS_BRK, (long)(uintptr_t)addr);
 }
 
 /* Returns the child's identifier in the parent and zero in the child, which is the whole
@@ -188,6 +436,40 @@ static inline long minx_wait(int *status) {
     return minx_syscall2(SYS_WAIT, (long)(uintptr_t)status, 0);
 }
 
+/* Create a pipe and write its two ends into `fds`, which must be a pointer to two ints.
+ * Returns 0, or -errno. */
+static inline long minx_pipe(int *fds) {
+    return minx_syscall1(SYS_PIPE, (long)(uintptr_t)fds);
+}
+
+/* Sleep for `sec.nsec`.  Returns 0, or -errno. */
+static inline long minx_nanosleep(unsigned long sec, unsigned long nsec) {
+    unsigned long ts[2];
+
+    ts[0] = sec;
+    ts[1] = nsec;
+    return minx_syscall2(SYS_NANOSLEEP, (long)(uintptr_t)ts, 0);
+}
+
+static inline long minx_sched_yield(void) {
+    return minx_syscall1(SYS_SCHED_YIELD, 0);
+}
+
+/* Map `length` bytes of anonymous memory.  Returns the address, or a negative errno. */
+static inline void *minx_mmap(unsigned long addr, unsigned long length, int prot,
+                              int flags) {
+    return (void *)(uintptr_t)minx_syscall6(SYS_MMAP, (long)addr, (long)length, prot,
+                                            flags, -1, 0);
+}
+
+static inline long minx_munmap(void *addr, unsigned long length) {
+    return minx_syscall2(SYS_MUNMAP, (long)(uintptr_t)addr, (long)length);
+}
+
+static inline long minx_mprotect(void *addr, unsigned long length, int prot) {
+    return minx_syscall3(SYS_MPROTECT, (long)(uintptr_t)addr, (long)length, prot);
+}
+
 /* Send `signum` to a process.  `pid` is a process identifier; 0 means this process and
  * nothing else.  Returns 0, or -errno. */
 static inline long minx_kill(long pid, int signum) {
@@ -202,7 +484,7 @@ static inline long minx_sigaction(int signum, const struct sigaction *act,
                          (long)(uintptr_t)old);
 }
 
-/* Change what is blocked: `how` is 0 to add, 1 to remove, 2 to replace.  `old_set` may be
+/* Change what is blocked: `how` is SIG_BLOCK, SIG_UNBLOCK or SIG_SETMASK.  `old_set` may be
  * NULL.  Returns 0, or -errno. */
 static inline long minx_sigprocmask(int how, const unsigned long *set,
                                     unsigned long *old_set) {
@@ -210,8 +492,7 @@ static inline long minx_sigprocmask(int how, const unsigned long *set,
                          (long)(uintptr_t)old_set);
 }
 
-/* The signals that are pending and not blocked, written into `set`.  Returns 0, or
- * -errno. */
+/* The signals that are pending, written into `set`.  Returns 0, or -errno. */
 static inline long minx_sigpending(unsigned long *set) {
     return minx_syscall1(SYS_SIGPENDING, (long)(uintptr_t)set);
 }

@@ -9,6 +9,8 @@
  * debugger or a crash report walking it stops here instead of walking into whatever the
  * kernel happened to leave in RBP.
  */
+#include "minx_syscall.inc"
+
 .section .text
 .globl _start
 .type _start, @function
@@ -40,7 +42,7 @@ _start:
      * reference at link time.  Doing it directly also puts the ABI in one place, which
      * is the point of having an entry point at all. */
     movl    %eax, %edi              /* SYS_EXIT's argument */
-    movl    $4, %eax                /* SYS_EXIT */
+    movl    $SYS_EXIT, %eax         /* the number, from the kernel's own enum */
     int     $0x80
 
     /* exit does not return either.  Looping here is a visible failure; falling off the

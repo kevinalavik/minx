@@ -142,7 +142,7 @@ USER_CFLAGS := -std=gnu11 -ffreestanding -nostdlib -nostdinc \
             -isystem $(FREESTD_INC) -fno-stack-protector -fno-pic -fno-pie \
             -fno-asynchronous-unwind-tables -mno-red-zone -mno-mmx -mno-sse \
             -mno-sse2 -m64 -MMD -MP $(OPT) $(WARN) \
-            -I$(LIBC_DIR)/include -I$(LIBC_DIR)/src -D__MINX__=1
+            -I$(LIBC_DIR)/include -I$(LIBC_DIR)/src -I$(GEN_INC) -D__MINX__=1
 USER_LDFLAGS := -static -nostdlib -no-pie -z noexecstack --build-id=none \
             -L$(BUILD)/lib -lc
 
@@ -188,14 +188,30 @@ PROGRAMS_H     := $(GEN_INC)/programs_list.h
 $(BUILD)/k/kernel/lib/programs.o: $(PROGRAMS_H)
 $(BUILD)/k/kernel/test/selftest.o: $(PROGRAMS_H)
 
+# The syscall numbers, read out of the kernel's enum rather than copied into the user side.
+# Two files because there are two languages: a C header for user/common/minx_user.h and an
+# assembler include for user/common/start.S.  The second one is the point -- the entry stub's
+# exit syscall was a literal, and when the enum was renumbered the literal became `lseek`.
+SYSCALL_TABLE_H := $(GEN_INC)/minx_syscall_table.h
+SYSCALL_TABLE_INC := $(GEN_INC)/minx_syscall.inc
+
 LIBC_C   := $(shell find $(LIBC_DIR)/src -name '*.c' 2>/dev/null | sort)
 LIBC_ASM := $(shell find $(LIBC_DIR)/src -name '*.S' 2>/dev/null | sort)
 LIBC_OBJ := $(LIBC_C:%.c=$(BUILD)/u/%.o) $(LIBC_ASM:%.S=$(BUILD)/u/%.o)
 LIBC     := $(BUILD)/lib/libc.a
 
-USER_BIN := $(foreach prog,$(shell ls $(USER_DIR) 2>/dev/null | grep -v -e '\.' -e Makefile), \
-                        $(BUILD)/bin/$(prog))
+# The binaries that go into the initrd.
+#
+# From USER_PROGS rather than from a directory listing, and the reason is a bug this tree had:
+# the listing was taken over `userland/`, which holds no programs -- the ring-3 programs live
+# in `user/`, one directory each -- so the list was empty, the initrd rule had no programs to
+# install, and `make iso` produced an image with a filesystem containing directories and
+# nothing in them.  Nothing failed.  The kernel booted, mounted /proc and /dev, and then
+# reported that there was no /init, which is the only reason this was ever noticed.
+USER_BIN := $(foreach prog,$(USER_PROGS),$(BUILD)/bin/$(prog))
 
+# Anything under tests/ that is a program rather than a directory or a script.  Kept as a
+# listing because a test is one file and does not deserve a directory.
 TEST_BIN := $(foreach prog,$(shell ls $(TESTS_DIR) 2>/dev/null | grep -v -e '\.' -e Makefile), \
                         $(BUILD)/bin/$(prog))
 
@@ -348,7 +364,7 @@ COMMON_SRC := $(wildcard user/common/*.c) $(wildcard user/common/*.S)
 # outright is no more code and cannot go wrong that way.
 define USER_PROGRAM_RULE
 $(BUILD)/bin/$(1): $$(wildcard user/$(1)/*.c) $$(wildcard user/$(1)/*.S) \
-                     $$(COMMON_SRC) $$(USER_HDRS)
+                     $$(COMMON_SRC) $$(USER_HDRS) $(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC)
 	@mkdir -p $$(dir $$@)
 	$(CC) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS) -Iuser/common -Iuser/$(1) \
 	    $$(wildcard user/$(1)/*.c) $$(wildcard user/$(1)/*.S) $(COMMON_SRC) \
@@ -377,8 +393,14 @@ $(INITRD_ROOT)/.stamp: $(ALL_BIN) $(INITRD_SRC)/tree.stamp
 	          $(INITRD_ROOT)/dev $(INITRD_ROOT)/proc $(INITRD_ROOT)/tmp \
 	          $(INITRD_ROOT)/home $(INITRD_ROOT)/root $(INITRD_ROOT)/usr/bin \
 	          $(INITRD_ROOT)/usr/lib $(INITRD_ROOT)/usr/share
+	# `init` goes at the root, where the kernel looks for it, and not in /bin as well:
+	# two copies of a program is two copies to keep in step, and the one in /bin is a
+	# second name for the same file that nobody asked for.
 	@for b in $(ALL_BIN); do \
-	    install -m 755 $$b $(INITRD_ROOT)/bin/; \
+	    case $$(basename $$b) in \
+		init) install -m 755 $$b $(INITRD_ROOT)/init ;; \
+		*)     install -m 755 $$b $(INITRD_ROOT)/bin/ ;; \
+	    esac; \
 	done
 	@for b in $(INITRD_ROOT)/bin/init $(INITRD_ROOT)/bin/sh; do \
 	    test -f $$b || continue; \
@@ -407,6 +429,13 @@ $(GEN_INC)/%_image.h: $(BUILD)/bin/% tools/bin2c.py
 $(PROGRAMS_H): $(USER_IMAGE_H) tools/gen-programs-list.sh
 	@mkdir -p $(GEN_INC)
 	@sh tools/gen-programs-list.sh $(GEN_INC) $@ $(USER_PROGS)
+
+# One enum, one reader.  Depends on the kernel header so that renumbering the syscalls
+# regenerates this without anything having to remember to.
+$(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC): $(KERNEL_DIR)/include/syscall.h \
+                                         tools/gen-syscall-table.sh
+	@mkdir -p $(GEN_INC)
+	@sh tools/gen-syscall-table.sh $< $(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC)
 
 $(INITRD): $(INITRD_ROOT)/.stamp
 	@mkdir -p $(dir $@)
