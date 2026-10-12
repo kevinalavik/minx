@@ -54,23 +54,14 @@ static block_t *free_list;
 static char    *heap_base;       /* where the kernel says the break was, once known */
 static char    *heap_break;
 
-/* The heap's top, as `brk()` reports it.  `sbrk(0)` is the portable way to ask and this
- * kernel's `brk` answers it, so the boundary between "already got it" and "ask for more"
- * is one call rather than a variable to keep in step. */
-static char *heap_ask(size_t n) {
-    char *want = heap_break + n;
-    char *got  = sbrk((intptr_t)n);
-
-    if (got == NULL || got != want) {
-        /* The kernel refused, or gave us something other than what was asked for.  Both are
-         * failures and both leave the break where it was: a half-extended heap is not a
-         * heap, it is a heap with a hole in it. */
-        errno = ENOMEM;
-        return NULL;
-    }
-
-    return heap_break;
-}
+/* The page the kernel grows the heap in.
+ *
+ * `brk` moves the break in whole pages, because that is the unit it allocates and unmaps
+ * in, so asking for 100 bytes moves it by 4096.  That is not a quirk to work around -- it
+ * is what makes the heap contiguous -- but it is why nothing here may ask for an exact
+ * figure and insist on getting it back: `sbrk(100)` cannot return what was asked for, and
+ * code that checks fails on the first allocation of every program and every one after it. */
+#define HEAP_PAGE 4096
 
 /* Add `b` to the free list, coalescing with the blocks around it.
  *
@@ -155,7 +146,22 @@ void *malloc(size_t n) {
                 rest->next = b->next;
                 rest->free = 1;
                 b->size = need;
-                b->next = rest;
+
+                /* The remainder *replaces* the block in the list, and the block leaves it.
+                 *
+                 * Leaving the block in place -- linking the remainder after it and handing
+                 * the block out -- puts the same block on the free list and in the
+                 * caller's hands at once.  The second `malloc()` of the same size then
+                 * returns the same pointer, which is right, and the `free()` of it then
+                 * finds a block that is *already* at the head of the list and links it to
+                 * itself.  From that moment the free list is a ring of one and every
+                 * `malloc()` that has to walk it spins for ever.
+                 *
+                 * That is exactly what `libctest` did: four allocations and the fifth hung,
+                 * in a program whose every individual operation had worked.  A free list
+                 * that can contain a block the caller also owns is a free list that will
+                 * eventually not be a list. */
+                *slot = rest;
             } else {
                 *slot = b->next;
             }
@@ -167,24 +173,44 @@ void *malloc(size_t n) {
         slot = &(*slot)->next;
     }
 
-    /* Nothing on the list fits, so the heap grows.  The new block is carved off the end
-     * rather than freed first: the kernel's `brk()` gives whole pages back to nobody, so
-     * extending and then freeing would put a block on the list that is at the very top of
-     * the heap, where the coalescing code would have to know it can merge *forward* with
-     * the next extension. */
-    if (heap_base == NULL)
-        heap_base = heap_break;
+    /* Nothing on the list fits, so the heap grows.
+     *
+     * The block is carved off the *front* of what came back and the remainder goes on the
+     * free list, rather than asking for exactly what was needed.  The reason that matters
+     * is the second one: the leftover of this allocation is the page the *next* allocation
+     * comes from, so a program that allocates and frees in a loop stops asking the kernel
+     * after the first few instead of once per allocation for ever.
+     *
+     * The reason it is written that way at all is the first one, and it is the bug this
+     * replaces: `brk()` moves the break in whole pages, so the amount obtained is never the
+     * amount asked for.  Code that asked for exactly what it needed and checked the answer
+     * failed on the first allocation of every program -- which is how `libctest` reported
+     * "calloc" failing before it had run a single `printf`. */
+    char *before = heap_break;
 
-    if (heap_ask(BLOCK_HDR + need) == NULL)
+    if (sbrk((intptr_t)(BLOCK_HDR + need)) == NULL)
         return NULL;
 
-    block_t *b = (block_t *)heap_break;
+    size_t got = (size_t)(heap_break - before);
 
-    heap_break += BLOCK_HDR + need;
+    if (got < BLOCK_HDR + need)
+        return NULL;            /* cannot happen: the kernel rounds *up* */
+
+    block_t *b = (block_t *)before;
+    size_t   rest = got - BLOCK_HDR - need;
 
     b->size = need;
     b->next = NULL;
     b->free = 0;
+
+    if (rest >= BLOCK_HDR + MIN_BLOCK) {
+        block_t *tail = (block_t *)((char *)b + BLOCK_HDR + need);
+
+        tail->size = rest - BLOCK_HDR;
+        tail->next = NULL;
+        tail->free = 1;
+        block_free(tail);
+    }
 
     return (char *)b + BLOCK_HDR;
 }
@@ -317,6 +343,25 @@ static void env_sync(void) {
         environ = env_storage;
         env_ready = 1;
     }
+}
+
+/* Take on a different environment: the loader's, when the program was started by something
+ * that had one to give.
+ *
+ * `startup_env` is a private array in start.c and the `environ` table here is a private
+ * array in this file, so one of the two has to be adopted into the other rather than
+ * pointed at -- and the table has to be the one the *program* can change, because
+ * `setenv()` writes through `environ`.  A program that `setenv()`s a variable and then
+ * `fork`s and `exec`s would otherwise pass the wrong array to its child. */
+void __libc_adopt_env(char **envp) {
+    env_count = 0;
+    env_ready = 1;
+    environ  = env_storage;
+
+    for (unsigned i = 0; envp != NULL && envp[i] != NULL && i < ENV_MAX; i++)
+        env_storage[env_count++] = envp[i];
+
+    env_storage[env_count] = NULL;
 }
 
 char *getenv(const char *name) {
