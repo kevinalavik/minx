@@ -24,6 +24,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
+#include <getopt.h>
+#include <glob.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -385,6 +388,176 @@ int main(int argc, char **argv, char **envp) {
         unlink("/tmp/libctest-dir/two");
         rmdir("/tmp/libctest-dir/inner");
         check(rmdir("/tmp/libctest-dir") == 0, "the test directory is removed");
+    }
+
+    /* --- getopt ---------------------------------------------------------------- */
+
+    {
+        /* The parsing rules are the whole of `getopt`, and three of them are not what a
+         * newcomer expects: options stop at the first non-option, `--` ends them, and a
+         * missing argument is a different answer from an unknown option. */
+        /* `-bc` is two options in one element, and `-d arg` is one option with the next
+         * element as its argument.  Both spellings have to work and neither may eat the
+         * other: `-bV` with a `b` that takes an argument is `-b V`, not `-b -V`. */
+        static char *av1[] = { "prog", "-a", "-bc", "-d", "arg", "file", "--", "-z", NULL };
+        static char *av2[] = { "prog", "-q", NULL };
+
+        opterr = 0;
+        optind = 1;
+        optreset();
+
+        int c = getopt(8, av1, "abcd:");
+        check(c == 'a', "getopt returns a short option");
+
+        c = getopt(8, av1, "abcd:");
+        check(c == 'b', "getopt reads the first option of a bundled element");
+
+        c = getopt(8, av1, "abcd:");
+        check(c == 'c', "getopt reads several options out of one element");
+
+        c = getopt(8, av1, "abcd:");
+        check(c == 'd' && optarg != NULL && strcmp(optarg, "arg") == 0,
+              "getopt takes a separate argument and puts it in optarg");
+
+        /* `file` is not an option, so the options are over -- and the `-z` after the `--`
+         * must not be reached, or a program could never name a file that starts with a
+         * dash. */
+        c = getopt(8, av1, "abcd:");
+        check(c == -1 && optind == 5,
+              "getopt stops at the first non-option and leaves optind on it");
+
+        /* An unknown option is reported and skipped, not treated as the end: a program
+         * that gave up could never be given a new option by whoever invoked it. */
+        optreset();
+        c = getopt(2, av2, "ab");
+        check(c == '?', "getopt reports an unknown option");
+
+        /* And a *known* option that wanted an argument and did not get one, with the
+         * leading colon in optstring so the two cases can be told apart. */
+        static char *av3[] = { "prog", "-b", NULL };
+
+        optreset();
+        c = getopt(2, av3, ":ab:");
+        check(c == ':' && optopt == 'b',
+              "getopt distinguishes a missing argument from an unknown option");
+
+        /* The attached spelling, which is how `-Wall` works. */
+        static char *av4[] = { "prog", "-bV", NULL };
+
+        optreset();
+        c = getopt(2, av4, "b:");
+        check(c == 'b' && optarg != NULL && strcmp(optarg, "V") == 0,
+              "getopt takes an attached argument");
+    }
+
+    /* --- fnmatch ---------------------------------------------------------------- */
+
+    {
+        check(fnmatch("*", "anything", 0) == 0, "fnmatch: * matches");
+        check(fnmatch("*.c", "hello.c", 0) == 0, "fnmatch: * at the end");
+        check(fnmatch("*.c", "hello.o", 0) == FNM_NOMATCH, "fnmatch: * at the end, no match");
+        check(fnmatch("a?c", "abc", 0) == 0, "fnmatch: ? is one character");
+        check(fnmatch("a?c", "ac", 0) == FNM_NOMATCH, "fnmatch: ? is exactly one");
+        check(fnmatch("a[bc]d", "abd", 0) == 0, "fnmatch: a set");
+        check(fnmatch("a[!bc]d", "abd", 0) == FNM_NOMATCH, "fnmatch: a negated set");
+        check(fnmatch("a[!bc]d", "axd", 0) == 0, "fnmatch: a negated set matches");
+        check(fnmatch("[a-z]*", "hello", 0) == 0, "fnmatch: a range");
+        check(fnmatch("a\\*b", "a*b", 0) == 0, "fnmatch: a backslash escapes");
+        check(fnmatch("a\\*b", "axxb", 0) == FNM_NOMATCH, "fnmatch: an escaped star is literal");
+
+        /* The leading dot, which `FNM_PERIOD` is about and `FNM_PATHNAME` is not.  Note
+         * that the *default* lets `*` match a leading dot: that is POSIX, and it is why
+         * `glob()` below always passes the flag and why `sh` never offers a dotfile to
+         * the matcher at all.  A libc whose default were the other way would make
+         * `fnmatch("*", ".hidden", 0)` a test that passes here and fails everywhere. */
+        check(fnmatch("*", ".hidden", 0) == 0,
+              "fnmatch: * matches a leading dot unless FNM_PERIOD says otherwise");
+        check(fnmatch("*", ".hidden", FNM_PERIOD) == FNM_NOMATCH,
+              "fnmatch: FNM_PERIOD stops it");
+        check(fnmatch(".*", ".hidden", 0) == 0, "fnmatch: .* matches a leading dot");
+        check(fnmatch("?", ".hidden", FNM_PERIOD) == FNM_NOMATCH,
+              "fnmatch: FNM_PERIOD stops ? as well as *");
+
+        /* And the one that stops `*` crossing a directory boundary, which is what makes
+         * `find -name '*.c'` find files rather than directories that end in .c. */
+        check(fnmatch("*", "a/b", 0) == 0, "fnmatch: * crosses a slash by default");
+        check(fnmatch("*", "a/b", FNM_PATHNAME) == FNM_NOMATCH,
+              "fnmatch: FNM_PATHNAME stops it");
+        check(fnmatch("src/*.c", "src/a.c", FNM_PATHNAME) == 0,
+              "fnmatch: a pattern with a directory");
+        check(fnmatch("*.c", "src/a.c", FNM_PATHNAME) == FNM_NOMATCH,
+              "fnmatch: FNM_PATHNAME does not let a pattern match a path");
+
+        /* A `[` that is never closed is a literal bracket, not an unterminated set: a
+         * pattern that treated it as a set would match `[` itself and change the meaning
+         * of an ordinary file name. */
+        check(fnmatch("[abc", "[abc", 0) == 0, "fnmatch: an unterminated set is literal");
+    }
+
+    /* --- glob ------------------------------------------------------------------- */
+
+    {
+        mkdir("/tmp/globtest", 0755);
+
+        static const char *names[] = { "one.c", "two.c", "three.h", ".hidden", NULL };
+
+        for (int i = 0; names[i] != NULL; i++) {
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/globtest/%s", names[i]);
+            FILE *f = fopen(path, "w");
+            if (f != NULL)
+                fclose(f);
+        }
+
+        glob_t g;
+
+        memset(&g, 0, sizeof(g));
+        check(glob("/tmp/globtest/*.c", 0, NULL, &g) == GLOB_NOMATCH && g.gl_pathc == 2,
+              "glob finds the two .c files");
+        check(g.gl_pathc == 2 && strcmp(g.gl_pathv[0], "/tmp/globtest/one.c") == 0 &&
+              strcmp(g.gl_pathv[1], "/tmp/globtest/two.c") == 0,
+              "glob sorts what it found, and only what matched");
+        globfree(&g);
+
+        /* A dotfile is not matched by `*`, which is the difference between `cp *` and
+         * `cp .*`. */
+        memset(&g, 0, sizeof(g));
+        glob("/tmp/globtest/*", 0, NULL, &g);
+        check(g.gl_pathc == 3, "glob does not hand back a dotfile for *");
+        globfree(&g);
+
+        memset(&g, 0, sizeof(g));
+        glob("/tmp/globtest/.*", 0, NULL, &g);
+        check(g.gl_pathc >= 2, "glob finds a dotfile when the pattern says so");
+        globfree(&g);
+
+        /* Nothing matching is not an error.  `sh` has to be able to tell "no files" from
+         * "something went wrong", and GLOB_NOMATCH is 0 so that it can. */
+        memset(&g, 0, sizeof(g));
+        check(glob("/tmp/globtest/*.zzz", 0, NULL, &g) == GLOB_NOMATCH && g.gl_pathc == 0,
+              "glob reports no match without calling it an error");
+        globfree(&g);
+
+        /* With GLOB_NOCHECK the pattern comes back unchanged, which is what lets `rm *.o`
+         * in a directory with no object files say which name it could not find. */
+        memset(&g, 0, sizeof(g));
+        glob("/tmp/globtest/*.zzz", GLOB_NOCHECK, NULL, &g);
+        check(g.gl_pathc == 1 && strcmp(g.gl_pathv[0], "/tmp/globtest/*.zzz") == 0,
+              "glob with GLOB_NOCHECK returns the pattern itself");
+        globfree(&g);
+
+        /* A pattern in a directory that is not there is "no match", not an error, or a
+         * glob under a missing directory could not be reported. */
+        memset(&g, 0, sizeof(g));
+        check(glob("/tmp/no-such-dir/*", 0, NULL, &g) == GLOB_NOMATCH && g.gl_pathc == 0,
+              "glob under a missing directory is no match, not an error");
+
+        for (int i = 0; names[i] != NULL; i++) {
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/globtest/%s", names[i]);
+            unlink(path);
+        }
+        check(rmdir("/tmp/globtest") == 0, "the glob test directory is removed");
     }
 
     /* --- the standard streams -------------------------------------------------- */
