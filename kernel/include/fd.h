@@ -45,6 +45,14 @@ fd_entry_t *fd_get(int fd);
  * program that closes its own stdout should not take the console with it. */
 bool fd_close(int fd);
 
+/* The file a descriptor names, or NULL if it does not name one.
+ *
+ * Separate from `fd_get()` because a caller wants to know whether a number is a *file* --
+ * one that can be seeked and stat'ed -- and `fd_get()` answers the other question, which is
+ * whether the number is open at all.  A pipe is open and is not a file, and a program that
+ * lseeks one has to be told ENOSPC rather than have the kernel try. */
+file_t *fd_file(int fd);
+
 /* --- pipes ---------------------------------------------------------------- */
 
 /* How many bytes a pipe holds.  One page: enough that a program writing a line and a

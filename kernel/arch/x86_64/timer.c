@@ -350,6 +350,38 @@ void rtc_read(rtc_time_t *out) {
     out->utc = rtc_utc;
 }
 
+/* Days from the epoch for a civil date, by the shift-and-add the calendar has since
+ * proleptic Gregorian reform: the leap-year pattern repeats exactly every 400 years, so
+ * four divisions and two multiplies get the right answer for any year a machine's clock is
+ * likely to be set to, including the ones before 1970 that a timezone west of Greenwich
+ * lands in.
+ *
+ * Howard Hinnant's algorithm, which is what this is: it is four lines, it has no loop, and
+ * it is right for negative years, which a loop counting years from 1970 is not. */
+static int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);           /* 0-399 */
+    const unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2u) / 5u + d - 1;
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+uint64_t wallclock_seconds(void) {
+    rtc_time_t t;
+
+    rtc_read(&t);
+
+    if (t.year < 1970)
+        return 0;
+
+    int64_t days = days_from_civil(t.year, t.month, t.day);
+
+    return (uint64_t)(days * 86400 + (int64_t)t.hour * 3600 + (int64_t)t.minute * 60 +
+                      (int64_t)t.second);
+}
+
 size_t rtc_format(const rtc_time_t *t, char *buf, size_t size) {
     int n = ksnprintf(buf, size, "%04d-%02u-%02u %02u:%02u:%02u", t->year,
                       t->month, t->day, t->hour, t->minute, t->second);

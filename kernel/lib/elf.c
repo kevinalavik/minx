@@ -43,6 +43,15 @@
  * game.  Both clear of where the segments and the stack go, so a program that grows its
  * heap cannot walk into either -- until phase 7 gives it a real allocator, which is the
  * point at which brk() stops being ENOMEM. */
+/* Where a process's heap starts, and where its anonymous mappings start.
+ *
+ * The heap is a long way above the program so that however far `brk` grows it can never
+ * reach the program's own segments -- a heap that runs into its own text is a heap that
+ * corrupts the program when it grows.  Two megabytes is far more than a small program's
+ * segments need; the linker put them at 4 MiB and they end a few megabytes later.
+ *
+ * `mmap` starts much higher still, so a program's segments, its heap and its mappings are
+ * three regions that never meet.  See memsys.c. */
 #define BRK_START         (USER_IMAGE_BASE + 0x02000000ull)
 #define BRK_END           (USER_IMAGE_BASE + 0x04000000ull)
 
@@ -409,6 +418,7 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
     }
 
     t->brk = BRK_START;
+    t->brk_start = BRK_START;
     t->exit_code = -1;
 
     *entry_rsp = sp;

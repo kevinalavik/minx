@@ -8,6 +8,7 @@
 #include "conio.h"
 
 #include "console.h"
+#include "tty.h"
 #include "cpu.h"
 #include "input.h"
 #include "io.h"
@@ -165,6 +166,16 @@ static void line_submit(void) {
 bool conio_handle_event(const input_event_t *ev) {
     if (ev->type != INPUT_KEY_DOWN)
         return true;
+
+    /* A program with the terminal gets the keystrokes and this loop does not.
+     *
+     * Not a preference: a keystroke that is echoed twice -- once by this line editor and
+     * once by the terminal's -- is a keystroke the person sees twice and the program reads
+     * once, and every `sh` prompt would be doubled.  The loop's own commands stop working
+     * while a program is attached, which is what a terminal does when something is reading
+     * it, and it starts again when the program closes it. */
+    if (tty_attached())
+        return tty_forward_event(ev);
 
     switch (ev->key) {
     case KEY_ENTER:

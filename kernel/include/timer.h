@@ -64,6 +64,14 @@ typedef struct {
 int  rtc_init(void);
 void rtc_read(rtc_time_t *out);
 
+/* Seconds since the epoch, from the real-time clock.
+ *
+ * Separate from `timer_uptime_ms()` on purpose: uptime is measured from boot and moves at
+ * whatever rate the timebase does, while this is the wall clock a file's timestamps and
+ * `date` want.  They disagree by however long the machine has been up, which is the point
+ * of having both. */
+uint64_t wallclock_seconds(void);
+
 /* Format an RTC timestamp as "YYYY-MM-DD HH:MM:SS" into buf. */
 size_t rtc_format(const rtc_time_t *t, char *buf, size_t size);
 

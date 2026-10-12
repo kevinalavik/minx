@@ -3,6 +3,7 @@
 #include "fd.h"
 
 #include "kmalloc.h"
+#include "vfs.h"
 #include "serial.h"
 #include "spinlock.h"
 #include "string.h"
@@ -85,6 +86,16 @@ fd_entry_t *fd_get(int fd) {
     return t[fd].kind == FD_NONE ? NULL : &t[fd];
 }
 
+/* The file a descriptor names, or NULL.  See fd.h for why this is not fd_get(). */
+file_t *fd_file(int fd) {
+    fd_entry_t *e = fd_get(fd);
+
+    if (e == NULL || e->kind != FD_FILE)
+        return NULL;
+
+    return (file_t *)e->obj;
+}
+
 bool fd_close(int fd) {
     fd_entry_t *t = fd_table();
 
@@ -98,9 +109,13 @@ bool fd_close(int fd) {
 
     /* The object first, then the number.  A pipe's readers are waiting to be told the
      * write end is gone, and a reader that is woken before the count is right sees a
-     * pipe that still has writers and goes back to sleep. */
+     * pipe that still has writers and goes back to sleep.  A file is closed here too --
+     * its buffer is freed, because a file that has been unlinked and closed has nothing
+     * left that could reach it. */
     if (e->kind == FD_PIPE)
         pipe_close_end((pipe_t *)e->obj, e->pipe_end);
+    else if (e->kind == FD_FILE)
+        vfs_close((file_t *)e->obj);
 
     e->kind = FD_NONE;
     e->obj = NULL;
