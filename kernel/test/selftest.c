@@ -1779,6 +1779,21 @@ static void test_signal_program(void) {
     test_pass("phase7-signal");
 }
 
+/* Phase 8's program, and the only filesystem test that goes through `int $0x80`.
+ *
+ * `test_ramfs()` below tests the same tree from inside the kernel, and both are here on
+ * purpose.  They cannot catch each other's bugs: the kernel-side one calls `vfs_*()`
+ * directly and so cannot notice a syscall that forgets to validate a pointer, and the
+ * user-side one cannot notice a node whose internal bookkeeping is wrong, because a program
+ * has no way to look at any.  What a pair of them catches that either alone would not is a
+ * disagreement between what the two halves believe, which is the whole class of bug that
+ * shows up as "it works from the tests and not from a program". */
+static void test_fs_program(void) {
+    if (!run_program("fstest", "phase8-vfs", "fstest would not load"))
+        return;
+    test_pass("phase8-vfs");
+}
+
 /* Ring 3 cannot read the kernel, and the check for that is a page-table walk rather
  * than a fault: `syscall_user_range_ok()` is the only thing standing between a
  * program's pointer and the kernel's memory, so it is worth testing on its own rather
@@ -2856,6 +2871,7 @@ void test_run_all(void) {
     test_cow_program();
     test_signal_program();
     test_ramfs();
+    test_fs_program();
     test_sched_queues();
     test_sched_parallel();
     test_sched_preempt();

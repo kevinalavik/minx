@@ -10,6 +10,7 @@
  * header, so the agreement between the two is kept by both being in one place each and by
  * docs/SYSCALLS.md being the third.
  */
+#include <stddef.h>
 #include <stdint.h>
 
 #ifndef MINX_USER_H
@@ -182,6 +183,17 @@ struct minx_dirent {
     unsigned char  d_pad[7];
     char           d_name[256];
 };
+
+/* What `d_type` holds: the `DT_*` values, the same ones every other Unix puts there, so a
+ * program can write `d_type == DT_DIR` and mean it. */
+#define MINX_DT_UNKNOWN 0
+#define MINX_DT_FIFO    1
+#define MINX_DT_CHR     2
+#define MINX_DT_DIR     4
+#define MINX_DT_BLK     6
+#define MINX_DT_REG     8
+#define MINX_DT_LNK     10
+#define MINX_DT_SOCK    12
 
 /* Mode bits, the same as in kernel/include/types.h. */
 #define S_IFMT   0170000u
@@ -524,5 +536,65 @@ static inline size_t_ minx_strlen(const char *s) {
         n++;
     return n;
 }
+
+/* The other two string routines a program needs before it has a libc, for the same reason
+ * and with the same trade: written out, so that the program's own code still has no
+ * unresolved symbols.  A test program that walks a directory listing compares names, and a
+ * program that writes a buffer wants it zeroed rather than left to whatever the loader
+ * left there -- both of which are one call here and a link error without it. */
+static inline int minx_strcmp(const char *a, const char *b) {
+    while (*a != 0 && *a == *b) {
+        a++;
+        b++;
+    }
+
+    /* The difference of the unsigned bytes, not of the chars: a program that gets a
+     * negative answer for "Z" against "a" has been handed a sign that depends on
+     * whether the compiler decided `char` is signed on this machine. */
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+static inline int minx_strncmp(const char *a, const char *b, size_t_ n) {
+    for (size_t_ i = 0; i < n; i++) {
+        int d = (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
+
+        if (d != 0)
+            return d;
+        if (a[i] == 0)
+            return 0;
+    }
+    return 0;
+}
+
+/* strstr, for the same reason: a program reading a file another program wrote cannot
+ * assume the answer is at offset zero, and searching for a field is what keeps it working
+ * when the format grows a field. */
+static inline const char *minx_strstr(const char *hay, const char *needle) {
+    if (*needle == 0)
+        return hay;
+
+    for (; *hay != 0; hay++) {
+        const char *h = hay;
+        const char *n = needle;
+
+        while (*n != 0 && *h == *n) {
+            h++;
+            n++;
+        }
+        if (*n == 0)
+            return hay;
+    }
+    return NULL;
+}
+
+static inline void *minx_memset(void *p, int c, size_t_ n) {
+    unsigned char *b = p;
+
+    for (size_t_ i = 0; i < n; i++)
+        b[i] = (unsigned char)c;
+    return p;
+}
+
+#define memset minx_memset
 
 #endif /* MINX_USER_H */
