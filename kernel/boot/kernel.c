@@ -542,6 +542,13 @@ static void heartbeat(uint64_t now_ms, uint64_t *last_ms) {
         return;
     *last_ms = now_ms;
 
+    /* The console's write lock, for the one writer in the kernel that does not go through
+     * the console.  The heartbeat writes to the serial port directly so that it cannot
+     * disturb what is on the framebuffer, and without this a heartbeat line and a program's
+     * message interleave character by character in the log -- which is exactly the failure
+     * the console lock exists to stop, arriving by the one route that bypasses it. */
+    console_lock();
+
     serial_puts("[hb] up ");
     serial_puts(utoa_to_buf(now_ms));
     serial_puts(" ms, pit ");
@@ -573,6 +580,8 @@ static void heartbeat(uint64_t now_ms, uint64_t *last_ms) {
     serial_puts("s q");
     serial_puts(utoa_to_buf((uint64_t)st.queued));
     serial_puts("\n");
+
+    console_unlock();
 }
 
 /* Runs on the kernel's own stack; kmain() switches to it and never returns. */
@@ -730,7 +739,26 @@ void kmain(void) {
     gdt_init();
     idt_init();
 
+    /* %gs at the boot processor's own per-CPU slot, before the first line is printed.
+     *
+     * `percpu_self()` is `movq %gs:0, %reg` and half the kernel assumes it works, but GS's
+     * base was being installed by `percpu_register()` -- which runs in `cpu_interrupts_init()`,
+     * well after the boot log has started.  Until then `%gs:0` reads address zero, so any
+     * code that asked which processor it was on got a page fault rather than an answer.
+     *
+     * The slot is not *registered* yet -- `percpu_register()`, which fills in `self`, runs
+     * later, in `cpu_interrupts_init()` -- so for the whole boot log `%gs:0` reads NULL.
+     * That is still an answer rather than a fault: `percpu_self_index()` treats a GS that
+     * points at no filled-in slot as pointing at the boot processor's, which is the only
+     * processor that can be running before `percpu_register()` has run.  It must not print
+     * to say so, either: it is called from the console's own lock, and a `kprintf` in here
+     * is a `kprintf` waiting on a lock the caller already holds. */
+    percpu_gs_install_index(percpu_boot_index());
+
     serial_init();
+
+    /* The print lock, before anything can print from more than one processor. */
+    kprintf_init();
 
     /* The direct map offset has to be known before anything calls
      * phys_to_virt(): the framebuffer address, the ACPI tables and every frame

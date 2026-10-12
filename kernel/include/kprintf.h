@@ -11,6 +11,10 @@
 #include <stddef.h>
 
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* Bring the print lock up.  Once, from kmain(), before anything can print from more than
+ * one processor.  See the comment on kprintf() for why there is a lock at all. */
+void kprintf_init(void);
 void kvprintf(const char *fmt, va_list ap);
 void ksprintf(char *buf, size_t size, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));

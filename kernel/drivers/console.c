@@ -4,6 +4,8 @@
 #include "io.h"
 #include "kmalloc.h"
 #include "panic.h"
+#include "percpu.h"
+#include "spinlock.h"
 #include "serial.h"
 #include "string.h"
 #include "types.h"
@@ -690,7 +692,85 @@ void console_putc(char c) {
     putc_escape(c);
 }
 
+/* The console's write lock.
+ *
+ * The console is one buffer with four processors writing into it, and a write is a
+ * *sequence* of characters rather than a character.  Without a lock, two writers interleave
+ * inside each other and the boot log gets lines like "iinnitte:r rsutaprttsin egn,apbild
+ * e" -- half a word from a user program's `write` and half a line from the kernel's own
+ * output.  That is cosmetic in the sense that nothing is wrong, and it is not cosmetic in
+ * the sense that it makes the serial log useless as evidence: a message split in half is
+ * not findable by `grep`, and every phase of this kernel has been verified by reading that
+ * log.  "The line is there somewhere" is not the same as "the log says it".
+ *
+ * The lock is *not* re-entrant, and making it so would be the wrong answer twice over.  A
+ * re-entrant lock needs per-processor state to count depth, and that state is indexed by
+ * the same `%gs:0` this function is reached through -- so a mistake in the nesting turns a
+ * cosmetic bug into memory corruption, which is a bad trade for a boot log.  What nesting
+ * would need it is also not there: `kprintf` holds the lock across format-and-write and then
+ * calls `console_write_locked()`, not `console_write()`.
+ *
+ * Interrupts are off across the whole thing.  An interrupt that arrives while the lock is
+ * held and tries to print would deadlock against the code it interrupted, and that is not a
+ * rare event: the timer fires every millisecond. */
+static ticket_lock_t out_lock;
+static bool          out_lock_ready;
+static uint64_t      out_lock_flags[MAX_CPU_COUNT];
+
+/* Which slot to keep this processor's saved interrupt flags in.
+ *
+ * `percpu_self_index()` answers the boot processor's slot when GS has not been installed
+ * yet, which is the case for the first lines the kernel prints.  That answer is in range,
+ * so the clamp below is a backstop rather than the usual path -- but indexing an array with
+ * an out-of-range processor index would write past the end of it into whatever static
+ * happens to be next, which on this build is the lock itself, and a lock that corrupts
+ * itself when it is contended is worse than no lock at all. */
+static unsigned lock_flags_slot(void) {
+    unsigned idx = percpu_self_index();
+
+    return idx < MAX_CPU_COUNT ? idx : 0;
+}
+
+void console_lock(void) {
+    /* Before the lock exists there is nothing to take and nothing to deadlock against
+     * either, because nothing else is running: the first characters this kernel ever prints
+     * are its own, on one processor, before the application processors are up.  Taking a
+     * lock `ticket_lock_init()` has never seen is a different thing, and it is how the first
+     * line of the boot log becomes the one line that is never printed. */
+    if (!out_lock_ready)
+        return;
+
+    out_lock_flags[lock_flags_slot()] = spin_lock_irqsave(&out_lock);
+}
+
+void console_unlock(void) {
+    if (!out_lock_ready)
+        return;
+
+    spin_unlock_irqrestore(&out_lock, out_lock_flags[lock_flags_slot()]);
+}
+
+/* Bring the write lock up.  Called once, from kmain(), before anything can print from more
+ * than one processor. */
+void console_lock_init(void) {
+    ticket_lock_init(&out_lock);
+    out_lock_ready = true;
+}
+
 void console_write(const char *data, size_t len) {
+    console_lock();
+
+    for (size_t i = 0; i < len; i++)
+        console_putc(data[i]);
+
+    console_unlock();
+}
+
+/* The same write with the lock already held, for a caller that is holding it -- `kprintf`
+ * formats a whole line into a buffer and then writes it, and taking the lock around each
+ * `console_write` separately would let another writer in between the format and the write,
+ * which is the same interleaving in a different place. */
+void console_write_locked(const char *data, size_t len) {
     for (size_t i = 0; i < len; i++)
         console_putc(data[i]);
 }
@@ -700,11 +780,21 @@ void console_puts(const char *s) {
 }
 
 void console_write_attr(const char *data, size_t len, console_color_t color) {
-    console_color_t saved = con.cur;
+    console_color_t saved;
+    size_t i;
+
+    /* The current colour is shared state, so this has to hold the lock for the whole run,
+     * not per character: two writers each saving and restoring `con.cur` around their own
+     * characters would hand each other the wrong colour. */
+    console_lock();
+
+    saved = con.cur;
     con.cur = color;
-    for (size_t i = 0; i < len; i++)
+    for (i = 0; i < len; i++)
         console_putc(data[i]);
     con.cur = saved;
+
+    console_unlock();
 }
 
 /* Used by the panic path, which must never recurse into the escape parser. */
@@ -713,6 +803,15 @@ void console_putc_raw(char c) {
     putc_plain(c);
 }
 
+/* Deliberately *not* locked.
+ *
+ * This is the path a fault or a panic prints through, and it is the one place where being
+ * unable to print is worse than printing untidily.  A lock here would deadlock against
+ * whichever processor happens to hold it -- including the processor that faulted *inside* a
+ * console write, which is not a hypothetical: `console_putc()` touches the framebuffer,
+ * and a console write is exactly the kind of code that ends up taking a page fault.  So
+ * this path may interleave with another writer's line.  That is the right way round: the
+ * reader of a panic message needs the message, not the alignment. */
 void console_raw_write(const char *data, size_t len) {
     for (size_t i = 0; i < len; i++)
         console_putc_raw(data[i]);

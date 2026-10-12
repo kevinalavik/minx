@@ -1,4 +1,7 @@
 #include "kprintf.h"
+#include "console.h"
+#include "spinlock.h"
+#include "spinlock.h"
 
 #include "console.h"
 #include "string.h"
@@ -317,14 +320,46 @@ void kvprintf(const char *fmt, va_list ap) {
     int n = kvsnprintf(buf, sizeof(buf), fmt, ap);
     if (n < 0)
         return;
-    console_write(buf, strlen(buf));
+    console_write_locked(buf, strlen(buf));
 }
 
+/* One lock for the whole of a formatted write.
+ *
+ * The console is shared: the framebuffer, the serial mirror and the serial-only heartbeat
+ * are all writing into the same buffer, from four processors, and a write is a *sequence*
+ * of characters rather than a character.  Without a lock two of them interleave inside each
+ * other, which is why the boot log has lines like "it: console is descriptor 3" -- the
+ * middle of a word from one processor and the end of a line from another.
+ *
+ * That is cosmetic in the sense that nothing is wrong, and it is not cosmetic in the sense
+ * that it makes the serial log useless as evidence: a message can be split in half and
+ * neither half is findable by `grep`.  Every phase in this kernel was verified by reading
+ * that log, and "the line is there somewhere" is not the same as "the log says it".
+ *
+ * IRQ-saving, because `kprintf` is called from interrupt paths -- an unexpected vector, a
+ * fault report -- and a plain spinlock there would deadlock against a `kprintf` that was
+ * interrupted. */
 void kprintf(const char *fmt, ...) {
     va_list ap;
+
+    /* The console's own lock, not a second one: a print is a write, and a write that takes
+     * a different lock from every other write is a write that can still interleave with
+     * them. */
+    console_lock();
+
     va_start(ap, fmt);
     kvprintf(fmt, ap);
     va_end(ap);
+
+    console_unlock();
+}
+
+/* Bring the print lock up.  Called once, from kmain(), after the serial port and before
+ * anything that will want to print from more than one processor.  The lock itself lives in
+ * console.c, because that is what it guards; this is here so the order in kmain() reads as
+ * "the console, then the console's lock, then everything else". */
+void kprintf_init(void) {
+    console_lock_init();
 }
 
 void kputs(const char *s) {

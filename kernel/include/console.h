@@ -35,10 +35,34 @@ typedef struct {
 void console_init(void);
 void console_putc(char c);
 void console_write(const char *data, size_t len);
+
+/* Take and release the console's write lock around a sequence of characters.
+ *
+ * A write is a sequence rather than a character, so a caller writing several pieces has to
+ * hold this across all of them -- which is what `kprintf` does, and what a program writing
+ * a line in two `write()` calls does not need to do because each call is atomic.
+ *
+ * The second use is the boot heartbeat, which writes to the serial port *directly* rather
+ * than through the console, because it must not disturb what is on screen.  It is the only
+ * writer in the kernel that does, and it takes the same lock so that a line of heartbeat
+ * cannot be split in half by a program's message. */
+void console_lock(void);
+void console_unlock(void);
+
+/* The console's write lock, brought up once at boot. */
+void console_lock_init(void);
+
+/* console_write() with the lock already held.  For a caller that holds it. */
+void console_write_locked(const char *data, size_t len);
+
 void console_puts(const char *s);
 
 /* Escape-sequence-free output for the panic path, which must not re-enter the
- * ANSI parser while it is printing the reason for the panic. */
+ * ANSI parser while it is printing the reason for the panic.
+ *
+ * These two deliberately do *not* take the console lock: they are what prints when the
+ * machine is already in trouble, and a panic that cannot get past a lock held by the code
+ * it is reporting on is a panic that prints nothing. */
 void console_putc_raw(char c);
 void console_raw_write(const char *data, size_t len);
 

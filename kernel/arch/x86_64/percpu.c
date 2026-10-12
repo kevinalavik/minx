@@ -81,16 +81,23 @@ unsigned percpu_self_index(void) {
     percpu_t *state;
     __asm__ volatile("movq %%gs:0, %0" : "=r"(state) :: "memory");
 
+    /* The slot exists but has not been filled in yet.
+     *
+     * `kmain()` installs GS at the boot processor's slot before the first character is
+     * printed, and `percpu_register()` -- which sets `self` -- runs later, in
+     * `cpu_interrupts_init()`.  So for the whole boot log `%gs:0` is NULL, which matches no
+     * slot, and the answer has to be the slot GS is *pointing at*.
+     *
+     * The two cases are the same question, so they are answered together: anything that is
+     * not one of the filled-in slots is treated as the boot processor, which is the only
+     * processor that can be running before `percpu_register()` has been called. */
     for (unsigned i = 0; i < MAX_CPU_COUNT; i++)
-        if (&slots[i].state == state)
+        if (state == NULL || (&slots[i].state == state && slots[i].self != NULL))
             return i;
 
-    /* GS is not pointing at a slot this kernel knows: either it was never set,
-     * or something clobbered it.  Falling back to the boot processor is the
-     * safe answer -- it is a real slot with a real stack behind it -- and the
-     * boot log says so. */
-    kprintf("[warn] percpu: %%gs does not point at a known slot; assuming "
-            "processor %u\n", PERCPU_BOOTSTRAP);
+    /* GS is not pointing at a slot this kernel knows at all: either it was never set, or
+     * something clobbered it.  Falling back to the boot processor is the safe answer -- it
+     * is a real slot with a real stack behind it. */
     return PERCPU_BOOTSTRAP;
 }
 
