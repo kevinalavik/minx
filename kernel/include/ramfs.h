@@ -46,6 +46,8 @@ typedef enum {
     RAMFS_DEV_CONSOLE = 0,   /* the framebuffer and its serial mirror */
     RAMFS_DEV_NULL,          /* reads nothing, writes nothing, always succeeds */
     RAMFS_DEV_ZERO,          /* reads zeroes forever */
+    RAMFS_DEV_RANDOM,        /* reads random bytes, and blocks once it has any history */
+    RAMFS_DEV_URANDOM,       /* reads random bytes, and never blocks */
 } ramfs_dev_t;
 
 /* One name for a node: which directory it is in, and what it is called there.
@@ -157,6 +159,40 @@ long ramfs_truncate(uint64_t ino, uint64_t size);
 /* Per-node times, and the node's own attributes. */
 void    ramfs_touch(uint64_t ino, bool atime_only);
 long    ramfs_set_mode(uint64_t ino, mode_t mode);
+
+/* The rest of a node's attributes, for a VFS layer that has to answer `stat` without
+ * reaching into `ramfs_node_at()` and depending on this file's private layout.
+ *
+ * A VFS that reads `ramfs_node_at(i)` and pulls fields out of the struct is one edit away
+ * from breaking every time this file changes its node, and it makes the two files the same
+ * file.  These are the fields, asked for by name. */
+uint64_t ramfs_node_parent(uint64_t ino);
+mode_t   ramfs_node_mode(uint64_t ino);
+uint64_t ramfs_node_nlink(uint64_t ino);
+uint64_t ramfs_node_uid(uint64_t ino);
+uint64_t ramfs_node_gid(uint64_t ino);
+uint64_t ramfs_node_atime(uint64_t ino);
+uint64_t ramfs_node_mtime(uint64_t ino);
+uint64_t ramfs_node_ctime(uint64_t ino);
+ramfs_dev_t ramfs_node_device(uint64_t ino);
+
+/* What a symbolic link names, or NULL for anything that is not one.  The returned string
+ * is the node's own, and is NUL-terminated: `link_len` includes the terminator, and a
+ * `readlink()` that reported `link_len` would hand a caller one byte more than the name. */
+const char *ramfs_node_link(uint64_t ino);
+
+/* The shared sequential cursor.  One per node, so `read()` through two descriptors on the
+ * same file advances both -- which is what a program opening the same file twice expects,
+ * and what makes `getdents` resumable. */
+uint64_t ramfs_node_cursor(uint64_t ino);
+void     ramfs_node_set_cursor(uint64_t ino, uint64_t value);
+
+/* Create a device node.  Separate from ramfs_create() because a device is not a file and
+ * making it one -- a RAMFS_FILE with a mode -- produces a device that reads as zeroes. */
+uint64_t ramfs_create_dev(uint64_t parent, const char *name, ramfs_dev_t dev);
+
+long ramfs_chown(uint64_t ino, uint64_t uid, uint64_t gid);
+long ramfs_set_times(uint64_t ino, uint64_t atime, uint64_t mtime);
 
 /* How many nodes exist, how many bytes of data they hold, and how much of the pool is
  * used.  For the self tests and for phase 11's accounting. */

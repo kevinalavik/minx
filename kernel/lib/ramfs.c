@@ -490,6 +490,94 @@ long ramfs_set_mode(uint64_t ino, mode_t mode) {
     return 0;
 }
 
+/* --- attributes, asked for by name --------------------------------------- */
+
+uint64_t ramfs_node_parent(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].links[0].parent;
+}
+
+mode_t ramfs_node_mode(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].mode;
+}
+
+uint64_t ramfs_node_nlink(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].nlink;
+}
+
+uint64_t ramfs_node_uid(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].uid;
+}
+
+uint64_t ramfs_node_gid(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].gid;
+}
+
+uint64_t ramfs_node_atime(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].atime;
+}
+
+uint64_t ramfs_node_mtime(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].mtime;
+}
+
+uint64_t ramfs_node_ctime(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].ctime;
+}
+
+ramfs_dev_t ramfs_node_device(uint64_t ino) {
+    if (!mounted || ino == 0 || ino > RAMFS_NODES)
+        return RAMFS_DEV_NULL;
+    return nodes[ino - 1].device;
+}
+
+const char *ramfs_node_link(uint64_t ino) {
+    if (!mounted || ino == 0 || ino > RAMFS_NODES)
+        return NULL;
+    if (nodes[ino - 1].kind != RAMFS_SYMLINK)
+        return NULL;
+    return nodes[ino - 1].link_target;
+}
+
+uint64_t ramfs_node_cursor(uint64_t ino) {
+    return (!mounted || ino == 0 || ino > RAMFS_NODES) ? 0 : nodes[ino - 1].read_pos;
+}
+
+void ramfs_node_set_cursor(uint64_t ino, uint64_t value) {
+    if (mounted && ino != 0 && ino <= RAMFS_NODES)
+        nodes[ino - 1].read_pos = value;
+}
+
+uint64_t ramfs_create_dev(uint64_t parent, const char *name, ramfs_dev_t dev) {
+    uint64_t ino = ramfs_create(parent, name, RAMFS_DEVICE, S_IFCHR | 0666);
+
+    if (ino == 0)
+        return 0;
+
+    nodes[ino - 1].device = dev;
+    return ino;
+}
+
+long ramfs_chown(uint64_t ino, uint64_t uid, uint64_t gid) {
+    if (!mounted || ino == 0 || ino > RAMFS_NODES)
+        return -EFAULT;
+
+    nodes[ino - 1].uid = uid;
+    nodes[ino - 1].gid = gid;
+    ramfs_touch(ino, false);
+    return 0;
+}
+
+long ramfs_set_times(uint64_t ino, uint64_t atime, uint64_t mtime) {
+    if (!mounted || ino == 0 || ino > RAMFS_NODES)
+        return -EFAULT;
+
+    /* Only the two the interface takes.  The change time is the kernel's to set, because
+     * it is the time of the call rather than of anything the caller asked for. */
+    nodes[ino - 1].atime = atime;
+    nodes[ino - 1].mtime = mtime;
+    return 0;
+}
+
 unsigned ramfs_node_count(void) { return node_used; }
 uint64_t ramfs_data_bytes(void) { return data_bytes; }
 uint64_t ramfs_pool_used(void) { return pool_used_bytes; }
@@ -587,39 +675,59 @@ static uint64_t newc_value(const char *field) {
     return v;
 }
 
+/* Create every *directory* in `path` and return the one they hang off.
+ *
+ * Only the components that are followed by a slash, and that is the whole of it: this
+ * returns the directory the last component goes *into*, and creating the last component as
+ * a directory is how an archive's top-level files turn into empty directories.  `init` at the
+ * root of an initrd is the one every boot has, so it is the one that is always broken --
+ * the archive says "./init" is a file, `make_dirs()` makes it a directory, the caller sees
+ * a path with no slash in it and counts it as a directory it has already made, and the
+ * kernel boots to "there is no /init" having unpacked twenty-one entries successfully.
+ *
+ * The distinction is not cosmetic in the other direction either: a name that *does* end in
+ * a slash is a directory, and creating it here is what makes `bin/` exist before `bin/sh`
+ * is unpacked into it. */
 static uint64_t make_dirs(uint64_t parent, const char *path, size_t len) {
     uint64_t at = parent;
     char name[64];
-    size_t i = 0;
     size_t start = 0;
 
-    while (i <= len) {
-        if (i == len || path[i] == '/') {
-            size_t n = i - start;
+    for (size_t i = 0; i < len; i++) {
+        if (path[i] != '/')
+            continue;
 
-            if (n == 0 || n >= sizeof(name)) {
-                if (i == len)
-                    break;
-                start = i + 1;
-                i++;
-                continue;
-            }
+        /* Only the components a slash *terminates*, which is every component except the
+         * last.
+         *
+         * A trailing slash is a directory entry in its own right -- "bin/" is how an
+         * archive says "this is a directory", and it is why an initrd can list a directory
+         * that has nothing in it -- and a slash in the middle terminates a component that is
+         * therefore a directory too.  Either way the component ends here and is created.
+         *
+         * What must never happen is creating the *last* component when it is the file the
+         * caller is about to make, and that is the difference between an initrd that boots
+         * and one where every file at every level is an empty directory. */
+        size_t n = i - start;
 
-            memcpy(name, path + start, n);
-            name[n] = 0;
-
-            uint64_t found = ramfs_lookup(at, name);
-
-            if (found == 0)
-                found = ramfs_create(at, name, RAMFS_DIR, 0755);
-
-            if (found == 0)
-                return 0;
-
-            at = found;
+        if (n == 0 || n >= sizeof(name)) {
             start = i + 1;
+            continue;
         }
-        i++;
+
+        memcpy(name, path + start, n);
+        name[n] = 0;
+
+        uint64_t found = ramfs_lookup(at, name);
+
+        if (found == 0)
+            found = ramfs_create(at, name, RAMFS_DIR, 0755);
+
+        if (found == 0)
+            return 0;
+
+        at = found;
+        start = i + 1;
     }
 
     return at;
@@ -706,7 +814,23 @@ long ramfs_mount_initrd(uint64_t initrd_base, uint64_t initrd_size) {
         }
 
         const char *name = name_at;
-        const char *data_at = name_at + namesize;
+        /* The contents start on the next four-byte boundary *after* the name, not
+         * immediately after it.
+         *
+         * `c_namesize` counts the pathname and its terminator and not the padding, and
+         * newc's rule is that "the pathname is followed by NUL bytes so that the total size
+         * of the fixed header and pathname is a multiple of four".  So for a seven-byte name
+         * the contents begin at 120, not at 117, and taking `name_at + namesize` reads
+         * three bytes of padding as the first three bytes of the file.
+         *
+         * It is invisible for every entry whose name length happens to make the sum a
+         * multiple of four, and for a cpio with several such entries in it -- which is how
+         * it survived until an initrd contained a file at the top level, whose name length
+         * is the one that has to be six characters.  The symptom is an ELF whose class byte
+         * reads 69, which is 'E': the loader is looking three bytes before the file and
+         * finds the 'E' of its own magic number in the ELF class field. */
+        const char *data_at = (const char *)(((uintptr_t)(name_at + namesize) + 3) &
+                                             ~(uintptr_t)3);
         const char *data_end = data_at + filesize;
 
         if (data_end > end) {
@@ -749,8 +873,12 @@ long ramfs_mount_initrd(uint64_t initrd_base, uint64_t initrd_size) {
 
         if (parent == 0) {
             kprintf("ramfs: could not create the directories for \"%s\"\n", name);
-        } else if (len > 1 && base_name == name) {
-            /* The whole path was directories. */
+        } else if (len > 0 && name[len - 1] == '/') {
+            /* A name that ends in a slash is a directory, and make_dirs() made it.  The
+             * test is on the last *character* rather than on whether the name has a slash
+             * in it at all: "bin/sh" has one and is a file, and treating every path with a
+             * slash in it as a directory loses every file below the root -- which is all of
+             * them. */
             dirs++;
         } else if ((mode & 0170000) == 0120000) {
             /* A symlink's contents are the target path, and an archive is free to store
