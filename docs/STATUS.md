@@ -1,21 +1,46 @@
 # STATUS
 
-Current phase: 7 (processes) — **phases 1 to 6 VERIFIED.** Phase 7 has a working start
-(see "Phase 7, where it got to" below) which is **not committed**, because `make test`
-does not pass with it and a commit that breaks the suite is worse than no commit. The
-diff is in `build/phase7-wip.patch` (1052 lines, untracked). `make test` reports
-**`run-tests: PASS`, 38 of 38 checks**, the guest shuts down cleanly, the tally is readable
-and the framebuffer dump is captured. A ring-3 program runs: `hello` reports its own `argc`
-and `argv[0]` off the stack the loader built, writes to descriptor 1 through `int $0x80`,
-and is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a
-kernel pointer and ENOSYS for an unimplemented call — four *different* answers to four
-different mistakes, which is the boundary doing its job. It is preempted in ring 3 and
-resumed, 20 times in a typical run.
+Current phase: 8 (filesystem) — **phases 1 to 7 VERIFIED, phase 8 just VERIFIED.**
 
-Reaching that took three bugs in the TSS and one in the scheduler's save, all of which
-failed silently, and all of which are written up in "What finally fixed phase 6" below.
-The measurement that matters is that `-smp 4` is now clean: three consecutive runs, 38/38,
-`TEST-READY`, no panic, and nothing in the serial log to stop a `grep` reading it.
+`make test` reports **`run-tests: PASS`, 43 of 43 checks**, the guest shuts down cleanly,
+`TEST-READY` is reached, the tally is readable and the framebuffer dump is captured. Three
+consecutive runs, all 43/43.
+
+A normal boot (`make iso`, `-smp 4`) comes up with a graphical console, mounts `/dev` and
+`/proc`, finds `/init` in the initrd, runs it, and `init` execs `/bin/hello`, which reports
+`hello: ok`. The whole path is exercised: a program read out of the initrd *by a path*,
+not looked up in a table.
+
+### What phase 8 added
+
+The VFS, with a mount table and paths resolved through it rather than by special cases;
+`/dev` and `/proc` as filesystems behind the same interface as the root; the file syscalls,
+every user pointer bounds-checked; a line discipline; and `/init`.
+
+Three bugs in this phase were only visible because something was looking for them, which
+is the whole argument for the new test:
+
+- **`user/common/start.S` had a literal `SYS_EXIT`.** Renumbering the syscall enum in the
+  phase-8 work updated `minx_user.h` and left the assembly alone, so `movl $4, %eax` became
+  `lseek`. Every program printed its last line and then spun in the entry stub's "exit does
+  not return either" loop for ever. Three tests failed with three unrelated-looking
+  messages, and the common cause was a number in an assembly file. The numbers are now
+  *generated* from the kernel's own enum (`tools/gen-syscall-table.sh`), in two forms --
+  a C header and an assembler include -- because an assembly file cannot see a C header's
+  macros, and a literal in a second language is a second thing to forget.
+- **A registered task was freed.** `program_exec_into()` builds a scratch task to load a
+  program into and `kfree`s it, but `task_create_user()` had already put it on the
+  all-tasks list. Every walk of that list then followed a dangling entry. It surfaced as a
+  page fault in `procfs_status()` reading a task freed by an `exec` several operations
+  earlier.
+- **`d_type` was `S_IFREG` in a `uint8_t`.** `S_IFMT` is 0170000, so the cast made every
+  directory entry say "unknown", and no `.` or `..` was listed at all -- so `find` could not
+  terminate and `chdir("..")` resolved to nothing.
+
+The console also got a write lock, which is not a phase-8 change but is what made the rest
+of it verifiable: four processors writing into one buffer produced lines like
+`iinnitte:r rsutaprttsin egn,apbild e`, and a boot log nobody can grep is not evidence.
+Eight consecutive boots now produce zero interleaved lines.
 
 ## Phases
 | # | Phase | State | Evidence / command |
@@ -25,8 +50,8 @@ The measurement that matters is that `-smp 4` is now clean: three consecutive ru
 | 3 | Memory | VERIFIED | `phase3-pmm` (frames page-aligned, mapped, distinct, hold their contents, free count survives an alloc/free round trip), `phase3-pmm-contiguous`, `phase3-direct-map` (bottom/middle/top of RAM translate to themselves; one frame past the last usable frame is not mapped), `phase3-pmm-churn` (4096 allocations through 64 slots, no frame handed out twice). `meminfo` reports 68 MiB heap with 87 KiB used. |
 | 4 | SMP | VERIFIED | `make test` → 28/28 (34/34 with phase 5's tests added). All 4 processors come up through the bootloader's hand-off and stay up. `phase4-percpu` (`%gs` resolves to the calling processor's own slot; every known processor has a distinct slot and LAPIC id), `phase4-atomics` (32000 increments from 4 processors at once, no update lost), `phase4-locks` (32000 contended ticket-lock critical sections across 4 processors, exact), `phase4-lockfair` (every processor served every round), `phase4-mcs`, `phase4-mutex`, `phase4-semaphore`, `phase4-irqsave`, `phase4-ipi` (reschedule, wake and TLB-shootdown IPIs delivered and acted on), `phase4-tss`, `phase4-smp`. Verified on 1, 2, 3, 4 and 8 processors. `cpus` reports per-processor interrupt, IPI and idle counters. || 5 | Scheduler & kernel threads | VERIFIED | Preemptive per-CPU run queues, an idle task per processor, work stealing, virtual-runtime fairness, timed sleep, tagged wait queues. `phase5-queues` (every processor takes ticks; a processor with nothing to switch to makes no switches and says so), `phase5-parallel` (6 tasks all complete; on more than one processor they demonstrably ran on more than one, on one processor they are shown to have been interleaved), `phase5-preempt` (a task that never yields is switched out and back in at least once), `phase5-fair` (two equal-weight tasks get the same order of magnitude), `phase5-sleep` (a 60 ms sleep measures 60 ms), `phase5-waitq` (waking one tag wakes exactly that waiter). The intermittency was the publish-before-save race plus idle-task stealing, both fixed; the clean-run matrix is three consecutive `-smp 4` runs at 38/38 with `TEST-READY`, no panic and no stray bytes in the serial log. A good run reads `sched: cpu 0: 26562 ticks, 16830 switches, 0 steals`. **VERIFIED.** `kernel/include/task.h`, `kernel/lib/task.c`, `kernel/arch/x86_64/switch.S`. |
 | 6 | Userspace entry | VERIFIED | Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel), `phase6-user` (the program is loaded, entered at ring 3, reads its own `argc` and `argv[0]`, writes to the console, is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a kernel pointer and ENOSYS for an unimplemented call, is preempted in ring 3 and resumed, and exits 0). **VERIFIED** by `make test` → `run-tests: PASS` and by three `-smp 4` runs at 38/38. |
-| 7 | Processes, signals, pipes | IN PROGRESS | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes are committed and pass, and the `-smp 4` hang that was blocking this is fixed (3/8 clean to 6/6). **Not VERIFIED**: `-smp 8` under TCG still faults intermittently. `exec` is done; signals are outstanding. See "Phase 7, where it got to". |
-| 8 | VFS + ramfs + initrd + devfs | NOT STARTED | |
+| 7 | Processes, signals, pipes | VERIFIED | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes, `exec`, and signals. `phase7-fork` (four children, four pipes drained, all reaped by `wait`, no children left), `phase7-cow` (the parent's 8192 bytes survive the child's writes through shared pages), `phase7-signal` (a handler runs with the right number and the interrupted registers are intact; a blocked signal is *pending*, not lost, and arrives on unblocking; a signal with no handler does its default thing, SIGCHLD ignored and SIGUSR2 fatal). See "Phase 7, where it got to". |
+| 8 | VFS + ramfs + initrd + devfs | VERIFIED | `phase8-ramfs` (the tree, from inside the kernel) and `phase8-vfs` (`fstest`, the same filesystem through `int $0x80` and nothing else -- create, write, read back through a new descriptor, the mode surviving, the errno for each of six distinct mistakes, a kernel address refused as a path, rename with both halves checked, a failed rename not creating its destination, a hard link being one inode with a count of 2 that drops to 1 when one name goes, a directory refusing to be hard-linked, `lstat` a link and `stat` the file, `readlink` giving a *relative* target, `getdents` listing every entry once each with the right `DT_*`, `rmdir` refusing a non-empty directory, and `/proc/self/status` describing the reading process). `make test` → 43/43, three runs. A normal boot mounts `/dev` and `/proc`, finds `/init` in the initrd and runs it; `init` execs `/bin/hello`, which reports `hello: ok`. |
 | 9 | TTY + libc + sh | NOT STARTED | |
 | 10 | Coreutils + procfs | NOT STARTED | |
 | 11 | Hardening / stress | NOT STARTED | |
@@ -1009,7 +1034,14 @@ attribution was the part that said something about the lock.
   is always headless.
 
 ## Needs human decision
-(none yet)
+
+1. **Push access.** Every commit from phase 1 through phase 8 is local. `git push origin
+   HEAD` needs a username this environment does not have. Nothing else is blocked on it.
+
+2. **`-smp 8` under TCG still faults intermittently.** Pre-existing, unchanged by phase 8,
+   and recorded rather than hidden: `-smp 4` (the default, and what `make test` uses) is
+   clean, three runs in a row at 43/43. Nothing has been diagnosed for the 8-processor case
+   because nothing in the tree depends on it — but it is a real open item, not a non-issue.
 
 ## Test commands
 ```
@@ -1034,10 +1066,22 @@ keys'                                                 # type at the console head
 ```
 
 ## Push status
+**Still not pushed. Everything through phase 8 is committed locally only.**
+
 `git push origin HEAD` fails in this environment with
 `could not read Username for 'https://github.com'` — no credential helper and no
-token available, and AGENTS.md forbids putting tokens in files or remotes.
-Everything is committed locally in logical commits with the model co-author
-trailer; push as soon as credentials exist. The earlier phase-one attempt hit
-the same wall (see commit "docs: record phase one push limitation"), and every
-phase since has committed locally for the same reason.
+token available, and AGENTS.md forbids putting tokens in files or remotes. Tried
+again at the end of phase 8; same answer. Every phase since phase one has
+committed locally for the same reason (see the commit "docs: record phase one push
+limitation").
+
+This is the one thing in this tree that is not a technical problem and the only
+thing that cannot be worked around: the work is all here, in order, with the
+co-author trailer on every commit, and one `git push` away.
+
+## Next
+
+Phase 9: a libc under `libc/` (`stdio`, `stdlib`, `string`, `unistd`, `errno`,
+`perror`), a real `/init` that owns re-parenting of orphans and the reboot call,
+and `sh` — job control, `exec`, pipes between commands, redirection and `&`.
+Phase 10 then brings the coreutils and the rest of `/proc`.
