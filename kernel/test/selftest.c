@@ -1633,14 +1633,22 @@ static void test_user_program(void) {
      * whichever of the two finished last -- and the child's is a deliberate 7, which the
      * test then read as the parent's own report that it had failed.
      *
-     * `syscall_exit_pid()` is published together with the status for exactly this. */
+     * `syscall_exit_record()` is published together for exactly this.  *Together*: reading
+     * the status and the pid as two separate calls lets another task's exit land between
+     * them, and the two halves then describe different programs -- which is how this test
+     * once reported "the exit was recorded against task 40, but the program is task 37"
+     * for a program that had exited correctly several milliseconds earlier. */
+    int      code = -1;
+    uint64_t who  = 0;
+
     for (unsigned waited = 0; waited < 20000; waited++) {
-        if (syscall_last_exit() >= 0 && syscall_exit_pid() == t->id)
+        syscall_exit_record(&code, &who);
+        if (code >= 0 && who == t->id)
             break;
         task_sleep_ms(1);
     }
 
-    if (syscall_last_exit() < 0) {
+    if (code < 0) {
         /* Everything about the task that decides whether it ever ran, because "never
          * exited" covers both "ran and hung" and "was never scheduled" and the two need
          * opposite fixes. */
@@ -1663,16 +1671,15 @@ static void test_user_program(void) {
         return;
     }
 
-    if (syscall_last_exit() != 0) {
+    if (code != 0) {
         test_fail("phase6-user", "the program exited %d, which is its own report "
-                  "that one of its checks failed", syscall_last_exit());
+                  "that one of its checks failed", code);
         return;
     }
 
-    if (syscall_exit_pid() != t->id) {
+    if (who != t->id) {
         test_fail("phase6-user", "the exit was recorded against task %lu, but the "
-                  "program is task %lu", (unsigned long)syscall_exit_pid(),
-                  (unsigned long)t->id);
+                  "program is task %lu", (unsigned long)who, (unsigned long)t->id);
         return;
     }
 
@@ -1691,8 +1698,7 @@ static void test_user_program(void) {
     }
 
     kprintf("user: hello ran in ring 3, exited %d, task %lu, %lu switches\n",
-            syscall_last_exit(), (unsigned long)t->id,
-            (unsigned long)t->switch_count);
+            code, (unsigned long)t->id, (unsigned long)t->switch_count);
 
     test_pass("phase6-user");
 }
@@ -1713,13 +1719,22 @@ static bool run_program(const char *name, const char *test, const char *what) {
         return false;
     }
 
+    /* One snapshot of the pair per poll, for the reason in `test_user_program()`: two
+     * separate reads can describe two different programs.  `forktest` has four children
+     * whose exits are deliberately 1, 2, 3 and 4, so a torn read here is not a rare race
+     * to shrug at -- it is the common case, and it is how this helper once reported
+     * "forktest exited 4" for a program that had printed "forktest: ok". */
+    int      code = -1;
+    uint64_t who  = 0;
+
     for (unsigned waited = 0; waited < 40000; waited++) {
-        if (syscall_last_exit() >= 0 && syscall_exit_pid() == t->id)
+        syscall_exit_record(&code, &who);
+        if (code >= 0 && who == t->id)
             break;
         task_sleep_ms(1);
     }
 
-    if (syscall_last_exit() < 0) {
+    if (code < 0) {
         kprintf("%s: task %lu (%s) never exited: state %d, started %d, %lu "
                 "switches, %lu on cpu %u\n", test, (unsigned long)t->id, t->name,
                 t->state, t->started ? 1 : 0, (unsigned long)t->switch_count,
@@ -1729,9 +1744,9 @@ static bool run_program(const char *name, const char *test, const char *what) {
         return false;
     }
 
-    if (syscall_last_exit() != 0) {
+    if (code != 0) {
         kprintf("%s: %s exited %d, which is its own report that a check failed\n",
-                test, name, syscall_last_exit());
+                test, name, code);
         test_fail(test, "the program's own checks failed");
         return false;
     }

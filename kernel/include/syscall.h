@@ -9,6 +9,11 @@
  * something wrong, but it cannot make the kernel read or write an address it chose.**
  * Every pointer crosses through syscall_copy_from_user()/syscall_copy_to_user(), which
  * check the range against the caller's own page tables first.
+ *
+ * The call numbers are this kernel's own, grouped so that the ones added together are in
+ * one place: read, write and the file calls at the bottom, the process calls in the
+ * middle, the signal calls above them, and the memory calls at the top.  docs/SYSCALLS.md
+ * is the same list written for a person.
  */
 #ifndef MINX_SYSCALL_H
 #define MINX_SYSCALL_H
@@ -31,30 +36,82 @@
  * reported error.  These are this kernel's own, grouped so that `read`-shaped calls
  * start at 0 and grow upwards. */
 enum {
-    SYS_READ  = 0,
-    SYS_WRITE = 1,
-    SYS_OPEN  = 2,
-    SYS_CLOSE = 3,
-    SYS_EXIT  = 4,
-    SYS_BRK   = 5,
-    SYS_WRITEV = 6,
-    SYS_GETPID = 7,
-    SYS_FORK   = 8,
-    SYS_WAIT   = 9,
-    SYS_PIPE   = 10,
-    SYS_EXEC   = 11,
+    /* --- files --------------------------------------------------------- */
+    SYS_READ    = 0,
+    SYS_WRITE   = 1,
+    SYS_OPEN    = 2,
+    SYS_CLOSE   = 3,
+    SYS_LSEEK   = 4,
+    SYS_FSTAT   = 5,
+    SYS_STAT    = 6,
+    SYS_LSTAT   = 7,
+    SYS_FSYNC   = 8,
+    SYS_READLINK= 9,
+    SYS_GETDENTS= 10,
+    SYS_DUP     = 11,
+    SYS_DUP2    = 12,
 
-    /* Signals.  Grouped together and numbered in a run, because they are the calls that
-     * make a *process* -- rather than a thread or a file -- exist: everything above this
-     * line could be done by a kernel thread with a descriptor table. */
-    SYS_KILL         = 12,
-    SYS_SIGACTION    = 13,
-    SYS_SIGRETURN    = 14,
-    SYS_SIGPROCMASK  = 15,
-    SYS_SIGPENDING   = 16,
-    SYS_PAUSE        = 17,
+    /* --- the filesystem, in memory -------------------------------------- */
+    SYS_MKDIR   = 16,
+    SYS_RMDIR   = 17,
+    SYS_UNLINK  = 18,
+    SYS_RENAME  = 19,
+    SYS_LINK    = 20,
+    SYS_SYMLINK = 21,
+    SYS_CHMOD   = 22,
+    SYS_CHOWN   = 23,
+    SYS_TRUNCATE= 24,
+    SYS_FTRUNCATE=25,
+    SYS_UTIMES  = 26,
+    SYS_CHDIR   = 27,
+    SYS_GETCWD  = 28,
+    SYS_UMASK   = 29,
+    SYS_MOUNT   = 30,
+    SYS_UMOUNT  = 31,
+    SYS_ACCESS  = 32,
 
-    SYS_MAX = 32,
+    /* --- descriptors and the terminal ----------------------------------- */
+    SYS_FCNTL   = 33,
+    SYS_IOCTL   = 34,
+
+    /* --- processes ------------------------------------------------------ */
+    SYS_EXIT    = 40,
+    SYS_BRK     = 41,
+    SYS_WRITEV  = 42,
+    SYS_GETPID  = 43,
+    SYS_GETPPID = 44,
+    SYS_FORK    = 45,
+    SYS_WAIT    = 46,
+    SYS_PIPE    = 47,
+    SYS_EXEC    = 48,
+    SYS_SETSID  = 49,
+    SYS_SETPGID = 50,
+    SYS_GETPGID = 51,
+    SYS_UNAME   = 52,
+    SYS_GETUID  = 53,
+    SYS_GETEUID = 54,
+    SYS_SETUID  = 55,
+    SYS_GETGID  = 56,
+    SYS_NANOSLEEP = 57,
+    SYS_SCHED_YIELD = 58,
+    SYS_TIMES   = 59,
+    SYS_GETRUSAGE = 60,
+    SYS_REBOOT  = 61,
+    SYS_PAUSE   = 62,
+
+    /* --- signals -------------------------------------------------------- */
+    SYS_KILL         = 64,
+    SYS_SIGACTION    = 65,
+    SYS_SIGRETURN    = 66,
+    SYS_SIGPROCMASK  = 67,
+    SYS_SIGPENDING   = 68,
+
+    /* --- memory --------------------------------------------------------- */
+    SYS_MMAP     = 72,
+    SYS_MUNMAP   = 73,
+    SYS_MPROTECT = 74,
+
+    SYS_MAX = 96,
 };
 
 /* --- errors ------------------------------------------------------------- */
@@ -77,7 +134,7 @@ enum {
 #define EINVAL   22
 #define ENFILE   23
 #define EMFILE   24
-#define ENOTDIR  20
+#define ENOTDIR 20
 #define ENOSPC   28
 #define ESPIPE   29
 #define EROFS    30
@@ -89,10 +146,10 @@ enum {
 #define ENODEV 19
 #define ENOSYS 38
 #define ENOTTY 25
-#define EINVAL 22
-#define ENOSPC 28
-#define ESPIPE 29
-#define ECHILD 10
+#define EXDEV   18
+#define ELOOP   40
+#define ERANGE  34
+#define EOVERFLOW 75
 #define EWOULDBLOCK EAGAIN
 
 /* Record the error a handler wants to return, for the reporting the tests do.
@@ -167,6 +224,13 @@ void syscall_prepare_write(uint64_t addr, size_t bytes);
 bool syscall_copy_from_user(void *dst, uint64_t src, size_t bytes);
 bool syscall_copy_to_user(uint64_t dst, const void *src, size_t bytes);
 
+/* Read a NUL-terminated string out of user memory, into a kernel buffer of at most
+ * `max` bytes including the terminator.  Returns the length, or -EFAULT if there is no
+ * terminator inside that many bytes -- a program that hands over an unterminated block has
+ * handed over bytes, not a name, and reading past it to find out would be reading a page
+ * it never offered. */
+long syscall_copy_string(uint64_t src, char *dst, size_t max);
+
 /* --- descriptors --------------------------------------------------------- */
 
 /* Write to a descriptor.  1 and 2 are the console -- both the framebuffer and the
@@ -195,6 +259,13 @@ struct task *program_load_and_run(const char *name, uint32_t stack_pages);
 /* Create a task and start one registered program in it. */
 struct task *program_start(const struct program_image *p);
 
+/* Create a task and start the program at `path`, reading its bytes out of the filesystem.
+ * The counterpart to program_load_and_run(): one starts a program the kernel carries inside
+ * itself and one starts a file, and both end in the same loader. */
+struct task *program_start_image(const char *name, const void *image, size_t bytes,
+                                 uint32_t stack_pages);
+struct task *program_start_path(const char *path, uint32_t stack_pages);
+
 /* Load `image` into the *existing* task `t`, throwing away whatever address space and
  * frame it had.  This is `exec`, and it is split from program_load_and_run() because
  * creating a task and replacing one are different jobs: the first allocates a stack and an
@@ -221,8 +292,25 @@ struct task *program_exec_into(struct task *t, const char *name, const void *ima
 
 /* Called by the exit handler, and by anything else that ends a task, before the task's
  * stack is abandoned.  `code` is the program's own idea of how it went; the self tests
- * read it back through syscall_last_exit(). */
+ * read it back through syscall_exit_record().
+ *
+ * The status and the task it belongs to are published *together*, and have to be.  A
+ * program that forks has children whose exits are not its own report, so a reader has to be
+ * able to ask whose exit it is looking at as well as what the exit was -- and it has to be
+ * able to ask both without being able to catch them changing in between.  Two separate
+ * words cannot do that: a child exiting between the reader's read of the status and its
+ * read of the pid hands it one task's status next to another task's pid, a pair that never
+ * existed.  The self tests hit exactly that, as "forktest exited 4" -- child 45's status
+ * beside forktest's pid -- and as a program that reported it never exited at all.
+ *
+ * `syscall_last_exit()` and `syscall_exit_pid()` read the same pair one half at a time and
+ * are for a caller that genuinely does not care whose it is. */
 void syscall_note_exit(int code);
+
+/* Both halves at once.  `*pid` is 0 and `*code` is -1 when nothing has exited since the
+ * last reset. */
+void syscall_exit_record(int *code, uint64_t *pid);
+
 int  syscall_last_exit(void);
 void syscall_last_errno_reset(void);
 uint64_t syscall_exit_pid(void);

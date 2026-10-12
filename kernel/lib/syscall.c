@@ -27,7 +27,12 @@
  *    room behind it does not, which is honest and which a program can act on.  What it
  *    must never do is block with interrupts disabled, because that stops the machine.
  */
+#include "fscalls.h"
+#include "memsys.h"
+#include "procsys.h"
+#include "power.h"
 #include "signal.h"
+#include "vfs.h"
 #include "syscall.h"
 
 #include "console.h"
@@ -51,24 +56,69 @@ static syscall_fn_t handlers[SYS_MAX];
 
 const char *syscall_name(unsigned nr) {
     static const char *const names[SYS_MAX] = {
-        [SYS_READ]   = "read",
-        [SYS_WRITE]  = "write",
-        [SYS_OPEN]   = "open",
-        [SYS_CLOSE]  = "close",
-        [SYS_EXIT]   = "exit",
-        [SYS_BRK]    = "brk",
-        [SYS_WRITEV] = "writev",
-        [SYS_GETPID] = "getpid",
-        [SYS_FORK]   = "fork",
-        [SYS_WAIT]   = "wait",
-        [SYS_PIPE]   = "pipe",
-        [SYS_EXEC]   = "exec",
-        [SYS_KILL]         = "kill",
-        [SYS_SIGACTION]    = "sigaction",
-        [SYS_SIGRETURN]    = "sigreturn",
-        [SYS_SIGPROCMASK]  = "sigprocmask",
-        [SYS_SIGPENDING]   = "sigpending",
-        [SYS_PAUSE]        = "pause",
+        [SYS_READ]       = "read",
+        [SYS_WRITE]      = "write",
+        [SYS_OPEN]       = "open",
+        [SYS_CLOSE]      = "close",
+        [SYS_LSEEK]      = "lseek",
+        [SYS_FSTAT]      = "fstat",
+        [SYS_STAT]       = "stat",
+        [SYS_LSTAT]      = "lstat",
+        [SYS_FSYNC]      = "fsync",
+        [SYS_READLINK]   = "readlink",
+        [SYS_GETDENTS]   = "getdents",
+        [SYS_DUP]        = "dup",
+        [SYS_DUP2]       = "dup2",
+        [SYS_MKDIR]      = "mkdir",
+        [SYS_RMDIR]      = "rmdir",
+        [SYS_UNLINK]     = "unlink",
+        [SYS_RENAME]     = "rename",
+        [SYS_LINK]       = "link",
+        [SYS_SYMLINK]    = "symlink",
+        [SYS_CHMOD]      = "chmod",
+        [SYS_CHOWN]      = "chown",
+        [SYS_TRUNCATE]   = "truncate",
+        [SYS_FTRUNCATE]  = "ftruncate",
+        [SYS_UTIMES]     = "utimes",
+        [SYS_CHDIR]      = "chdir",
+        [SYS_GETCWD]     = "getcwd",
+        [SYS_UMASK]      = "umask",
+        [SYS_MOUNT]      = "mount",
+        [SYS_UMOUNT]     = "umount",
+        [SYS_ACCESS]     = "access",
+        [SYS_FCNTL]      = "fcntl",
+        [SYS_IOCTL]      = "ioctl",
+        [SYS_EXIT]       = "exit",
+        [SYS_BRK]        = "brk",
+        [SYS_WRITEV]     = "writev",
+        [SYS_GETPID]     = "getpid",
+        [SYS_GETPPID]    = "getppid",
+        [SYS_FORK]       = "fork",
+        [SYS_WAIT]       = "wait",
+        [SYS_PIPE]       = "pipe",
+        [SYS_EXEC]       = "exec",
+        [SYS_SETSID]     = "setsid",
+        [SYS_SETPGID]    = "setpgid",
+        [SYS_GETPGID]    = "getpgid",
+        [SYS_UNAME]      = "uname",
+        [SYS_GETUID]     = "getuid",
+        [SYS_GETEUID]    = "geteuid",
+        [SYS_SETUID]     = "setuid",
+        [SYS_GETGID]     = "getgid",
+        [SYS_NANOSLEEP]  = "nanosleep",
+        [SYS_SCHED_YIELD]= "sched_yield",
+        [SYS_TIMES]      = "times",
+        [SYS_GETRUSAGE]  = "getrusage",
+        [SYS_REBOOT]     = "reboot",
+        [SYS_PAUSE]      = "pause",
+        [SYS_KILL]       = "kill",
+        [SYS_SIGACTION]  = "sigaction",
+        [SYS_SIGRETURN]  = "sigreturn",
+        [SYS_SIGPROCMASK]= "sigprocmask",
+        [SYS_SIGPENDING] = "sigpending",
+        [SYS_MMAP]       = "mmap",
+        [SYS_MUNMAP]     = "munmap",
+        [SYS_MPROTECT]   = "mprotect",
     };
 
     return (nr < SYS_MAX && names[nr] != NULL) ? names[nr] : "?";
@@ -77,23 +127,86 @@ const char *syscall_name(unsigned nr) {
 /* --- what a program did, for the tests and for a message ----------------- */
 
 static volatile int last_errno;
-static volatile int last_exit = -1;
-static volatile uint64_t exit_pid;
 static volatile uint64_t unknown_calls;
+
+/* The last exit, as one publishable thing.
+ *
+ * `exit_seq` is odd exactly while a writer is between the two halves and even when it is
+ * not, which is what lets a reader notice that it read across a write and ask again.  A
+ * plain seqlock rather than a lock because the reader is a test polling once a millisecond
+ * and the writer is a process that is on its way out: neither side can afford to block the
+ * other, and neither side is in a hurry.
+ *
+ * `exit_pid` is deliberately not "which task exited" in the sense of the *right* answer --
+ * it is whichever task exited last, which is all "the last exit" has ever meant here.  What
+ * it buys is that the pair cannot be torn: a reader gets one task's status with that same
+ * task's pid, or it is told to try again. */
+static volatile uint32_t exit_seq;
+static volatile int      exit_code = -1;
+static volatile uint64_t exit_pid;
 
 void syscall_set_errno(int err) { last_errno = err; }
 int  syscall_last_errno(void)   { return last_errno; }
-void syscall_last_errno_reset(void) { last_errno = 0; last_exit = -1; exit_pid = 0; }
 
-void syscall_note_exit(int code) {
-    last_exit = code;
-    task_t *t = sched_current();
+void syscall_last_errno_reset(void) {
+    last_errno = 0;
 
-    exit_pid = (t != NULL) ? t->id : 0;
+    /* Odd-then-even rather than two plain stores, so that a reader spinning in
+     * `syscall_exit_record()` cannot observe the reset half-applied and read a stale pid
+     * with the fresh "nothing has exited" code. */
+    __atomic_add_fetch(&exit_seq, 1, __ATOMIC_ACQ_REL);
+    exit_code = -1;
+    exit_pid  = 0;
+    __atomic_add_fetch(&exit_seq, 1, __ATOMIC_ACQ_REL);
 }
 
-int      syscall_last_exit(void)  { return last_exit; }
-uint64_t syscall_exit_pid(void)   { return exit_pid; }
+void syscall_note_exit(int code) {
+    task_t *t = sched_current();
+
+    __atomic_add_fetch(&exit_seq, 1, __ATOMIC_ACQ_REL);   /* odd: a write is in flight */
+    exit_code = code;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    exit_pid = (t != NULL) ? t->id : 0;
+    __atomic_add_fetch(&exit_seq, 1, __ATOMIC_ACQ_REL);   /* even: the pair is whole */
+}
+
+void syscall_exit_record(int *code, uint64_t *pid) {
+    for (;;) {
+        uint32_t before = __atomic_load_n(&exit_seq, __ATOMIC_ACQUIRE);
+        int c;
+        uint64_t p;
+
+        if (before & 1u)
+            continue;
+
+        c = exit_code;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        p = exit_pid;
+
+        if (__atomic_load_n(&exit_seq, __ATOMIC_ACQUIRE) != before)
+            continue;               /* a write happened; the pair is not the one we read */
+
+        if (code != NULL)
+            *code = c;
+        if (pid != NULL)
+            *pid = p;
+        return;
+    }
+}
+
+int      syscall_last_exit(void) {
+    int code;
+
+    syscall_exit_record(&code, NULL);
+    return code;
+}
+
+uint64_t syscall_exit_pid(void) {
+    uint64_t pid;
+
+    syscall_exit_record(NULL, &pid);
+    return pid;
+}
 
 void     syscall_note_unknown(unsigned long nr) {
     (void)nr;
@@ -274,6 +387,9 @@ long sys_fd_write(int fd, const void *buf, size_t bytes) {
 
         return pipe_write((pipe_t *)e->obj, (uint64_t)(uintptr_t)buf, bytes);
 
+    case FD_FILE:
+        return fs_sys_write_fd(fd, buf, bytes);
+
     default:
         errno_return(EBADF);
     }
@@ -295,12 +411,18 @@ long sys_fd_read(int fd, void *buf, size_t bytes) {
 
         return pipe_read((pipe_t *)e->obj, (uint64_t)(uintptr_t)buf, bytes);
 
+    case FD_FILE:
+        /* The file half of the dispatch, including a terminal: reading /dev/tty is a
+         * `read` of a file descriptor, and the line discipline is what makes it a line at
+         * a time rather than a keystroke at a time. */
+        return fs_sys_read_fd(fd, (uint64_t)(uintptr_t)buf, bytes);
+
     case FD_CONSOLE:
-        /* Reading the console needs the keyboard's input buffer to be a thing a task can
-         * wait on, which is the shell's stdin and not this call's job to fake.  ENOSYS
-         * says the door exists and the room behind it is not built.  What it must not do
-         * is block here with interrupts disabled, which would stop the machine rather than
-         * the program. */
+        /* Reading the console *descriptor* is not reading a terminal: 0, 1 and 2 belong to
+         * the process table and name the screen, which has nothing to read.  ENOSYS says
+         * the door exists and the room behind it is not built, which is true and is what a
+         * program has to act on.  What it must not do is block here with interrupts
+         * disabled, which would stop the machine rather than the program. */
         errno_return(ENOSYS);
 
     default:
@@ -394,7 +516,7 @@ long sys_exec(regs_t *regs) {
 
     /* The name has to be read out of the old space and *kept*: it lives in a page this
      * call is about to unmap. */
-    char name[64];
+    char name[VFS_NAME_MAX];
 
     if (!syscall_copy_from_user(name, path, sizeof(name))) {
         /* The whole block, or nothing.  A half-read name is a name that does not exist. */
@@ -416,24 +538,86 @@ long sys_exec(regs_t *regs) {
     if (!terminated)
         errno_return(EINVAL);
 
-    const program_image_t *p = program_find(name);
-
-    if (p == NULL) {
-        kprintf("exec: no program called %s\n", name);
-        errno_return(ENOENT);
-    }
-
     if (argv != 0 && !syscall_user_range_ok(argv, sizeof(char *), false))
         errno_return(EFAULT);
+
+    /* Two sources of bytes, and which one is used is decided by the *name*, not by a flag:
+     *
+     *   - a path with a slash is a file.  `exec("/bin/sh")`, `exec("./build")` and
+     *     `exec("../a.out")` are all files, and reading them from the filesystem is the
+     *     only thing that makes them work.
+     *   - a bare name is a program the kernel knows by name -- the registry -- which is
+     *     what `hello`, `forktest` and every other self-test program is started as.  The
+     *     registry is still here because there is no filesystem path for a program the
+     *     kernel carries inside itself.
+     *
+     * Deciding by the name rather than by a flag is what lets `exec("hello")` and
+     * `exec("/hello")` both do the obvious thing without a program having to say which. */
+    const program_image_t *reg = strchr(name, '/') != NULL ? NULL : program_find(name);
+    void *image = NULL;
+    size_t bytes = 0;
+    uint32_t stack_pages = 8;
+    const char *exec_name = name;
+
+    if (reg != NULL) {
+        image = (void *)(uintptr_t)reg->image;
+        bytes = reg->bytes;
+        stack_pages = reg->stack_pages;
+        exec_name = reg->name;
+    } else {
+        vpath_t p;
+        long r = vfs_resolve(sched_current(), name, true, &p);
+
+        if (r != 0) {
+            kprintf("exec: %s: %ld\n", name, r);
+            errno_return(r == -ENOENT ? ENOENT : -ENOENT);
+        }
+
+        if (ramfs_node_kind(p.ino) != RAMFS_FILE)
+            errno_return(EACCES);
+
+        /* The `n` of an EACCES is not an errno and the error is about the file, so it is
+         * said here rather than returned as a number nobody can read. */
+        uint32_t mode = ramfs_node_mode(p.ino);
+
+        if ((mode & 0111) == 0 && sched_current() != NULL &&
+            sched_current()->uid != 0) {
+            kprintf("exec: %s is not executable\n", name);
+            errno_return(EACCES);
+        }
+
+        r = vfs_read_whole(&p, &image, &bytes);
+
+        if (r != 0) {
+            kprintf("exec: %s could not be read (%ld)\n", name, r);
+            errno_return(ENOEXEC);
+        }
+
+        /* A script: `#!` on the first line.  The interpreter is named by the file itself and
+         * this kernel does not run one, so it says so and says why rather than executing
+         * whatever the line happens to contain -- which is what treating an interpreter as
+         * just another program would do with a path the program chose. */
+        if (bytes >= 2 && ((char *)image)[0] == '#' && ((char *)image)[1] == '!') {
+            ramfs_image_free(image);
+            kprintf("exec: %s is a script; minx has no interpreter for one\n", name);
+            errno_return(ENOEXEC);
+        }
+    }
 
     task_t *t = sched_current();
 
     uint64_t entry = 0;
     uint64_t entry_rsp = 0;
 
-    if (program_exec_into(t, p->name, p->image, p->bytes, p->stack_pages,
-                          &entry, &entry_rsp) == NULL)
+    if (program_exec_into(t, exec_name, image, bytes, stack_pages, &entry,
+                          &entry_rsp) == NULL) {
+        if (reg == NULL)
+            ramfs_image_free(image);
         errno_return(ENOEXEC);
+    }
+
+    if (reg == NULL)
+        ramfs_image_free(image);
 
     /* Into the frame this call arrived on, which is the one the tail's `iretq` is about to
      * use.  Everything else in it is left alone: the selector and flag words are the same
@@ -528,24 +712,7 @@ long sys_exit(regs_t *regs) {
 }
 
 long sys_brk(regs_t *regs) {
-    uint64_t want = arg(regs, 0);
-    task_t *t = sched_current();
-
-    if (t == NULL)
-        errno_return(ENOSYS);
-
-    /* Growing a heap is phase 7, with an allocator behind it.  Reporting the current
-     * break keeps a program that probes it -- which is what a loader does first --
-     * working. */
-    if (want == 0)
-        return (long)t->brk;
-
-    if (want < t->brk)
-        errno_return(EINVAL);
-
-    /* Not implemented, and saying so beats pretending: a program that believes its heap
-     * grew will store into it and fault. */
-    errno_return(ENOMEM);
+    return sys_brk_grow(regs);
 }
 
 long sys_getpid(regs_t *regs) {
@@ -722,6 +889,45 @@ task_t *program_exec_into(task_t *t, const char *name, const void *image,
     return t;
 }
 
+/* Start a program named by a *path*, reading its bytes out of the filesystem.
+ *
+ * The counterpart to `program_load_and_run()`, which starts a program the kernel carries
+ * inside itself.  Both end in the same `program_start_image()`, because loading an image
+ * into a task is the same work either way and the only thing that differs is where the
+ * bytes came from.
+ *
+ * Returns NULL with the reason on the console, which is what a boot log wants: a machine
+ * that cannot find its init says so rather than reaching a prompt with nothing behind it. */
+task_t *program_start_path(const char *path, uint32_t stack_pages) {
+    vpath_t p;
+    long r = vfs_resolve(sched_current(), path, true, &p);
+
+    if (r != 0) {
+        kwarn("program: %s does not resolve (%ld)", path, r);
+        return NULL;
+    }
+
+    if (ramfs_node_kind(p.ino) != RAMFS_FILE) {
+        kwarn("program: %s is not a regular file", path);
+        return NULL;
+    }
+
+    void *image = NULL;
+    size_t bytes = 0;
+
+    if (vfs_read_whole(&p, &image, &bytes) != 0) {
+        kwarn("program: %s could not be read", path);
+        return NULL;
+    }
+
+    task_t *t = program_start_image(path, image, bytes, stack_pages);
+
+    if (t != NULL)
+        ramfs_image_free(image);    /* the task has its own copy in its own pages now */
+
+    return t;
+}
+
 task_t *program_load_and_run(const char *name, uint32_t stack_pages) {
     const program_image_t *p = program_find(name);
 
@@ -733,14 +939,12 @@ task_t *program_load_and_run(const char *name, uint32_t stack_pages) {
     return program_start(p);
 }
 
-/* Create a task and load one registered program into it.  Split out because the loader
- * body is now reached from two places and neither of them wants the other's half. */
-task_t *program_start(const program_image_t *p) {
-    const char *name = p->name;
-    const void *image = p->image;
-    size_t bytes = p->bytes;
-    uint32_t stack_pages = p->stack_pages;
-
+/* Create a task and load one image into it.  Split out from program_start() so that a
+ * program named by a path and a program the kernel carries both end here: loading an image
+ * into a task is the same work either way and the only thing that differs is where the
+ * bytes came from. */
+task_t *program_start_image(const char *name, const void *image, size_t bytes,
+                            uint32_t stack_pages) {
     task_t *t = task_create_user(name, 0, stack_pages, TASK_WEIGHT_DEFAULT);
 
     if (t == NULL) {
@@ -768,7 +972,7 @@ task_t *program_start(const program_image_t *p) {
     /* `iretq` pops RIP, CS, RFLAGS, RSP and SS -- in that order, each one quadword above
      * the last -- so RIP is the first quadword of the frame and SS the fifth.  RSP is
      * *fourth*, not fifth: the two were the wrong way round here, and reading a stack
-     * pointer where a selector belongs is a #GP whose error code is the low half of the
+     * pointer where a selector belongs is a #GP whose error code is the low half of that
      * stack pointer.  task_create_user() lays the frame out in the order the CPU pops it
      * and records a kernel alias of the frame's page for exactly this.
      *
@@ -787,7 +991,6 @@ task_t *program_start(const program_image_t *p) {
     frame[0] = r.entry;            /* RIP */
     frame[3] = r.entry_rsp;        /* RSP */
     frame[4] = GDT_USER_DATA_RPL3; /* SS   */
-
 
     /* A virtual address: this is what the CPU loads into RSP. */
     t->saved_rsp = USER_STACK_TOP - USER_FRAME_BYTES - USER_CTX_BYTES;
@@ -813,13 +1016,13 @@ task_t *program_start(const program_image_t *p) {
 
     /* Report before queueing, not after.
      *
-     * Waking the task makes it runnable, and on this machine the next tick can hand it
-     * the processor while the report below is still being rendered.  The two then write
-     * to the console a character at a time -- the program's own output interleaved with
-     * this line, which reads as though the program had printed something strange:
+     * Waking the task makes it runnable, and on this machine the next tick can hand it the
+     * processor while the report below is still being rendered.  The two then write to the
+     * console a character at a time -- the program's own output interleaved with this
+     * line, which reads as though the program had printed something strange:
      * `argc=1` came out as `argc=g1r` because "program:" was being emitted into the
-     * middle of it.  Nothing was actually wrong with either line, and that is exactly
-     * why it is worth fixing: a report that cannot be read is a report nobody has. */
+     * middle of it.  Nothing was actually wrong with either line, and that is exactly why
+     * it is worth fixing: a report that cannot be read is a report nobody has. */
     kprintf("program: %s loaded, entry %#lx, %u segment(s), %lu bytes, stack %#lx\n",
             name, (unsigned long)r.entry, r.segments, (unsigned long)r.bytes,
             (unsigned long)r.entry_rsp);
@@ -830,6 +1033,11 @@ task_t *program_start(const program_image_t *p) {
     }
 
     return t;
+}
+
+/* Create a task and load one registered program into it. */
+task_t *program_start(const struct program_image *p) {
+    return program_start_image(p->name, p->image, p->bytes, p->stack_pages);
 }
 
 /* --- fork and wait ------------------------------------------------------- */
@@ -928,24 +1136,69 @@ int syscall_init(void) {
     for (unsigned i = 0; i < SYS_MAX; i++)
         handlers[i] = NULL;
 
-    handlers[SYS_WRITE] = sys_write;
-    handlers[SYS_READ] = sys_read;
-    handlers[SYS_OPEN] = sys_open;
-    handlers[SYS_CLOSE] = sys_close;
-    handlers[SYS_WRITEV] = sys_writev;
-    handlers[SYS_PIPE] = sys_pipe;
-    handlers[SYS_EXEC] = sys_exec;
-    handlers[SYS_EXIT] = sys_exit;
-    handlers[SYS_BRK] = sys_brk;
-    handlers[SYS_GETPID] = sys_getpid;
-    handlers[SYS_FORK] = sys_fork;
-    handlers[SYS_WAIT] = sys_wait;
-    handlers[SYS_KILL] = sys_kill;
+    handlers[SYS_READ]    = sys_read;
+    handlers[SYS_WRITE]   = sys_write;
+    handlers[SYS_WRITEV]  = sys_writev;
+    handlers[SYS_OPEN]    = fs_sys_open;
+    handlers[SYS_CLOSE]   = fs_sys_close;
+    handlers[SYS_LSEEK]   = fs_sys_lseek;
+    handlers[SYS_FSTAT]   = fs_sys_fstat;
+    handlers[SYS_STAT]    = fs_sys_stat;
+    handlers[SYS_LSTAT]   = fs_sys_lstat;
+    handlers[SYS_FSYNC]   = fs_sys_fsync;
+    handlers[SYS_READLINK]= fs_sys_readlink;
+    handlers[SYS_GETDENTS]= fs_sys_getdents;
+    handlers[SYS_DUP]     = fs_sys_dup;
+    handlers[SYS_DUP2]    = fs_sys_dup2;
+    handlers[SYS_MKDIR]   = fs_sys_mkdir;
+    handlers[SYS_RMDIR]   = fs_sys_rmdir;
+    handlers[SYS_UNLINK]  = fs_sys_unlink;
+    handlers[SYS_RENAME]  = fs_sys_rename;
+    handlers[SYS_LINK]    = fs_sys_link;
+    handlers[SYS_SYMLINK] = fs_sys_symlink;
+    handlers[SYS_CHMOD]   = fs_sys_chmod;
+    handlers[SYS_CHOWN]   = fs_sys_chown;
+    handlers[SYS_TRUNCATE]= fs_sys_truncate;
+    handlers[SYS_FTRUNCATE]= fs_sys_ftruncate;
+    handlers[SYS_UTIMES]  = fs_sys_utimes;
+    handlers[SYS_CHDIR]   = fs_sys_chdir;
+    handlers[SYS_GETCWD]  = fs_sys_getcwd;
+    handlers[SYS_UMASK]   = fs_sys_umask;
+    handlers[SYS_MOUNT]   = fs_sys_mount;
+    handlers[SYS_UMOUNT]  = fs_sys_umount;
+    handlers[SYS_ACCESS]  = fs_sys_access;
+    handlers[SYS_FCNTL]   = fs_sys_fcntl;
+    handlers[SYS_IOCTL]   = fs_sys_ioctl;
+    handlers[SYS_EXIT]    = sys_exit;
+    handlers[SYS_BRK]     = sys_brk;
+    handlers[SYS_GETPID]  = sys_getpid;
+    handlers[SYS_GETPPID] = sys_getppid;
+    handlers[SYS_FORK]    = sys_fork;
+    handlers[SYS_WAIT]    = sys_wait;
+    handlers[SYS_PIPE]    = sys_pipe;
+    handlers[SYS_EXEC]    = sys_exec;
+    handlers[SYS_SETSID]  = sys_setsid;
+    handlers[SYS_SETPGID] = sys_setpgid;
+    handlers[SYS_GETPGID] = sys_getpgid;
+    handlers[SYS_UNAME]   = sys_uname;
+    handlers[SYS_GETUID]  = sys_getuid;
+    handlers[SYS_GETEUID] = sys_geteuid;
+    handlers[SYS_SETUID]  = sys_setuid;
+    handlers[SYS_GETGID]  = sys_getgid;
+    handlers[SYS_NANOSLEEP] = sys_nanosleep;
+    handlers[SYS_SCHED_YIELD] = sys_sched_yield;
+    handlers[SYS_TIMES]   = sys_times;
+    handlers[SYS_GETRUSAGE] = sys_getrusage;
+    handlers[SYS_REBOOT]  = sys_reboot;
+    handlers[SYS_KILL]    = sys_kill;
     handlers[SYS_SIGACTION] = sys_sigaction;
     handlers[SYS_SIGRETURN] = sys_sigreturn;
     handlers[SYS_SIGPROCMASK] = sys_sigprocmask;
     handlers[SYS_SIGPENDING] = sys_sigpending;
-    handlers[SYS_PAUSE] = sys_pause;
+    handlers[SYS_PAUSE]   = sys_pause;
+    handlers[SYS_MMAP]    = sys_mmap;
+    handlers[SYS_MUNMAP]  = sys_munmap;
+    handlers[SYS_MPROTECT]= sys_mprotect;
 
     /* DPL 3: the gate has to be reachable from ring 3, which is the entire point.  A
      * kernel gate is DPL 0, and a user `int $0x80` against one raises #GP -- which is
