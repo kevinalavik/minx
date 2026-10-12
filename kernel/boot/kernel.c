@@ -25,8 +25,11 @@
 #include "percpu.h"
 #include "pmm.h"
 #include "ramfs.h"
+#include "string.h"
 #include "signal.h"
 #include "power.h"
+#include "devfs.h"
+#include "procfs.h"
 #include "serial.h"
 #include "smp.h"
 #include "syscall.h"
@@ -34,7 +37,9 @@
 #include "string.h"
 #include "test.h"
 #include "timer.h"
+#include "tty.h"
 #include "types.h"
+#include "vfs.h"
 #include "vmm.h"
 
 #include "vectors.h"
@@ -517,6 +522,7 @@ static void smp_init(void) {
 /* The idle loop: pump the input queue and halt between events until something
  * wakes us.  Declared before kmain_stage2, which starts it. */
 static void interactive_console(void);
+static void boot_banner(void);
 
 static char heartbeat_buf[24];
 
@@ -631,6 +637,13 @@ static void kmain_stage2(void) {
     if (ramfs_mount_initrd(boot_info.initrd_base, boot_info.initrd_size) != 0)
         kprintf("[warn] the root filesystem could not be mounted\n");
 
+    /* The root into the mount table, so that every path -- including "/" itself -- resolves
+     * through the same code every other path does.  Without it the table is empty and
+     * nothing resolves at all, which looks like "the filesystem has no files in it" rather
+     * than like "the filesystem was never plugged in". */
+    if (vfs_init() != 0)
+        kwarn("vfs: the root filesystem could not be registered");
+
     cpu_interrupts_init();
 
     const fb_info_t *fbi = fb_get_info();
@@ -688,9 +701,57 @@ static void kmain_stage2(void) {
      * ends. */
     sti();
 
+    /* The two generated filesystems and the terminal.
+     *
+     * `/dev` and `/proc` are built here rather than by `init` for the same reason the
+     * console is: a machine that boots with no way to read a device, or no way to ask what
+     * it is, cannot be reported on.  `init` mounts them again, which is a no-op because
+     * both builders are idempotent, so the shell sees a machine that was set up properly
+     * rather than one that depends on the kernel having done it first.
+     *
+     * The terminal comes up before either, because `/dev/console` is the console: a device
+     * node bound to something that does not exist yet is a name that lies. */
+    if (tty_init() != 0)
+        kwarn("terminal: the line discipline could not be started");
+
+    if (devfs_init() != 0)
+        kwarn("devfs: /dev could not be built");
+
+    if (procfs_init() != 0)
+        kwarn("procfs: /proc could not be built");
+
     if (boot_cmdline.test) {
         test_run_all();
         test_linger_and_exit();
+    }
+
+    /* The machine's own account of itself, before the first program's, because the first
+     * program prints three words after this point and there is no later moment at which
+     * the banner can be said without landing between two of them. */
+    boot_banner();
+
+    /* The first program.
+     *
+     * From the filesystem, by a path, and that is the point: everything before this
+     * statement proved that a path *resolves*; this proves that a program read out of a
+     * file runs.  `/init` is a name rather than a table entry, so what runs here is
+     * exactly what the initrd contained -- and an initrd with no /init in it produces a
+     * machine that says so and stops, which is a much better failure than a machine that
+     * reaches an interactive prompt with no shell behind it. */
+    {
+        vpath_t p;
+        long r = vfs_resolve_abs("/init", true, &p);
+
+        if (r != 0 || ramfs_node_kind(p.ino) != RAMFS_FILE) {
+            kprintf("init: there is no /init in the initrd (looked, and %s)\n",
+                    r != 0 ? "it is not there" : "it is not a file");
+            kprintf("     the initrd has %u file(s) under /\n", ramfs_node_count());
+        } else {
+            kprintf("init: found /init, %lu bytes\n",
+                    (unsigned long)ramfs_node_size(p.ino));
+            tty_attach(true);
+            program_start_path("/init", 8);
+        }
     }
 
     interactive_console();
@@ -698,7 +759,25 @@ static void kmain_stage2(void) {
 
 /* The idle loop: pump the input queue and halt between events until something
  * wakes us. */
-static void interactive_console(void) {
+/* What the machine says about itself, printed before anything else can.
+ *
+ * Split out of `interactive_console()` because it has to run *before* `/init` is started,
+ * not after.  The kernel started init and then called `interactive_console()`, which is
+ * where the banner lives -- so init's first message and the banner raced, and the log read:
+ *
+ *     init: starting, pid
+ *     6minx console commands: help clear uptime ...
+ *
+ * The pid is on the wrong line.  Neither write was torn: the console lock makes every
+ * single write atomic, and both of those are whole writes.  What a lock cannot do is make
+ * two *sequences* of writes atomic, and a boot log where a program's line is split by the
+ * banner is a boot log that cannot be grepped -- which is the same reason the console lock
+ * exists at all, one level up.
+ *
+ * The test path deliberately does not call this: a test run's output is a fixed script that
+ * the harness reads by line, and a banner in the middle of it is another thing to keep in
+ * sync. */
+static void boot_banner(void) {
     /* Report which lines are actually unmasked.  The 8259s are fully masked by
      * design once the IOAPIC owns delivery, so counting clear bits in *their*
      * mask always prints zero and says nothing about the machine. */
@@ -713,7 +792,9 @@ static void interactive_console(void) {
             boot_info.have_timer ? "armed" : "absent");
 
     conio_banner();
+}
 
+static void interactive_console(void) {
     /* Halve between events rather than halt.
      *
      * The scheduler's idle path is where a halt belongs, but this is the boot
