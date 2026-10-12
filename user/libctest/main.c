@@ -24,6 +24,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -290,6 +292,38 @@ int main(int argc, char **argv, char **envp) {
             check(stat("/tmp/libctest", &st) == -1 && errno == ENOENT,
                   "unlink, and the file is gone");
         }
+    }
+
+    /* --- setjmp -------------------------------------------------------------- */
+
+    {
+        /* The jump has to come back with its own value, and the value is the only way the
+         * code after the jump can tell which path it took.  A `longjmp` that arrives as 0
+         * would be indistinguishable from the `setjmp` that saved the environment. */
+        static jmp_buf env;
+        volatile int reached = 0;
+        int v = setjmp(env);
+
+        if (v == 0) {
+            reached = 1;
+            longjmp(env, 42);
+            check(0, "longjmp did not return at all");
+        }
+
+        check(v == 42 && reached == 1, "setjmp returns 0 and longjmp returns its value");
+
+        /* The registers, not just the control flow: a `longjmp` that restores the stack
+         * but not r12..r15 comes back with the *caller's* values in them, which is a
+         * corruption that only shows up if something is in one. */
+        static jmp_buf env2;
+        volatile unsigned long kept = 0;
+        register unsigned long r12 asm("r12") = 0x5a5a5a5a5a5a5a5aull;
+
+        if (setjmp(env2) == 0)
+            longjmp(env2, 7);
+
+        kept = r12;
+        check(kept == 0x5a5a5a5a5a5a5a5aull, "longjmp restores the callee-saved registers");
     }
 
     /* --- directories ----------------------------------------------------------- */

@@ -917,8 +917,24 @@ long vfs_seek(file_t *f, int64_t offset, int whence) {
     if (f == NULL)
         return -EBADF;
 
-    if (f->is_dir)
+    if (f->is_dir) {
+        /* A directory's "position" is not a byte offset, so there is nothing to seek to --
+         * and yet `lseek(fd, 0, SEEK_SET)` on a directory is exactly what `rewinddir()` is.
+         *
+         * POSIX spells it that way and every other system honours it, because the position
+         * is opaque to the caller: a program that has read half a directory and wants to
+         * read it again has no other way to say so, and a libc that had to close and reopen
+         * the descriptor to do it would lose the descriptor number it was given.  So the
+         * one seek a directory has is "back to the beginning", and anything else is
+         * ESPIPE -- the honest answer, rather than a position that means something only to
+         * this kernel. */
+        if (whence == 0 && offset == 0) {
+            f->offset = 0;
+            return 0;
+        }
+
         return -ESPIPE;
+    }
 
     int64_t base;
 
