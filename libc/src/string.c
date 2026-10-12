@@ -21,6 +21,7 @@
  * below counts with a `size_t` for that reason. */
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 void *memcpy(void *dst, const void *src, size_t n) {
@@ -148,12 +149,19 @@ void *memchr(const void *s, int c, size_t n) {
 size_t strlen(const char *s) {
     const char *p = s;
 
-    /* A word-at-a-time scan for the NUL.  Every string operation in a program bottoms out
-     * here, and a byte at a time this is the difference between a shell that feels
-     * instant and one that does not. */
+    /* Get to an eight-byte boundary one byte at a time, and a string that *ends* before
+     * the boundary is found here rather than in the word loop below.
+     *
+     * That case is the one that matters: `strlen("octal")` at an address that puts the
+     * NUL before the next eight-byte boundary has to answer 5, and returning 0 there made
+     * `printf("%s", ...)` print nothing for every string shorter than the alignment gap.
+     * libctest printed "libctest: ok -- " with the explanation missing, for exactly those
+     * strings whose length happened to end early, and passed for the rest -- which is the
+     * worst shape a string bug can have: right most of the time, on data you did not
+     * choose. */
     while (((uintptr_t)p & 7) != 0) {
         if (*p == 0)
-            return 0;
+            return (size_t)(p - s);
         p++;
     }
 
@@ -483,4 +491,35 @@ int strncasecmp(const char *a, const char *b, size_t n) {
     }
 
     return 0;
+}
+
+/* --- the allocating ones ------------------------------------------------------- */
+
+/* `strdup()` and `strndup()` are here rather than in stdlib.c because they are string
+ * functions that happen to allocate, and a program that includes <string.h> for them gets
+ * them from where it expects, with `free()` from <stdlib.h>. */
+char *strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char  *p = malloc(n);
+
+    if (p != NULL)
+        memcpy(p, s, n);
+
+    return p;
+}
+
+/* Bounded, and bounded in the way that matters: `strndup()` copies at most `n` bytes *and*
+ * terminates, so the result is a string whatever `s` is.  An implementation that copies `n`
+ * bytes without terminating leaves the result's last byte as whatever followed the source
+ * in memory, which for a source at the end of a page is a fault. */
+char *strndup(const char *s, size_t n) {
+    size_t len = strnlen(s, n);
+    char  *p   = malloc(len + 1);
+
+    if (p != NULL) {
+        memcpy(p, s, len);
+        p[len] = 0;
+    }
+
+    return p;
 }
