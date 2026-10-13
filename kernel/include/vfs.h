@@ -201,6 +201,12 @@ typedef struct file {
  * caller that has already resolved something does not resolve it twice. */
 long vfs_open(const vpath_t *p, uint32_t flags, file_t **out);
 long vfs_close(file_t *f);
+
+/* The reference count on a `file_t`, moved by every path that makes a second descriptor
+ * name the same open file: `dup`, `dup2` and `fork`.  Without them `close` frees a file
+ * that another descriptor still points at. */
+void vfs_file_retain(file_t *f);
+long vfs_file_release(file_t *f);
 long vfs_read(file_t *f, void *buf, size_t len);
 long vfs_write(file_t *f, const void *buf, size_t len);
 long vfs_seek(file_t *f, int64_t offset, int whence);

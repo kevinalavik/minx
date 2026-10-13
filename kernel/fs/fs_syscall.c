@@ -345,6 +345,8 @@ long fs_sys_dup(regs_t *regs) {
 
     if (e->kind == FD_PIPE)
         pipe_retain((pipe_t *)e->obj, e->pipe_end);
+    else if (e->kind == FD_FILE)
+        vfs_file_retain((file_t *)e->obj);
 
     return copy;
 }
@@ -366,6 +368,9 @@ long fs_sys_dup2(regs_t *regs) {
         if (victim != NULL && victim->closable) {
             if (victim->kind == FD_PIPE)
                 pipe_close_end((pipe_t *)victim->obj, victim->pipe_end);
+            else if (victim->kind == FD_FILE)
+                vfs_file_release((file_t *)victim->obj);
+
             memset(victim, 0, sizeof(*victim));
         }
     }
@@ -386,6 +391,8 @@ long fs_sys_dup2(regs_t *regs) {
 
     if (e->kind == FD_PIPE)
         pipe_retain((pipe_t *)e->obj, e->pipe_end);
+    else if (e->kind == FD_FILE)
+        vfs_file_retain((file_t *)e->obj);
 
     return neu;
 }

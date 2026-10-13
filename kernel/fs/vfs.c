@@ -802,12 +802,41 @@ long vfs_open(const vpath_t *p, uint32_t flags, file_t **out) {
     return 0;
 }
 
-long vfs_close(file_t *f) {
+/* One more descriptor now names this open file. */
+void vfs_file_retain(file_t *f) {
+    if (f != NULL)
+        f->refs++;
+}
+
+/* Give one up, and free it when the last one does.
+ *
+ * The count is the whole of what makes `dup` safe.  `dup` hands a second descriptor the
+ * *same* pointer, and POSIX is explicit that closing one of the two must not close the
+ * other: the open file description lives until the last descriptor naming it is gone.
+ * Without the count, `int fd = open(...); dup2(fd, 0); dup2(fd, 1); dup2(fd, 2);
+ * close(fd);` -- which is how init puts the console on its three standard descriptors --
+ * frees the file out from under all three.  The freed block is still readable for a while,
+ * so the program that did it keeps working, and the failure appears later, in a child that
+ * inherited the descriptor, as EBADF on a write that should have gone to the console.
+ *
+ * `refs` was in the struct from the start and set to one by `vfs_open()`; nothing ever
+ * moved it. */
+long vfs_file_release(file_t *f) {
     if (f == NULL)
         return -EBADF;
 
+    if (f->refs > 0)
+        f->refs--;
+
+    if (f->refs > 0)
+        return 0;
+
     kfree(f);
     return 0;
+}
+
+long vfs_close(file_t *f) {
+    return vfs_file_release(f);
 }
 
 long vfs_read(file_t *f, void *buf, size_t len) {

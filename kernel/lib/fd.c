@@ -52,6 +52,8 @@ void fd_table_copy(fd_entry_t *dst, const fd_entry_t *src) {
     for (int i = 0; i < FD_TABLE_ENTRIES; i++) {
         if (dst[i].kind == FD_PIPE)
             pipe_retain((pipe_t *)dst[i].obj, dst[i].pipe_end);
+        else if (dst[i].kind == FD_FILE)
+            vfs_file_retain((file_t *)dst[i].obj);
     }
 }
 
