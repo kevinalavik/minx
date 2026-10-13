@@ -2135,7 +2135,7 @@ static void test_elf_rejects(void) {
     }
     t->tables = &tables;
 
-    elf_load_result_t r = elf_load(fake, 8, t, 4, USER_IMAGE_BASE + 64);
+    elf_load_result_t r = elf_load(fake, 8, t, 4, USER_IMAGE_BASE + 64, NULL, NULL);
     if (r.ok) {
         test_fail("phase6-elf", "an 8-byte file was loaded as a program");
         return;
@@ -2156,7 +2156,7 @@ static void test_elf_rejects(void) {
     eh->e_phnum = 1;
     eh->e_phoff = sizeof(Elf64_Ehdr);
 
-    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64);
+    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64, NULL, NULL);
     if (r.ok) {
         test_fail("phase6-elf", "an ELF for machine 0x1234 was loaded");
         return;
@@ -2166,7 +2166,7 @@ static void test_elf_rejects(void) {
     eh->e_machine = EM_X86_64;
     eh->e_ident[EI_CLASS] = ELFCLASS32;
 
-    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64);
+    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64, NULL, NULL);
     if (r.ok) {
         test_fail("phase6-elf", "a 32-bit ELF was loaded");
         return;
@@ -2177,7 +2177,7 @@ static void test_elf_rejects(void) {
     eh->e_ident[EI_CLASS] = ELFCLASS64;
     ((Elf64_Phdr *)(fake + eh->e_phoff))->p_type = PT_NULL;
 
-    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64);
+    r = elf_load(fake, sizeof(fake), t, 4, USER_IMAGE_BASE + 64, NULL, NULL);
     if (r.ok) {
         test_fail("phase6-elf", "an ELF with no loadable segments was loaded");
         return;

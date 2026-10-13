@@ -36,7 +36,13 @@ tmp="$out.tmp"
     echo " * is a list that can be out of date, and the symptom is a program that the Makefile"
     echo " * built, put in the initrd and nothing can start."
     echo " *"
-    echo " * `stack_pages` is a property of the program rather than of whoever starts it: a"
+    # Single-quoted because of the backticks.  Inside double quotes a backtick starts a
+    # command substitution, so this line was running `stack_pages` as a command -- printing
+    # "stack_pages: command not found" to stderr and writing a comment into the generated
+    # header with a hole in the middle of the sentence.  It was never fatal, which is why
+    # it survived: the header still compiled, and the only symptom was noise on stderr and
+    # a generated comment that did not say what it meant.
+    echo ' * `stack_pages` is a property of the program rather than of whoever starts it: a'
     echo " * program whose stack is too small for its own recursion should fail the same way"
     echo " * whoever runs it.  8 pages (32 KiB) is enough for every program here and small"
     echo " * enough that a stress test forking in the hundreds is bounded by something. */"

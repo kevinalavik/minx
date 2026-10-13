@@ -295,6 +295,7 @@ struct task *program_start_path(const char *path, uint32_t stack_pages);
  * worked. */
 struct task *program_exec_into(struct task *t, const char *name, const void *image,
                                size_t bytes, uint32_t stack_pages,
+                               const char *const *argv, const char *const *envp,
                                uint64_t *entry_out, uint64_t *rsp_out);
 
 /* --- what a program did -------------------------------------------------- */

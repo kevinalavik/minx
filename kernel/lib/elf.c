@@ -260,7 +260,27 @@ static void stack_write(task_t *t, uint64_t vaddr, const void *src, size_t n) {
     }
 }
 
+/* How many entries one of these arrays has, NULL-terminated or not.
+ *
+ * A caller that passes NULL gets zero, and a caller that passes a non-NULL first element
+ * gets a count that stops at the first NULL.  The second case is the one that matters:
+ * every user program builds its argument vector NULL-terminated, because that is what
+ * `execve` is given, and a count that ran off the end would be a walk through whatever
+ * followed. */
+static size_t count_of(const char *const *v) {
+    size_t n = 0;
+
+    if (v == NULL)
+        return 0;
+
+    while (v[n] != NULL && n < 4096)
+        n++;
+
+    return n;
+}
+
 static bool build_stack(task_t *t, uint64_t entry, const char *path,
+                        const char *const *argv, const char *const *envp,
                         uint32_t stack_pages, uint64_t *entry_rsp) {
     uint64_t top = USER_STACK_TOP;
 
@@ -320,7 +340,40 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
 
     size_t path_len = strnlen(path, 4096);
 
-    /* argc, argv[0], the argv NULL, the envp NULL, then one auxv entry each for
+    /* The arguments and the environment, as the program will see them.
+     *
+     * `argv[0]` is the program's name as it was invoked -- the *path*, not the path with a
+     * slash replaced by a base name.  `basename()`-ing it here would be helpful and wrong:
+     * a program that re-execs itself by `argv[0]` has to get back the name it was given,
+     * and a program that prints its usage message wants the name the user typed.  What
+     * `argv[0]` is *not* allowed to be is NULL: a program that does `strcmp(argv[0], "sh")`
+     * has to be able to, and an empty `argv[0]` is a lie about something the caller knows.
+     *
+     * A NULL vector is replaced by the path alone, which is what a program started with no
+     * arguments at all should see: one argument, which is its name. */
+    size_t argc = count_of(argv);
+    size_t envc = count_of(envp);
+
+    /* The one-argument vector used when the caller passed none.
+     *
+     * Declared *here*, at function scope, and not inside the `if` that uses it.  That is
+     * not style: C ends an automatic object's lifetime at the end of its block, and
+     * `argv` -- which is used for the rest of this function -- would be left pointing at
+     * sixteen bytes of stack that the compiler is free to hand to the next local it needs.
+     * And it does: the two address arrays below are several kilobytes, so they land
+     * exactly there.  `argv[0]` then reads a zero out of the middle of `argv_addr`, and
+     * `strnlen()` is asked for the length of a NULL pointer -- a kernel page fault at
+     * address 0, inside the loader, on the *first* program the self tests start.
+     *
+     * So the array is as long-lived as the pointer that refers to it. */
+    const char *fallback[2] = { path, NULL };
+
+    if (argc == 0) {
+        argv = fallback;
+        argc = 1;
+    }
+
+    /* The auxiliary vector, then one auxv entry each for
      * AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_ENTRY and AT_NULL. */
     struct { uint64_t key, value; } auxv[8];
     unsigned naux = 0;
@@ -333,13 +386,28 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
     auxv[naux].key = AT_ENTRY;  auxv[naux++].value = entry;
     auxv[naux].key = AT_NULL;   auxv[naux++].value = 0;
 
-    uint64_t block_bytes = 8           /* argc                       */
-                         + 8           /* argv[0]                    */
-                         + 8           /* argv NULL                  */
-                         + 8           /* envp NULL                  */
+    uint64_t block_bytes = 8                       /* argc                   */
+                         + 8 * (argc + 1)          /* argv[], and its NULL   */
+                         + 8 * (envc + 1)          /* envp[], and its NULL   */
                          + (uint64_t)naux * 16;
 
-    uint64_t strings_bytes = ALIGN16(path_len + 1);
+    /* Every string the program can reach, each padded to 16 so the block below stays
+     * aligned.  `path` is counted as well as the vector because the fallback above may have
+     * put it into `argv[0]`, and counting it twice would reserve space that is used --
+     * the strings are *written* one per vector entry, so what has to fit is the vector's
+     * contents, not the vector and the path separately. */
+    uint64_t strings_bytes = 0;
+
+    for (size_t i = 0; i < argc; i++)
+        strings_bytes += ALIGN16(strnlen(argv[i], 4096) + 1);
+
+    for (size_t i = 0; i < envc; i++)
+        strings_bytes += ALIGN16(strnlen(envp[i], 4096) + 1);
+
+    /* The name is written unconditionally, above the vector's own strings, so that a
+     * program with a NULL vector still has *something* in the slot rather than a null
+     * pointer it would have to check for. */
+    strings_bytes += ALIGN16(path_len + 1);
 
     /* 256 bytes of slack below the block so a program's first few frames cannot walk
      * off the bottom of the stack into whatever the allocator gave us. */
@@ -394,12 +462,53 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
      * So the stack pointer is computed first, aligned, and the rest of the block hangs
      * off it. */
     uint64_t sp = ALIGN_UP(top - frames - strings_bytes - block_bytes, 16);
-    uint64_t p = sp + block_bytes;          /* the strings, directly above the block */
+
+    /* Two cursors, and the difference between them is the whole layout.
+     *
+     * `b` is the *bottom* of the string region: the block hangs downward from it, and it
+     * never moves.  `p` walks upward through the strings, because the block holds pointers
+     * to them and those addresses have to be known before the block is written -- a two-pass
+     * layout is cheaper than a patch-up pass over the block afterwards.
+     *
+     * Deriving the block's top from `p` instead is the mistake that was made first: `p`
+     * ends up `strings_bytes` above `b` after the strings are written, so a block laid out
+     * downward from it ends `strings_bytes` above `sp` -- and the check that the block ends
+     * exactly on the stack pointer then fails for every program, with a message about the
+     * argument block and the stack pointer that is really about a cursor. */
+    uint64_t b = sp + block_bytes;
+    uint64_t p = b;
+
+    /* The name first, at the very top, and the vector's strings below it.
+     *
+     * Top-down rather than bottom-up, for the reason above. */
     stack_write(t, p, path, path_len);
     {
         char nul = 0;
 
         stack_write(t, p + path_len, &nul, 1);
+    }
+
+    uint64_t argv_addr[4096 / sizeof(uint64_t) + 1];
+    uint64_t envp_addr[4096 / sizeof(uint64_t) + 1];
+
+    p += ALIGN16(path_len + 1);
+
+    for (size_t i = 0; i < argc; i++) {
+        size_t len = strnlen(argv[i], 4096);
+
+        stack_write(t, p, argv[i], len);
+        stack_write(t, p + len, &(char){ 0 }, 1);
+        argv_addr[i] = p;
+        p += ALIGN16(len + 1);
+    }
+
+    for (size_t i = 0; i < envc; i++) {
+        size_t len = strnlen(envp[i], 4096);
+
+        stack_write(t, p, envp[i], len);
+        stack_write(t, p + len, &(char){ 0 }, 1);
+        envp_addr[i] = p;
+        p += ALIGN16(len + 1);
     }
 
     /* The *addresses the program will see* are offsets into its own stack, not offsets
@@ -411,24 +520,56 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
      *
      * So the alias is used only to *write*; everything the program will read back is
      * expressed against the user address of the stack. */
-    uint64_t argv0_addr = p;
+    /* The block, written *upward* from `sp`.
+     *
+     * Upward, and not downward from `b`, and the reason is not style.  Laying it out
+     * downward means every field's address is "wherever the cursor is after subtracting
+     * this field", and the order of the subtractions has to be the reverse of the order of
+     * the fields -- which is exactly the kind of thing that is right in the source, wrong
+     * by one, and indistinguishable from a loader bug until a program reads `envp[0]` and
+     * finds eight bytes of a string.  The fields went in the wrong order: `argv[0]` was
+     * written where `argv[argc]` belongs and the NULL markers went where the arrays belong,
+     * so `__libc_start_main()` read a string's *address* as an argument count and eight
+     * characters of `PATH=/bin:/usr/bin` as the end of argv.  The program's own report was
+     * `getenv()` faulting on a non-canonical address.
+     *
+     * Upward, each field is written where it is, the cursor only ever increases, and the
+     * one check at the end -- that the cursor arrived at `b` -- is the whole proof that
+     * `block_bytes` and what was written agree.  That check is the same one that was there
+     * before, and it passed for the layout that was wrong: it verifies the *size*, and the
+     * size was right.  It just could not see which field went where. */
+    uint64_t q = sp;
 
-    /* The block, ending just below the strings. */
-    uint64_t q = p - (uint64_t)naux * 16;
+    stack_put(t, q, (uint64_t)argc);
+    q += 8;
+
+    for (size_t i = 0; i < argc; i++) {
+        stack_put(t, q, argv_addr[i]);
+        q += 8;
+    }
+
+    stack_put(t, q, 0);                     /* argv[argc] == NULL */
+    q += 8;
+
+    for (size_t i = 0; i < envc; i++) {
+        stack_put(t, q, envp_addr[i]);
+        q += 8;
+    }
+
+    stack_put(t, q, 0);                     /* envp[envc] == NULL */
+    q += 8;
+
     stack_write(t, q, auxv, (size_t)naux * 16);
+    q += (uint64_t)naux * 16;
 
-    q -= 8; stack_put(t, q, 0);             /* envp[0] == NULL  */
-    q -= 8; stack_put(t, q, 0);             /* argv[1] == NULL  */
-    q -= 8; stack_put(t, q, argv0_addr);    /* argv[0]          */
-    q -= 8; stack_put(t, q, 1);             /* argc == 1        */
-
-    /* The ABI wants 16-byte alignment at the first call.  `sp` was computed aligned and
-     * the words above were written down to `q`, which has to land back exactly on it --
-     * so say so rather than rounding, because rounding is what moved the stack pointer
-     * off `argc` in the first place. */
-    if (q != sp || (sp & 15) != 0) {
-        kprintf("elf: the argument block ends at %#lx but the stack pointer is "
-                "%#lx\n", (unsigned long)q, (unsigned long)sp);
+    /* The block has to fill exactly the space `block_bytes` reserved, ending where the
+     * strings begin.  Together with the 16-byte alignment of `sp`, that is what puts the
+     * ABI's words in the right places; both are checked rather than rounded, because
+     * rounding is what moved the stack pointer off `argc` in the first place. */
+    if (q != b || (sp & 15) != 0) {
+        kprintf("elf: the argument block ends at %#lx but the strings begin at "
+                "%#lx (stack pointer %#lx)\n",
+                (unsigned long)q, (unsigned long)b, (unsigned long)sp);
         return false;
     }
 
@@ -451,7 +592,8 @@ static bool build_stack(task_t *t, uint64_t entry, const char *path,
 }
 
 elf_load_result_t elf_load(const void *image, size_t image_bytes, task_t *t,
-                           uint32_t stack_pages, uint64_t phdr_vaddr) {
+                           uint32_t stack_pages, uint64_t phdr_vaddr,
+                           const char *const *argv, const char *const *envp) {
     elf_load_result_t r = { 0, 0, 0, 0, 0, false };
     const uint8_t *base = (const uint8_t *)image;
 
@@ -543,7 +685,7 @@ elf_load_result_t elf_load(const void *image, size_t image_bytes, task_t *t,
         }
     }
 
-    if (!build_stack(t, r.entry, "minx", stack_pages, &r.entry_rsp)) {
+    if (!build_stack(t, r.entry, "minx", argv, envp, stack_pages, &r.entry_rsp)) {
         kprintf("elf: could not build the initial stack\n");
         return (elf_load_result_t){ 0, 0, 0, 0, 0, false };
     }

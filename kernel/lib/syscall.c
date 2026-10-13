@@ -505,42 +505,60 @@ long sys_pipe(regs_t *regs) {
  * environment with the filesystem.  Saying so is better than quietly handing the new
  * program an empty one and letting it wonder.
  */
-long sys_exec(regs_t *regs) {
-    uint64_t path = arg(regs, 0);
-    uint64_t argv = arg(regs, 1);
-    uint64_t envp = arg(regs, 2);
+/* How many entries a user vector has, read one pointer at a time and bounded.
+ *
+ * Counted rather than trusted because a user vector has no length: the only terminator is
+ * a NULL, and a caller that forgot one would otherwise have the kernel walk until it hit
+ * an unmapped page and take a fault on the caller's behalf -- turning a program's mistake
+ * into a kernel oops.  `MAX_EXEC_VECS` is the ceiling; a program with more arguments than
+ * that gets them truncated and a message, which is a usable answer where a fault is not. */
+#define MAX_EXEC_VECS 256
 
-    (void)envp;
+static int copy_user_vector(uint64_t from, const char **into, int max) {
+    int n = 0;
 
-    if (!syscall_user_range_ok(path, 1, false))
-        errno_return(EFAULT);
+    if (from == 0)
+        return 0;
 
-    /* The name has to be read out of the old space and *kept*: it lives in a page this
-     * call is about to unmap. */
-    char name[VFS_NAME_MAX];
+    while (n < max) {
+        uint64_t ptr = 0;
 
-    if (!syscall_copy_from_user(name, path, sizeof(name))) {
-        /* The whole block, or nothing.  A half-read name is a name that does not exist. */
-        errno_return(EFAULT);
-    }
+        if (!syscall_copy_from_user(&ptr, from + (uint64_t)n * sizeof(uint64_t),
+                                    sizeof(ptr)))
+            return -1;
 
-    name[sizeof(name) - 1] = 0;
-
-    /* ...and it still has to be a string.  A program reading its own unterminated memory
-     * hands over bytes with no NUL anywhere in the block, and those bytes are not a name. */
-    bool terminated = false;
-
-    for (unsigned i = 0; i < sizeof(name); i++) {
-        if (name[i] == 0) {
-            terminated = true;
+        if (ptr == 0)
             break;
-        }
-    }
-    if (!terminated)
-        errno_return(EINVAL);
 
-    if (argv != 0 && !syscall_user_range_ok(argv, sizeof(char *), false))
-        errno_return(EFAULT);
+        if (!syscall_user_range_ok(ptr, 1, false))
+            return -1;
+
+        into[n] = (const char *)(uintptr_t)ptr;
+        n++;
+    }
+
+    return n;
+}
+
+/* Everything `exec` does, with the name and the vectors already in the kernel's hands.
+ *
+ * Declared before its own definition because it calls itself: the `#!` path re-enters it
+ * with the interpreter.
+ *
+ * Split out from `sys_exec()` because the `#!` path calls it *again*, with an interpreter
+ * and a rebuilt argument vector, and a second copy of the load-and-replace half of exec
+ * would be a second thing to get wrong.  The split is also where the recursion is bounded:
+ * an interpreter that is itself a script goes round once more, and a script whose
+ * interpreter is a script whose interpreter is... runs out of kernel stack, which is the
+ * honest place for that to end.
+ *
+ * `name` is writable because the `#!` path builds the interpreter's name in it. */
+static long do_exec(regs_t *regs, char *name,
+                    const char *const *exec_argv, const char *const *exec_envp)
+{
+    (void)arg(regs, 0);
+    (void)arg(regs, 1);
+    (void)arg(regs, 2);
 
     /* Two sources of bytes, and which one is used is decided by the *name*, not by a flag:
      *
@@ -594,14 +612,135 @@ long sys_exec(regs_t *regs) {
             errno_return(ENOEXEC);
         }
 
-        /* A script: `#!` on the first line.  The interpreter is named by the file itself and
-         * this kernel does not run one, so it says so and says why rather than executing
-         * whatever the line happens to contain -- which is what treating an interpreter as
-         * just another program would do with a path the program chose. */
-        if (bytes >= 2 && ((char *)image)[0] == '#' && ((char *)image)[1] == '!') {
+        /* A script: `#!` on the first line.
+         *
+         * The kernel does not *run* a script -- it runs the interpreter the script names,
+         * with the script's path in the interpreter's arguments.  That is the whole trick,
+         * and doing it here rather than in every program is what makes `#!/bin/sh` work for
+         * a program that has never heard of shell scripts.
+         *
+         * The line is parsed the way every Unix parses it, which is not quite the way a
+         * person reads it:
+         *
+         *   `#!`, optional spaces, the interpreter's path up to the next space or the end
+         *   of the line, then everything to the end of the line as *one* argument.
+         *
+         * "As one argument" is the part that surprises people and the part that matters.
+         * The argument is an operand, not shell input: `#!/bin/sh -e -x` has to reach
+         * `/bin/sh` as three arguments, and word-splitting it here would also make a
+         * script path with a space in it unnameable.
+         *
+         * The line is bounded rather than NUL-terminated: the image is whatever the
+         * filesystem gave, and reading past the first line would read past the end of the
+         * buffer for a file whose entire content is `#!`. */
+        if (bytes >= 2 && ((const char *)image)[0] == '#' &&
+            ((const char *)image)[1] == '!') {
+            const char *line = (const char *)image + 2;
+            size_t      n    = bytes - 2;
+            size_t      i    = 0;
+
+            while (i < n && (line[i] == ' ' || line[i] == '\t'))
+                i++;
+
+            size_t ipath = i;
+
+            while (i < n && line[i] != ' ' && line[i] != '\t')
+                i++;
+
+            size_t ilen = i - ipath;
+
+            while (i < n && (line[i] == ' ' || line[i] == '\t'))
+                i++;
+
+            size_t arg_at = i;
+
+            while (i < n && line[i] != '\n' && line[i] != '\r')
+                i++;
+
+            size_t alen = i - arg_at;
+
+            /* Trailing spaces are not part of the argument.  Leading ones were already
+             * skipped, and a trailing space is what a file with CRLF endings turns into --
+             * which is a script somebody wrote on another machine, and it should run. */
+            while (alen > 0 && (line[arg_at + alen - 1] == ' ' ||
+                                line[arg_at + alen - 1] == '\t'))
+                alen--;
+
+            /* Declared here rather than where it is filled in, because the check that
+             * bounds it comes first.  And `sizeof(interp)`, never `sizeof(name)`: `name` is
+             * a pointer parameter -- the recursion below passes a different buffer -- so
+             * `sizeof` of it is eight, and a bound of eight refuses every interpreter whose
+             * path is longer than that, which is all of them. */
+            static char interp[128];
+            static char script_arg[VFS_NAME_MAX];
+            static char one[256];
+
+            /* A `#!` line naming nothing.  ENOEXEC rather than a message alone: the file
+             * *is* executable and the kernel could not run it, which is exactly what
+             * ENOEXEC is for. */
+            if (ilen == 0 || ilen >= sizeof(interp)) {
+                ramfs_image_free(image);
+                kprintf("exec: %s has a #! line that names no interpreter\n", name);
+                errno_return(ENOEXEC);
+            }
+
+            memcpy(interp, line + ipath, ilen);
+            interp[ilen] = 0;
+
+            /* The script's own name, kept because `name` is the interpreter's buffer by
+             * the time the vector is used, and because a script that refers to things
+             * beside itself has to find them the way its author wrote them: resolving the
+             * path here would change what `$0` says. */
+            memcpy(script_arg, name, strlen(name) + 1);
+
+            /* The new vector, in POSIX order: the interpreter, its optional argument, the
+             * script, and then whatever the caller had after the script's name.  So
+             * `execve("./s.sh", ["./s.sh", "a"], env)` of a `#!/bin/sh -x` line reaches
+             * `/bin/sh` as `["/bin/sh", "-x", "./s.sh", "a"]` -- which is what a shell
+             * would have built by hand, and the reason a script does not need to know
+             * anything about being a script. */
+            const char *newv[MAX_EXEC_VECS + 4];
+            int   nn = 0;
+            int   have = 0;
+
+            while (have < MAX_EXEC_VECS && exec_argv[have + 1] != NULL)
+                have++;
+
+            if (have + 3 > MAX_EXEC_VECS + 1) {
+                ramfs_image_free(image);
+                kprintf("exec: %s is a script and there is no room for its interpreter\n",
+                        script_arg);
+                errno_return(E2BIG);
+            }
+
+            newv[nn++] = interp;
+
+            if (alen > 0) {
+                if (alen >= sizeof(one)) {
+                    ramfs_image_free(image);
+                    kprintf("exec: %s has a #! argument too long to pass\n", script_arg);
+                    errno_return(ENOEXEC);
+                }
+
+                memcpy(one, line + arg_at, alen);
+                one[alen] = 0;
+                newv[nn++] = one;
+            }
+
+            newv[nn++] = script_arg;
+
+            for (int k = 1; k <= have; k++)
+                newv[nn++] = exec_argv[k];
+
+            newv[nn] = NULL;
+
             ramfs_image_free(image);
-            kprintf("exec: %s is a script; minx has no interpreter for one\n", name);
-            errno_return(ENOEXEC);
+
+            /* Once more, with the interpreter.  The recursion is bounded by the stack and
+             * not by this code, which is deliberate: a chain of scripts each naming the
+             * next is a real thing to want, and truncating it would be a rule nobody asked
+             * for. */
+            return do_exec(regs, interp, newv, exec_envp);
         }
     }
 
@@ -610,8 +749,8 @@ long sys_exec(regs_t *regs) {
     uint64_t entry = 0;
     uint64_t entry_rsp = 0;
 
-    if (program_exec_into(t, exec_name, image, bytes, stack_pages, &entry,
-                          &entry_rsp) == NULL) {
+    if (program_exec_into(t, exec_name, image, bytes, stack_pages,
+                          exec_argv, exec_envp, &entry, &entry_rsp) == NULL) {
         if (reg == NULL)
             ramfs_image_free(image);
         errno_return(ENOEXEC);
@@ -632,6 +771,123 @@ long sys_exec(regs_t *regs) {
      * and it resumes there the next time it is switched into -- so the return value here
      * is never observed, and is only reached on the failure paths above. */
     return 0;
+    return 0;
+}
+
+/* `exec(path, argv, envp)`, with everything the caller's address space holds copied out
+ * before anything is replaced.
+ *
+ * Every string is copied rather than pointed at, for the reason the name is: this call
+ * replaces the address space, and a vector that still points into it is a vector of
+ * addresses that no longer mean anything.  The arena is static rather than allocated,
+ * which is what bounds the argument space: a program with more than 8 KiB of arguments
+ * gets the first 8 KiB and a message on the console, and a program with more than
+ * `MAX_EXEC_VECS` entries gets that many.  Neither is a crash, and both are answers a
+ * shell can report.
+ *
+ * The arena is static and this is not reentrant -- and it does not need to be.  `exec`
+ * replaces the program, so there is no second `exec` in flight from the same task: the
+ * `#!` recursion happens *after* everything has been copied, and works from the copies. */
+long sys_exec(regs_t *regs) {
+    uint64_t path = arg(regs, 0);
+    uint64_t argv = arg(regs, 1);
+    uint64_t envp = arg(regs, 2);
+
+    if (!syscall_user_range_ok(path, 1, false))
+        errno_return(EFAULT);
+
+    char name[VFS_NAME_MAX];
+
+    if (!syscall_copy_from_user(name, path, sizeof(name))) {
+        /* The whole block, or nothing.  A half-read name is a name that does not exist. */
+        errno_return(EFAULT);
+    }
+
+    name[sizeof(name) - 1] = 0;
+
+    /* ...and it still has to be a string.  A program reading its own unterminated memory
+     * hands over bytes with no NUL anywhere in the block, and those bytes are not a name. */
+    bool terminated = false;
+
+    for (unsigned i = 0; i < sizeof(name); i++) {
+        if (name[i] == 0) {
+            terminated = true;
+            break;
+        }
+    }
+    if (!terminated)
+        errno_return(EINVAL);
+
+    static char  exec_strs[8192];
+    static char *exec_argv[MAX_EXEC_VECS + 1];
+    static char *exec_envp[MAX_EXEC_VECS + 1];
+    size_t       used = 0;
+
+    /* Copy one string into the arena, or say that there was no room.  Returning false is
+     * not an error for the caller: a program whose arguments do not fit gets the ones that
+     * do, which is what every Unix does when `ARG_MAX` is exceeded. */
+    #define COPY_ONE(dst_index, src)                                              \
+        do {                                                                      \
+            size_t len = 0;                                                       \
+                                                                                  \
+            while (used + len + 1 < sizeof(exec_strs) && len < 4096) {            \
+                char ch;                                                          \
+                                                                                  \
+                if (!syscall_copy_from_user(&ch, (src) + len, 1))                 \
+                    return -EFAULT;                                               \
+                                                                                  \
+                if (ch == 0)                                                      \
+                    break;                                                        \
+                                                                                  \
+                exec_strs[used + len] = ch;                                       \
+                len++;                                                            \
+            }                                                                     \
+                                                                                  \
+            exec_strs[used + len] = 0;                                            \
+            (dst_index) = exec_strs + used;                                       \
+            used += len + 1;                                                      \
+        } while (0)
+
+    {
+        const char *raw[MAX_EXEC_VECS];
+        int n = copy_user_vector(argv, raw, MAX_EXEC_VECS);
+
+        if (n < 0)
+            return -EFAULT;
+
+        for (int i = 0; i < n; i++) {
+            if (used >= sizeof(exec_strs) - 1) {
+                kprintf("exec: %s has arguments past %zu bytes; truncating\n",
+                        name, sizeof(exec_strs));
+                break;
+            }
+
+            COPY_ONE(exec_argv[i], (uint64_t)(uintptr_t)raw[i]);
+        }
+
+        exec_argv[n] = NULL;
+    }
+
+    {
+        const char *raw[MAX_EXEC_VECS];
+        int n = copy_user_vector(envp, raw, MAX_EXEC_VECS);
+
+        if (n < 0)
+            return -EFAULT;
+
+        for (int i = 0; i < n; i++) {
+            if (used >= sizeof(exec_strs) - 1)
+                break;
+
+            COPY_ONE(exec_envp[i], (uint64_t)(uintptr_t)raw[i]);
+        }
+
+        exec_envp[n] = NULL;
+    }
+
+    #undef COPY_ONE
+
+    return do_exec(regs, name, exec_argv, exec_envp);
 }
 
 long sys_open(regs_t *regs) {
@@ -778,6 +1034,7 @@ void syscall_dispatch(regs_t *regs) {
  * deliberately the part that will not have to change. */
 task_t *program_exec_into(task_t *t, const char *name, const void *image,
                           size_t bytes, uint32_t stack_pages,
+                          const char *const *argv, const char *const *envp,
                           uint64_t *entry_out, uint64_t *rsp_out) {
     if (t == NULL || t->tables == NULL) {
         kwarn("exec: %s has no address space to replace", name != NULL ? name : "?");
@@ -800,7 +1057,8 @@ task_t *program_exec_into(task_t *t, const char *name, const void *image,
     }
 
     elf_load_result_t r = elf_load(image, bytes, fresh, stack_pages,
-                                   USER_IMAGE_BASE + sizeof(Elf64_Ehdr));
+                                   USER_IMAGE_BASE + sizeof(Elf64_Ehdr),
+                                   argv, envp);
 
     if (!r.ok || fresh->user_frame == NULL ||
         !vmm_translate_in(fresh->tables, r.entry) ||
@@ -968,7 +1226,8 @@ task_t *program_start_image(const char *name, const void *image, size_t bytes,
      * the ELF header says.  The caller passes the file's base and the loader works out
      * the rest, because the link address and the file offset can differ. */
     elf_load_result_t r = elf_load(image, bytes, t, stack_pages,
-                                   USER_IMAGE_BASE + sizeof(Elf64_Ehdr));
+                                   USER_IMAGE_BASE + sizeof(Elf64_Ehdr),
+                                   NULL, NULL);
 
     if (!r.ok) {
         kwarn("program: %s would not load", name);

@@ -118,8 +118,15 @@ typedef struct task task_t;
  *
  * Returns `ok == false` and says why on the console for anything it rejects; every
  * rejection leaves the address space untouched rather than half-mapped. */
+/* `argv` and `envp` are the vectors the program will see, NULL-terminated, or NULL for
+ * "just the program's name and no environment".  They are the whole reason a loader needs
+ * to be told them: a shell passes its own `argv[1..]` down, a `#!` line inserts an
+ * interpreter between the two, and a program started by the kernel gets one name and
+ * nothing else.  Each string is copied onto the new program's own stack, so the caller's
+ * arrays may live in an address space this load is about to replace. */
 elf_load_result_t elf_load(const void *image, size_t image_bytes, task_t *t,
-                           uint32_t stack_pages, uint64_t phdr_vaddr);
+                           uint32_t stack_pages, uint64_t phdr_vaddr,
+                           const char *const *argv, const char *const *envp);
 
 /* The loader's own view of what it has done, for `ps`, /proc and the self tests. */
 typedef struct {
