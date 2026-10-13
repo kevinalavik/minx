@@ -1117,6 +1117,23 @@ task_t *program_exec_into(task_t *t, const char *name, const void *image,
     t->started = false;
     t->cow = NULL;             /* the old pages are gone; the list described them */
 
+    /* The program break, which `build_stack()` set on the scratch task and which every
+     * `sbrk` asks about.  It was missing here, and it is the kind of field whose absence
+     * cannot be seen: `t->brk` kept whatever the *old* program left, which for a process
+     * that the kernel started is zero, so `sbrk(0)` answered zero, the allocator took that
+     * as the base of its heap, and handed out memory starting at address 0 and upwards --
+     * straight through this program's own image.  The first `strdup()` wrote its string
+     * over a hundred kilobytes of `.bss`, and a shell's variable table came back holding
+     * pointers into itself.
+     *
+     * The symptom is nowhere near the cause.  Nothing failed, nothing was reported, and the
+     * program that did it kept running: it was a later, unrelated lookup that walked into
+     * the overwritten table.  A program started by the *kernel* was fine, because there
+     * `elf_load()` runs on the task itself and sets the break directly -- which is why
+     * every test in the tree passed and `sh`, which init starts with `exec`, did not. */
+    t->brk = fresh->brk;
+    t->brk_start = fresh->brk_start;
+
     fresh->tables = NULL;
     fresh->stack = NULL;
     kfree(scratch_stack);
