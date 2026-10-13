@@ -1,15 +1,17 @@
 # STATUS
 
-Current phase: 8 (filesystem) — **phases 1 to 7 VERIFIED, phase 8 just VERIFIED.**
+Current phase: 9 (libc and shell) — **phases 1 to 8 VERIFIED; phase 9's libc VERIFIED,
+phase 9's shell IN PROGRESS.**
 
-`make test` reports **`run-tests: PASS`, 43 of 43 checks**, the guest shuts down cleanly,
-`TEST-READY` is reached, the tally is readable and the framebuffer dump is captured. Three
-consecutive runs, all 43/43.
+`make test` reports **`run-tests: PASS`, 44 of 44 checks**, the guest shuts down cleanly,
+`TEST-READY` is reached, the tally is readable and the framebuffer dump is captured.
+`libctest` reports **115 of 115** checks passing inside that run.
 
 A normal boot (`make iso`, `-smp 4`) comes up with a graphical console, mounts `/dev` and
-`/proc`, finds `/init` in the initrd, runs it, and `init` execs `/bin/hello`, which reports
-`hello: ok`. The whole path is exercised: a program read out of the initrd *by a path*,
-not looked up in a table.
+`/proc`, finds `/init` in the initrd, runs it, and `init` execs `/sbin/init`, which mounts
+`/proc`, puts `/dev/console` on 0/1/2, takes a session and forks `/bin/sh`.  The shell is
+not in the default image yet (see "Known bugs"), so the shell's absence is reported on the
+console rather than being silent.
 
 ### What phase 8 added
 
@@ -1079,9 +1081,55 @@ This is the one thing in this tree that is not a technical problem and the only
 thing that cannot be worked around: the work is all here, in order, with the
 co-author trailer on every commit, and one `git push` away.
 
+## Known bugs
+
+**`sh` comes up with fifteen variables that were never set (open).**
+
+`sh`'s own `static var_t vars[256]` in `user/sh/var.c` reads back with fifteen entries
+whose `set` flag is non-zero before a single `var_set()` has run.  The first
+`var_import_environ()` then walks into one of them and `strcmp()`s through a null name, so
+the shell dies in its own first statement with a `#GP` at address 0.  Reproducible from a
+clean tree with:
+
+```
+make WITH_SHELL=1 iso
+# or, to see it without the self tests:
+#   sh is at /bin/sh in the image; run the test ISO and look at build/test-serial.log
+```
+
+What has been established, and what has not:
+
+- **It is not the loader's per-page file offsets.**  That was the first theory — the
+  formula in `load_segment()` did look as though it conflated "how far this page is from
+  the segment's start" with "where the segment starts within this page", and rewriting it
+  *did* change `sh`'s variable table from fifteen bad entries to none.  But the same change
+  made `fstest` fault on its first instruction with kernel registers in the user frame, and
+  the rewritten ranges were then shown to be byte-for-byte what the original computed for
+  that program.  The original formula is right and has been restored; `git log` on
+  `kernel/lib/elf.c` is the whole argument.
+- **`vars[0..5]` are zero and the rest are not.**  The first 128 bytes of the table dump as
+  sixteen null quadwords while `var_count()` — which reads the same memory — returns 15.
+- **It is not the heap.**  `BRK_START` is `USER_IMAGE_BASE + 0x02000000`, well clear of
+  `sh`'s image end at `0x43a8a8`.
+- **Not diagnosed.**  The next thing to try is a write-watchpoint style bisection: zero
+  `vars` explicitly at the top of `var_import_environ()` and see whether the shell then runs
+  (which would confirm the table is being written between load and main, and by whom), and
+  failing that, whether `__stdio_init()`'s buffer is landing inside `.bss`.
+
+Three libc and loader bugs found along the way, all fixed and all committed separately:
+`printf("%d", 0)` wrote a NUL byte instead of `"0"`; the argument block was laid out
+downward from its top, so `argv[0]` was written where `argv[argc]` belongs and every libc
+program read eight characters of `PATH=/bin:/usr/bin` as the end of its argv; and
+`fallback[]` in `build_stack()` was declared inside the `if` that used it, so its sixteen
+bytes were handed to the address arrays declared after it and the loader asked `strnlen()`
+for the length of a null pointer.
+
 ## Next
 
-Phase 9: a libc under `libc/` (`stdio`, `stdlib`, `string`, `unistd`, `errno`,
-`perror`), a real `/init` that owns re-parenting of orphans and the reboot call,
-and `sh` — job control, `exec`, pipes between commands, redirection and `&`.
-Phase 10 then brings the coreutils and the rest of `/proc`.
+Finish `sh`: the open bug above, then `job control` beyond the table (`fg`/`bg` currently
+record and report but do not move a job's process group to the foreground), then run
+`shtest` to green.
+
+Then phase 10: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
+`tr`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `echo`, `true`, `false`, `date`, `env`, `kill`),
+`grep -r`, an editor, and the rest of `/proc`.
