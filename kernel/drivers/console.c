@@ -41,6 +41,11 @@ static const uint32_t palette_bright[8] = {
 #define FONT_H      16u
 #define FONT_BYTES_PER_ROW (FONT_W / 8u)
 
+/* The largest console this build can be asked for: 256 columns by 64 rows, which is what a
+ * 1920x1080 framebuffer gives at this font.  The cell buffer is sized to it rather than
+ * allocated, so that it is still there after the heap has come up -- see console_init(). */
+#define CONSOLE_MAX_CELLS (256u * 64u)
+
 extern const unsigned char g_font8x16[];
 
 typedef struct {
@@ -162,10 +167,20 @@ static void draw_cursor(void) {
 }
 
 static void clear_cursor(void) {
+    /* The cell the cursor is sitting on, and nothing else.
+     *
+     * This used to repaint the cursor's whole row -- a hundred and sixty `draw_cell()`
+     * calls -- before every character.  That is correct, and it is why typing felt broken:
+     * the echo of a keystroke had to wait behind a hundred and sixty glyph blits to clear a
+     * bar eight pixels wide, so a character appeared only once the *next* one had been
+     * typed.  From the keyboard that is "the letter shows up when I press the next key".
+     *
+     * The cell under the cursor is the only thing the bar can be hiding, so repainting
+     * that one cell is the whole job. */
     if (!con.fb_ok || !con.enabled)
         return;
     if (con.cursor_row < con.rows && con.cursor_col < con.cols)
-        redraw_row(con.cursor_row);
+        draw_cell(con.cursor_row, con.cursor_col);
 }
 
 static void move_cursor(uint32_t row, uint32_t col) {
@@ -182,6 +197,17 @@ static void move_cursor(uint32_t row, uint32_t col) {
 
 static void scroll_up(uint32_t n) {
     if (con.rows == 0 || con.cols == 0)
+        return;
+    if (con.bottom < con.top)
+        return;
+
+    /* Clamped to the region, because the blanking loop below counts back from the bottom
+     * and an `n` larger than the region's height would wrap that subtraction. */
+    uint32_t region = con.bottom - con.top + 1;
+
+    if (n > region)
+        n = region;
+    if (n == 0)
         return;
 
     for (uint32_t row = con.top; row + n <= con.bottom; row++) {
@@ -201,12 +227,53 @@ static void scroll_up(uint32_t n) {
         }
     }
 
-    if (con.fb_ok && n > 0) {
-        /* Redraw the scrolling region from the (already updated) cell buffer;
-         * this keeps colour attributes correct, which a raw pixel copy would
-         * not, and costs nothing at console speeds. */
-        for (uint32_t row = con.top; row <= con.bottom; row++)
-            redraw_row(row);
+    if (con.fb_ok) {
+        /* Move the pixels, not the glyphs.
+         *
+         * This repainted every cell of the scrolling region -- eight thousand glyph blits
+         * for a fifty-line console -- for every line that went past the bottom.  The comment
+         * it replaced claimed that "costs nothing at console speeds"; it costs nothing *at*
+         * console speeds, and everything at typing speed, which is why scrolling was slow
+         * enough to be the first thing anyone noticed about the console.
+         *
+         * Colours stay exactly right because a cell's colour lives in the glyphs rendered
+         * from it, not in the framebuffer: moving a row of pixels moves the rendering of a
+         * row of cells precisely as redrawing that row would.
+         *
+         * Only the columns the console uses are moved.  The framebuffer is normally wider
+         * than the text area -- 1280 pixels for a 160-column console -- and scrolling the
+         * whole line would drag along pixels that belong to nothing. */
+        const fb_info_t *fb = fb_get_info();
+
+        if (fb != NULL && fb->ready && fb->base != NULL && con.line_pixels > 0) {
+            uint32_t used_px = con.cols * FONT_W * con.font_scale;
+            uint32_t row_bytes;
+
+            if (used_px > fb->width)
+                used_px = fb->width;
+
+            row_bytes = used_px * (fb->bpp / 8u);
+
+            /* Destination is always above source and the two never share a row, so every
+             * row can be moved independently, and moving them from the top down keeps each
+             * `memmove` from reading a row some later iteration has already written. */
+            for (uint32_t row = con.top; row + n <= con.bottom; row++) {
+                uint8_t *dst = fb->base + (uint64_t)row * con.line_pixels * fb->pitch;
+                uint8_t *src = fb->base + (uint64_t)(row + n) * con.line_pixels * fb->pitch;
+
+                memmove(dst, src, row_bytes);
+            }
+
+            /* And blank what the move exposed, in the current background -- which is what a
+             * row of spaces would have drawn. */
+            uint32_t bg = (con.cur.attr & CONSOLE_ATTR_INVERSE) ? con.cur.fg : con.cur.bg;
+
+            for (uint32_t row = con.bottom + 1 - n; row <= con.bottom; row++) {
+                uint32_t y = row * con.line_pixels;
+
+                fb_fill(y, 0, y + con.line_pixels, used_px, bg);
+            }
+        }
     }
 }
 
@@ -466,6 +533,7 @@ static void putc_raw(char c) {
         uint32_t next = (con.cursor_col + 8) & ~7u;
         while (con.cursor_col < next && con.cursor_col < con.cols) {
             cell_put(con.cursor_row, con.cursor_col, ' ', pack_attr(con.cur));
+            draw_cell(con.cursor_row, con.cursor_col);
             con.cursor_col++;
         }
         if (con.cursor_col >= con.cols) {
@@ -485,6 +553,16 @@ static void putc_raw(char c) {
             break;
         cell_put(con.cursor_row, con.cursor_col, (uint8_t)c,
                  pack_attr(con.cur));
+        /* Draw the cell just written.
+         *
+         * This is the character this function exists to print, and nothing else was ever
+         * going to draw it: it used to appear as a side effect of `clear_cursor()`
+         * repainting the cursor's entire row before every character.  That dependency was
+         * invisible in the code and fatal the moment the repaint was narrowed to the one
+         * cell the cursor was hiding -- the screen went blank, because with the repaint
+         * gone nothing drew anything at all.  A character costs one glyph blit, which is
+         * what a character costs. */
+        draw_cell(con.cursor_row, con.cursor_col);
         con.cursor_col++;
         if (con.cursor_col >= con.cols) {
             con.cursor_col = 0;
@@ -607,11 +685,33 @@ void console_init(void) {
     con.bottom = con.rows - 1;
 
     size_t cells = (size_t)con.rows * con.cols;
-    con.cells = (uint8_t *)kmalloc(cells);
-    con.attrs = (uint16_t *)kmalloc(cells * sizeof(uint16_t));
-    if (con.cells == NULL || con.attrs == NULL) {
-        panic("console: out of memory for %zu cells", cells);
+
+    /* Statically sized for the biggest console this build can produce, and not
+     * allocated.
+     *
+     * These were `kmalloc()`ed, in `console_init()`, which runs *before* the heap exists
+     * -- the very next boot message is the heap announcing itself.  Whatever `kmalloc()`
+     * handed back then sat in whatever that was, and the heap coming up underneath it is
+     * not a thing that can be allowed to still be pointing at console text.  What it looked
+     * like was a framebuffer that stopped updating part way through the boot log: the
+     * characters written after that point went into a cell buffer the heap had taken over,
+     * and every line drawn from it was blank, so the screen froze on the last line the
+     * console still owned while the serial mirror -- which never touches this buffer --
+     * carried on perfectly.
+     *
+     * Sixteen hundred pixels of cells and two bytes of attribute each, for the 256x64
+     * console a 1920x1080 framebuffer at this font would give, is 40 KiB of `.bss`.  That
+     * is the right trade for a buffer that has to outlive every allocator in the machine. */
+    static uint8_t  cell_store[CONSOLE_MAX_CELLS];
+    static uint16_t attr_store[CONSOLE_MAX_CELLS];
+
+    if (cells > CONSOLE_MAX_CELLS) {
+        panic("console: %zu cells exceeds the %d this build has room for",
+              cells, (int)CONSOLE_MAX_CELLS);
     }
+
+    con.cells = cell_store;
+    con.attrs = attr_store;
 
     /* Start every cell on a space.  Leaving them at zero would render glyph 0
      * -- the CP437 smiley -- everywhere the text does not reach. */
@@ -625,9 +725,11 @@ void console_init(void) {
     esc_state = ESC_NONE;
 
     fb_clear(CONSOLE_DEFAULT_BG);
+
     for (uint32_t row = 0; row < con.rows; row++)
         redraw_row(row);
     draw_cursor();
+
 }
 
 bool console_enabled(void) {
