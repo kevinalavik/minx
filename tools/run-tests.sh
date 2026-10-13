@@ -21,6 +21,22 @@ LOG=$BUILD/test-serial.log
 MONLOG=$BUILD/test-monitor.log
 SHOT=$BUILD/test-screen.ppm
 
+# The raw serial log, and the same log made greppable.
+#
+# The console mirrors its output byte for byte to COM1, which means the log contains every
+# escape sequence the console emitted -- and `grep` stops at the first NUL and calls the
+# file binary.  It then reports "binary file matches", prints no tally, and the whole suite
+# fails for a reason that has nothing to do with the kernel: a run in which the guest
+# printed "44 passed, 0 failed" was reported as "the guest printed no tally", and a run
+# whose only difference was one stray escape byte was reported as "43 check(s) reported
+# PASS" because one `PASS` line had a colour sequence in front of it.
+#
+# So every check below runs against a cleaned copy: CSI and other escape sequences removed,
+# then the control bytes that are not part of any text.  The *guest's own tally* is still
+# cross-checked against the count, which is what catches a line the cleaning mangled.
+CLEAN=$BUILD/test-serial.clean
+# Filled in below, once the guest has finished writing to $LOG.
+
 if ! command -v "$QEMU" >/dev/null 2>&1; then
     echo "run-tests: $QEMU not found" >&2
     exit 1
@@ -36,7 +52,7 @@ if [ -r /dev/kvm ]; then
     ACCEL="-accel kvm"
 fi
 
-rm -f "$LOG" "$MONLOG" "$SHOT"
+rm -f "$LOG" "$MONLOG" "$SHOT" "$CLEAN"
 
 echo "run-tests: booting $ISO (smp=$SMP mem=$MEM, timeout ${TIMEOUT}s)"
 
@@ -69,18 +85,33 @@ echo "run-tests: booting $ISO (smp=$SMP mem=$MEM, timeout ${TIMEOUT}s)"
         -monitor stdio > "$MONLOG" 2>&1
 QEMU_STATUS=$?
 
+# The greppable copy, made now that the guest has stopped writing.  See the note where
+# `$CLEAN` is declared: every check below runs against this, not against the raw log.
+sed -e 's/\x1b\[[0-9;?<>=]*[ -/]*[@-~]//g' \
+    -e 's/\x1b[()][0-9A-B]//g' \
+    -e 's/\x1b[>=]//g' \
+    "$LOG" 2>/dev/null | tr -d '\000-\010\013\014\016-\037\177-\377' > "$CLEAN"
+
 echo "run-tests: qemu exited with status $QEMU_STATUS"
 echo "----------------------------------------------------------------"
-cat "$LOG" 2>/dev/null || echo "(no serial output)"
+cat "$CLEAN" 2>/dev/null || echo "(no serial output)"
 echo "----------------------------------------------------------------"
 
 fail=0
 
-# isa-debug-exit maps the value N the guest wrote to QEMU's exit status
-# (N << 1) | 1: 1 means the guest shut down cleanly, 3 that it panicked.
+# isa-debug-exit maps the value N the guest wrote to QEMU's exit status (N << 1) | 1:
+#   0 -> 1, the machine shut itself down with every check passing
+#   1 -> 3, the machine shut itself down with checks failing
+#   2 -> 5, the kernel panicked
+#
+# Panic and "a test failed" are different facts and used to share a code, so a run whose
+# only problem was one red check was reported as "the guest reported a panic" -- which
+# sends the next person looking for a crash that never happened.  `panic()` writes 2 now
+# and the self-test writes its own count; see kernel/lib/panic.c.
 case "$QEMU_STATUS" in
     1)   echo "run-tests: guest shut down cleanly" ;;
-    3)   echo "run-tests: guest reported a panic" >&2; fail=1 ;;
+    3)   echo "run-tests: guest shut down with failing checks" >&2; fail=1 ;;
+    5)   echo "run-tests: the kernel panicked" >&2; fail=1 ;;
     124) echo "run-tests: guest timed out after ${TIMEOUT}s" >&2; fail=1 ;;
     *)   echo "run-tests: unexpected qemu exit status $QEMU_STATUS" >&2; fail=1 ;;
 esac
@@ -89,26 +120,26 @@ if [ ! -f "$LOG" ]; then
     echo "run-tests: the guest produced no serial output at all" >&2
     fail=1
 else
-    if grep -q 'KERNEL PANIC' "$LOG"; then
+    if grep -q 'KERNEL PANIC' "$CLEAN"; then
         echo "run-tests: the kernel panicked" >&2
         fail=1
     fi
-    if grep -q '^TEST-READY' "$LOG"; then
+    if grep -q '^TEST-READY' "$CLEAN"; then
         :
     else
         echo "run-tests: the guest never reached TEST-READY" >&2
         fail=1
     fi
-    if grep -q '^FAIL' "$LOG"; then
+    if grep -q '^FAIL' "$CLEAN"; then
         echo "run-tests: failing checks:" >&2
-        grep '^FAIL' "$LOG" >&2
+        grep '^FAIL' "$CLEAN" >&2
         fail=1
     fi
-    passes=$(grep -c '^PASS' "$LOG" 2>/dev/null || echo 0)
+    passes=$(grep -c '^PASS' "$CLEAN" 2>/dev/null || echo 0)
     echo "run-tests: $passes check(s) reported PASS"
     # The guest also prints its own tally; cross-check the two so a line that
     # the serial mirror mangled cannot quietly turn into a pass.
-    summary=$(grep -Eo '^[0-9]+ passed, [0-9]+ failed' "$LOG" | tail -1)
+    summary=$(grep -Eo '^[0-9]+ passed, [0-9]+ failed' "$CLEAN" | tail -1)
     if [ -n "$summary" ]; then
         guest_pass=$(echo "$summary" | cut -d' ' -f1)
         guest_fail=$(echo "$summary" | cut -d' ' -f3)

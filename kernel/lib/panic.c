@@ -136,8 +136,15 @@ void panic(const char *fmt, ...) {
     dump_stack_trace();
     console_raw_write("=== PANIC: halted ===\n", 23);
 
-    /* Tell the harness this was a crash, then stop. */
-    outb(QEMU_DEBUG_EXIT_PORT, 1);
+    /* Tell the harness this was a crash, then stop.
+     *
+     * 2, not 1.  QEMU's `isa-debug-exit` turns the value written into `(N << 1) | 1`, so
+     * writing 1 gives exit status 3 -- which is also what the self-test writes when a
+     * check fails, and `tools/run-tests.sh` reported that as "the guest reported a
+     * panic".  A run whose only problem was one red check then looked like a crash.  The
+     * codes are distinct now: 0 shut down cleanly, 1 shut down with failing checks,
+     * 2 panicked. */
+    outb(QEMU_DEBUG_EXIT_PORT, 2);
     khang();
 }
 

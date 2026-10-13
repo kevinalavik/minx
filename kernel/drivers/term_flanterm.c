@@ -226,7 +226,16 @@ void console_write_attr(const char *data, size_t len, console_color_t color) {
 }
 
 void console_set_color(console_color_t color) {
-    char seq[32];
+    /* 64, not 32.
+     *
+     * The sequence is `\033[0;38;2;r;g;b;48;2;r;g;b;m`: twenty-seven literal bytes and
+     * eighteen digits at worst, which is forty-five characters and forty-six with the NUL.
+     * In a 32 byte array the `m` landed on the NUL and the caller was handed the length the
+     * formatter *would* have written -- so the terminal received the sequence with a NUL
+     * where its terminator belonged, six bytes of the caller's stack, and a serial log that
+     * stopped being text.  The size is computed rather than guessed, so a future edit to
+     * the format cannot quietly make the buffer too small again. */
+    char seq[64];
     int  n;
 
     attr = color;
@@ -313,7 +322,7 @@ void console_clear(void) {
 }
 
 void console_set_cursor(uint32_t row, uint32_t col) {
-    char seq[32];
+    char seq[64];
 
     /* One-based on the wire, as every terminal has always been. */
     int n = ksnprintf(seq, sizeof(seq), "\033[%lu;%luH", (unsigned long)row + 1, (unsigned long)col + 1);

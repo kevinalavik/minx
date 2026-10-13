@@ -3,7 +3,11 @@
 # path, the input queue and the graphical console echo can all be checked without
 # a human at the window.
 #
-# Usage: tools/type-test.sh [iso] [out.log] [text-to-type]
+# Usage: tools/type-test.sh [iso] [out.log] [text-to-type] [banner-to-wait-for]
+#
+# The banner defaults to the kernel console's own prompt.  Pass a different one when
+# something else owns the console -- with `make WITH_SHELL=1` the userspace shell does,
+# and waiting for a prompt that is never printed is a timeout that looks like a hang.
 
 set -u
 
@@ -12,6 +16,7 @@ OUT=${2:-/tmp/minx-type.log}
 TEXT=${3:-help
 keys
 irqs}
+BANNER=${4:-minx console commands}
 
 if [ ! -f "$ISO" ]; then
     echo "type-test: $ISO does not exist" >&2
@@ -59,12 +64,12 @@ done
 
 # The monitor connection is a plain unix socket, so talk to it with python3
 # rather than depending on socat or nc being installed.
-python3 - "$MON" "$SERIAL" "$TEXT" "$SHOT" <<'PYEOF'
+python3 - "$MON" "$SERIAL" "$TEXT" "$SHOT" "$BANNER" <<'PYEOF'
 import socket
 import sys
 import time
 
-mon_path, serial_path, text, shot = sys.argv[1:5]
+mon_path, serial_path, text, shot, banner = sys.argv[1:6]
 
 def send(sock, line, settle=0.25):
     sock.sendall((line + "\n").encode())
@@ -88,7 +93,6 @@ s.connect(mon_path)
 drain(s)
 
 # Wait for the console banner before typing into it.
-banner = "minx console commands"
 deadline = time.time() + 40
 while time.time() < deadline:
     try:

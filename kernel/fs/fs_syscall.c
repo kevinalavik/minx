@@ -835,8 +835,28 @@ long fs_sys_ioctl(regs_t *regs) {
     int fd = (int)(int64_t)syscall_arg(regs, 0);
     file_t *f = fd_file(fd);
 
-    if (f == NULL)
-        return -ENOTTY;
+    /* Two kinds of descriptor name the terminal, and only one of them is a file.
+     *
+     * A program that opens `/dev/console` gets a `file_t`, and the `f != NULL` path below
+     * serves it.  Descriptors 0, 1 and 2 do not: they belong to the process table and are
+     * `FD_CONSOLE`, and they are what `init` puts the console onto before starting the
+     * shell.  So `tcgetattr(0)` -- the first thing a shell does, before it can decide
+     * whether its input is a terminal -- was refused with ENOTTY, `raw_mode()` gave up,
+     * the kernel's line discipline stayed in canonical mode with echo on, and the shell
+     * echoed every character a second time itself: `echo one` came out as `eecchhoo
+     * oonnee`.
+     *
+     * Both kinds are the same terminal, so both are served.  Which is decided by asking
+     * the descriptor table, not by guessing. */
+    if (f == NULL) {
+        fd_entry_t *e = fd_get(fd);
+
+        if (e == NULL || e->kind != FD_CONSOLE)
+            return -ENOTTY;
+
+        return tty_ioctl(NULL, (uint32_t)syscall_arg(regs, 1),
+                         syscall_arg(regs, 2), syscall_arg(regs, 3));
+    }
 
     if (ramfs_node_kind(f->ino) != RAMFS_DEVICE)
         return -ENOTTY;

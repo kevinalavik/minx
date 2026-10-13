@@ -110,9 +110,24 @@ long tty_write(const void *buf, size_t count);
 /* `ioctl` on a terminal descriptor: TIOCGTERMIO, TIOCSTERMIO, TIOCGWINSZ, TIOCSWINSZ. */
 long tty_ioctl(void *file, uint32_t request, uint64_t arg, uint64_t arg2);
 
-/* The request numbers, which are every system's. */
+/* The request numbers, which are every system's.
+ *
+ * All three "set" requests are here because a program picks one of them deliberately:
+ * `TCSANOW` does not wait, `TCSADRAIN` does, and `TCSAFLUSH` does *and* discards input
+ * typed in the meantime.  Only the first was handled, so `tcsetattr(fd, TCSAFLUSH, ...)` --
+ * which is what every shell uses when it takes a terminal over for line editing -- was
+ * refused with ENOTTY, the shell's `raw_mode()` quietly gave up, and every keystroke was
+ * echoed twice: once by the kernel's line discipline, which was still in canonical mode,
+ * and once by the shell's own reader.
+ *
+ * Two of the three are the same operation here, because there is no output buffer to
+ * drain: everything a program writes has already been handed to the console by the time
+ * this returns.  `TCSAFLUSH`'s *other* half -- discarding what was typed before the program
+ * took the terminal -- is not the same, and `tty_ioctl()` does it. */
 #define TIOCGETA   0x5401
 #define TIOCSETA   0x5402
+#define TIOCSETSW  0x5403
+#define TIOCSETSF  0x5404
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
 #define TIOCSCTTY  0x540E
@@ -155,5 +170,9 @@ bool tty_attached(void);
  * character.  Called by the console's event pump, which is the only thing that reads the
  * keyboard queue. */
 bool tty_forward_event(const input_event_t *ev);
+
+/* Characters waiting in the line discipline's input queue.  See conio_tty_input_pending()
+ * in kernel/drivers/conio.c for what this is for. */
+unsigned tty_input_pending(void);
 
 #endif /* MINX_TTY_H */

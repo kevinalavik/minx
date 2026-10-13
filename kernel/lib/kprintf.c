@@ -293,10 +293,30 @@ int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
         }
     }
 
+    /* The NUL goes where it always goes, and the return value is the number of characters
+     * that actually *fit*.
+     *
+     * C99's `snprintf` returns the length it would have written and the caller is expected
+     * to compare it with the buffer's size.  That is a fine contract for a hosted libc with
+     * a `strlen` on every call, and it is a trap in a kernel: `ksnprintf(seq, 32, ...)`
+     * returning 45 makes `console_write(seq, n)` read thirteen bytes past the end of a
+     * thirty-two byte array, which is exactly what happened -- the terminal printed the
+     * escape sequence with its final `m` replaced by a NUL and six bytes of somebody
+     * else's stack, the serial mirror stopped being text, and `make test` reported
+     * "43 of 44" for a run in which the guest's own tally said 44 of 44.
+     *
+     * So the kernel's printf returns what it stored.  A caller that wants to know whether
+     * something was truncated compares the answer with `size - 1`, which is the same
+     * comparison C99 asks for, just with the number it has to do it with being the one
+     * that is safe to use. */
     if (s.buf != NULL && s.size > 0)
         s.buf[s.written < s.size ? s.written : s.size - 1] = '\0';
-    if (s.written >= s.size)
+
+    if (s.written >= s.size) {
         s.error = -1;
+        return (int)(s.size > 0 ? s.size - 1 : 0);
+    }
+
     return (int)s.written;
 }
 

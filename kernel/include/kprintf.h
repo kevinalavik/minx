@@ -12,6 +12,15 @@
 
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* Formatting into a buffer.
+ *
+ * `ksnprintf()` returns the number of characters it actually stored -- never more than
+ * `size - 1`, and never more than the buffer holds -- so the answer is safe to hand
+ * straight to something that copies.  That is deliberately *not* C99's `snprintf`, which
+ * returns the length it would have written; see the comment at the end of `kvsnprintf()`
+ * in kernel/lib/kprintf.c for why the difference matters here.  A caller that wants to
+ * know whether anything was cut off compares the answer with `size - 1`. */
+
 /* Bring the print lock up.  Once, from kmain(), before anything can print from more than
  * one processor.  See the comment on kprintf() for why there is a lock at all. */
 void kprintf_init(void);

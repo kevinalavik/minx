@@ -177,6 +177,23 @@ bool conio_handle_event(const input_event_t *ev) {
     if (tty_attached())
         return tty_forward_event(ev);
 
+#if !MINX_KERNEL_SHELL
+    /* With this console's own line editor compiled out, the terminal *is* the consumer.
+     *
+     * This branch used not to exist, and the whole machine had no keyboard: the boot task
+     * only called `conio_pump()` when the editor was compiled in, so with
+     * `MINX_KERNEL_SHELL=0` -- the default, because `/bin/sh` owns the console -- nothing
+     * ever drained the input queue.  The driver kept counting scancodes, the heartbeat kept
+     * reporting a queue that grew by one every keystroke, and a shell at its prompt read
+     * nothing at all: every character a person typed was dropped on the floor between the
+     * keyboard and the terminal.
+     *
+     * So the pump is unconditional and only the *editor* is compiled out.  A key typed
+     * before `sh` has opened the console is buffered rather than lost, which is what a
+     * terminal does with input that arrives before anybody is reading it. */
+    return tty_forward_event(ev);
+#endif
+
     switch (ev->key) {
     case KEY_ENTER:
         line_submit();
@@ -238,6 +255,10 @@ bool conio_handle_event(const input_event_t *ev) {
     if (c == '\n' || c == '\r')
         line_submit();
     return true;
+}
+
+unsigned conio_tty_input_pending(void) {
+    return tty_input_pending();
 }
 
 /* Drain whatever is queued and act on it.  Returns the number of events

@@ -77,15 +77,33 @@ struct winsize {
 #define CRTSCTS 0040000
 
 /* --- local modes ------------------------------------------------------------- */
-#define ISIG    0000001    /* Ctrl-C, Ctrl-\ and Ctrl-Z generate signals */
-#define ICANON  0000002    /* line-buffered: deliver a line at a time      */
-#define ECHO    0000010    /* echo what is typed                             */
-#define ECHOE   0000020    /* echo the erase character as an erase           */
-#define ECHOK   0000040    /* echo a newline for a kill                       */
-#define ECHONL  0000100    /* echo a newline even in canonical mode          */
-#define NOFLSH  0000200
+/*
+ * These have to be the *same bits* as the kernel's, and they were not.
+ *
+ * The old spellings were `ISIG 1, ICANON 2, ECHO 8, ECHOE 16, ECHOK 32, ECHONL 64,
+ * NOFLSH 128, TOSTOP 256, IEXTEN 4096`; the kernel's are the same up to `TOSTOP` and then
+ * `ECHOCTL 512, IEXTEN 32768`.  Two consequences, both of them quiet:
+ *
+ *   - A program that asked for `ECHOCTL` had no name for it, so its `~(ICANON|ECHO)` mask
+ *     left the kernel's `ECHOCTL` bit standing and every `^C` in a line arrived as a raw
+ *     0x03 on the screen.
+ *   - A program that set `IEXTEN` set bit 12, which the kernel reads as nothing, so
+ *     `IEXTEN` was never actually set by anything written against this header.
+ *
+ * The kernel's values are in `kernel/include/tty.h`, and this list is the same list.  There
+ * is no shared header -- the kernel is a freestanding build with no include path to a
+ * libc, and libc is built without one either -- so the two have to agree by reading, and
+ * the check in kernel/include/tty.h is only about the *size* of the structure. */
+#define ISIG    0000001    /* Ctrl-C, Ctrl-\ and Ctrl-Z generate signals     */
+#define ICANON  0000002    /* line-buffered: deliver a line at a time        */
+#define ECHO    0000010    /* echo what is typed                              */
+#define ECHOE   0000020    /* echo the erase character as an erase            */
+#define ECHOK   0000040    /* echo a newline for a kill                        */
+#define ECHONL  0000100    /* echo a newline even in canonical mode            */
+#define NOFLSH  0000200    /* ^C does not flush the screen                    */
 #define TOSTOP  0000400
-#define IEXTEN  0100000
+#define ECHOCTL 0001000    /* a control character shows as ^x                 */
+#define IEXTEN  0200000
 
 /* What `tcsetattr()` does about output that has not been written yet.  `TCSANOW` is the
  * one that does not wait, and it is the one a program in a hurry uses -- a shell redrawing

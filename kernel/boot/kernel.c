@@ -569,6 +569,12 @@ static void heartbeat(uint64_t now_ms, uint64_t *last_ms) {
     serial_puts(utoa_to_buf(keyboard_events()));
     serial_puts(", input queued ");
     serial_puts(utoa_to_buf(input_pending()));
+    /* And how many of those are waiting for a *program*.  The two counters are different
+     * questions and the difference between them is the whole diagnosis: `input queued`
+     * growing means the pump is not running, and `input queued 0, tty N` with N growing
+     * means the pump is running and the shell is not reading. */
+    serial_puts(", tty ");
+    serial_puts(utoa_to_buf(conio_tty_input_pending()));
     serial_puts(", if=");
     serial_puts(interrupts_enabled() ? "1" : "0");
     serial_puts(" picmask=");
@@ -807,24 +813,22 @@ static void interactive_console(void) {
     uint64_t last = timer_uptime_ms();
 
     for (;;) {
-#if MINX_KERNEL_SHELL
+        /* The pump is *not* inside `#if MINX_KERNEL_SHELL`.
+         *
+         * It used to be, and that made a machine with no keyboard: `conio_pump()` is what
+         * drains the input queue, and with the console's own line editor compiled out --
+         * which is the default, because `/bin/sh` owns the console -- nothing ever called
+         * it.  The driver kept seeing scancodes and the queue kept growing, and the shell
+         * at its prompt read nothing, because the only route from a keystroke to the
+         * terminal's line discipline is through here.  `tools/type-test.sh` typed a command
+         * and watched the counter climb past ninety.
+         *
+         * Only the *editor* is compiled out now; forwarding to the terminal is always on
+         * (`conio.c` says why). */
         if (conio_pump() == 0) {
             for (unsigned spin = 0; spin < 64; spin++)
                 pause_cpu();
         }
-#else
-        /* Nothing to read and nothing to answer.
-         *
-         * The boot task stays alive here for one reason only: it is the task that started
-         * `/init`, so it must not exit, and it must keep taking timer interrupts so the
-         * heartbeat below stays honest.  It used to sit in a REPL -- `uptime`, `ps`, `irqs`,
-         * `reboot`, and a prompt -- which is a second shell competing with the real one for
-         * the same keyboard, and it started before `/init` had finished mounting anything.
-         * Two readers of one terminal is not a feature; the shell in `/bin/sh` is the one
-         * that should have it, and `make KERNEL_SHELL=1` brings this back for debugging. */
-        for (unsigned spin = 0; spin < 64; spin++)
-            pause_cpu();
-#endif
         heartbeat(timer_uptime_ms(), &last);
     }
 }

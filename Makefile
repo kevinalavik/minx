@@ -675,7 +675,18 @@ $(GEN_INC)/%_image.h: $(BUILD)/bin/% tools/bin2c.py
 	    "build/bin/$*, a ring-3 program"
 
 # The registry's list of what exists, generated so the kernel never has to be told.
-$(PROGRAMS_H): $(USER_IMAGE_H) tools/gen-programs-list.sh
+#
+# `$(PROG_LIST)` is a prerequisite as well as `$(USER_IMAGE_H)`, and it is the one that
+# matters here.  Turning `WITH_SHELL` on builds `sh` and `shtest`, which makes two more
+# `$(GEN_INC)/%_image.h` files exist -- but they were built by an *earlier* `WITH_SHELL=1`
+# build, so they are older than a `programs_list.h` that was generated from the list
+# *without* them.  Make compares timestamps, finds nothing newer, and never runs this
+# rule: the kernel image then carries a registry with no `sh` and no `shtest`, and the
+# image itself has both, and the symptom is `[warn] program: no program called shtest`
+# from a build that plainly built it.  `$(PROG_LIST)` is compared-and-rewritten rather
+# than simply stamped, so its timestamp moves exactly when the set of programs moves,
+# which is the event this rule has to notice.
+$(PROGRAMS_H): $(USER_IMAGE_H) $(PROG_LIST) tools/gen-programs-list.sh
 	@mkdir -p $(GEN_INC)
 	@sh tools/gen-programs-list.sh $(GEN_INC) $@ $(USER_PROGS)
 

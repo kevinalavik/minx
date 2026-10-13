@@ -32,6 +32,7 @@
 #include "procsys.h"
 #include "power.h"
 #include "signal.h"
+#include "tty.h"
 #include "vfs.h"
 #include "syscall.h"
 
@@ -419,12 +420,19 @@ long sys_fd_read(int fd, void *buf, size_t bytes) {
         return fs_sys_read_fd(fd, (uint64_t)(uintptr_t)buf, bytes);
 
     case FD_CONSOLE:
-        /* Reading the console *descriptor* is not reading a terminal: 0, 1 and 2 belong to
-         * the process table and name the screen, which has nothing to read.  ENOSYS says
-         * the door exists and the room behind it is not built, which is true and is what a
-         * program has to act on.  What it must not do is block here with interrupts
-         * disabled, which would stop the machine rather than the program. */
-        errno_return(ENOSYS);
+        /* The console descriptor *is* the terminal, so reading it is a read through the
+         * line discipline -- which is where every program on this machine gets its standard
+         * input from.  `/sbin/init` opens `/dev/console` and `dup2`s it onto 0, 1 and 2, so
+         * this case is not a special case: it is the shell's own input.
+         *
+         * It used to answer ENOSYS, on the grounds that "0, 1 and 2 belong to the process
+         * table and name the screen, which has nothing to read".  The screen has nothing to
+         * read; the terminal has.  With ENOSYS here, a shell at its prompt called
+         * `read(0, &c, 1)`, got an error, and spun on it for ever: the keystrokes reached
+         * the discipline's queue and nothing ever took them out.  A machine with a keyboard,
+         * a terminal, a working line discipline and a shell on the console, in which typing
+         * does nothing. */
+        return tty_read((uint64_t)(uintptr_t)buf, bytes);
 
     default:
         errno_return(EBADF);

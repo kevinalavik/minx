@@ -1270,6 +1270,46 @@ void exec_run_string(const char *text, int *status) {
         *status = last;
 }
 
+/* Run every complete line in `buf`, sliding the buffer down as it goes.
+ *
+ * A file is read a *chunk* at a time rather than a line at a time because a line at a time
+ * costs a syscall per line, and a chunk is split here because `fgets` on a `FILE *` the
+ * caller may have positioned is not something a shell should be doing.
+ *
+ * The order of the two operations at the top of the loop is the whole of the fix.  The
+ * line is copied out and run *before* the remainder is slid over it: sliding first puts
+ * the second line exactly where the first one was, so the script's first line is silently
+ * never run and the output is everything but the first line.  That is what this did -- a
+ * script's opening comment and its first command both vanished, with no error anywhere. */
+static void run_script_lines(char *buf, size_t have, int *last) {
+    while (have > 0) {
+        char *line = buf;
+        size_t len = 0;
+
+        while (len < have && buf[len] != '\n')
+            len++;
+
+        buf[len] = 0;                 /* terminate the line, with or without its newline */
+
+        size_t rest = len < have ? have - len - 1 : 0;
+
+        int line_status = 0;
+
+        exec_run_string(line, &line_status);
+        *last = line_status;
+
+        if (exiting)
+            return;
+
+        /* `memmove`, not `memcpy`: the tail begins after the head and the head is longer
+         * than the distance between them, so the two ranges overlap. */
+        if (rest > 0)
+            memmove(buf, buf + len + 1, rest);
+
+        have = rest;
+    }
+}
+
 void exec_run_string_file(const char *path, int *status) {
     FILE *f = fopen(path, "r");
 
@@ -1284,52 +1324,37 @@ void exec_run_string_file(const char *path, int *status) {
 
     /* Read a line, expand nothing, hand it to the runner.  A `source`d file runs in this
      * process, so a `cd` in it moves the shell -- which is the entire reason `source` is a
-     * builtin and not a program. */
-    char   buf[8192];
-    char  *leftover = NULL;
+     * builtin and not a program.
+     *
+     * The chunk is read into the *tail* of the buffer, because whatever is left of the
+     * previous chunk has to survive into this one: a line can straddle a read boundary, and
+     * running half of it is not running it. */
+    char   buf[8192 + 1];
     int    last = 0;
-    size_t n = 0;
+    size_t held = 0;
 
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0 && !exiting) {
-        /* NUL-terminate, and stop at the first newline: what `fgets` would have done, and
-         * reading a block rather than a line is what lets `read` inside the script see the
-         * *next* line rather than the rest of the buffer. */
-        buf[n] = 0;
+    for (;;) {
+        size_t n = fread(buf + held, 1, sizeof(buf) - 1 - held, f);
 
-        char *nl = memchr(buf, '\n', n);
+        if (n == 0)
+            break;
 
-        if (nl != NULL) {
-            *nl = 0;
+        held += n;
+        buf[held] = 0;
 
-            /* Push the rest back, so that the next iteration of this loop sees it.  A
-             * `FILE *` cannot be un-read, which is why the leftover is kept here. */
-            if (nl + 1 < buf + n) {
-                size_t rest = n - (size_t)(nl + 1 - buf);
-                memmove(buf, nl + 1, rest);
-                n = rest;
-            } else {
-                n = 0;
-            }
+        run_script_lines(buf, held, &last);
+        held = 0;
 
-            leftover = strdup(buf);
-        } else {
-            leftover = strdup(buf);
-            n = 0;
-        }
-
-        int line_status = 0;
-
-        exec_run_string(leftover != NULL ? leftover : "", &line_status);
-        free(leftover);
-        leftover = NULL;
-        last = line_status;
+        if (exiting)
+            break;
     }
 
     /* A file with no final newline still has a last line, and running it is the difference
-     * between a script that works and one that silently does nothing for its last command. */
-    if (n > 0 && !exiting) {
-        buf[n] = 0;
-        exec_run_string(buf, &last);
+     * between a script that works and one that silently does nothing for its last command.
+     * What is left here is by construction a line with no newline in it. */
+    if (held > 0 && !exiting) {
+        buf[held] = 0;
+        run_script_lines(buf, held, &last);
     }
 
     fclose(f);

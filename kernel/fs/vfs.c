@@ -13,6 +13,7 @@
 #include "string.h"
 #include "syscall.h"
 #include "task.h"
+#include "tty.h"
 
 /* --- the mount table ------------------------------------------------------ */
 
@@ -506,9 +507,14 @@ long vfs_getcwd(task_t *t, char *buf, size_t len) {
 
     /* A caller that asked for too little is told how much it needs rather than handed a
      * truncated path: a truncated path names a different directory, and a program that
-     * chdir's into it ends up somewhere it did not ask to be. */
+     * chdir's into it ends up somewhere it did not ask to be.
+     *
+     * `ERANGE`, which is the errno POSIX names for exactly this, rather than the raw
+     * length negated: the length is not an errno, and a libc that has to turn it back into
+     * one cannot tell `ERANGE` from `EINVAL` if the kernel answered with a number.  The
+     * libc wrapper in `libc/src/unistd.c` is the other half of this and says so. */
     if (n >= len)
-        return -(int)n;
+        return -ERANGE;
 
     return (long)n;
 }
@@ -532,10 +538,58 @@ long vfs_chdir(task_t *t, const char *path) {
     if (ramfs_node_kind(p.ino) != RAMFS_DIR)
         return -ENOTDIR;
 
-    /* The name is kept as written rather than as resolved, because that is what makes
-     * `getcwd` answer with something a person recognises.  The node is kept too, because
-     * that is what makes the *next* lookup work after the directory has been renamed. */
-    strlcpy(t->cwd, path[0] == '/' ? path : path, sizeof(t->cwd));
+    /* The name is kept as *resolved*, not as written, because `getcwd` answers with it: a
+     * shell that `cd tmp`s is in `/tmp`, and a `pwd` that says `tmp` is a path that does
+     * not work from anywhere else.  The node is kept too, because that is what makes the
+     * *next* lookup work after the directory has been renamed.
+     *
+     * The one thing that is preserved from what was written is the case of the components,
+     * which is what makes `ls -l` in a directory show the names its owner typed. */
+    if (p.ino == t->cwd_ino && p.mount == t->cwd_mount) {
+        /* `cd .` is not a move; leaving the name alone keeps `cd .` from turning `pwd` into
+         * a longer and longer string every time it is used. */
+        return 0;
+    }
+
+    /* `sizeof(t->cwd)`, spelled out rather than through a name of its own: the answer has to
+     * fit the field it is going to be stored in, and a second constant that means the same
+     * thing is a second thing to get wrong. */
+    char   absolute[sizeof(t->cwd)];
+    size_t at = 0;
+
+    absolute[0] = 0;
+
+    if (path[0] == '/') {
+        strlcpy(absolute, path, sizeof(absolute));
+    } else {
+        /* A relative `cd` is against the current directory, so the answer has to start
+         * there.  The join is written out rather than assumed: `cwd` is `/` for the root and
+         * has no trailing slash anywhere else, and a `cwd` of `//` is not a thing this
+         * kernel produces but a concatenation would happily make one. */
+        strlcpy(absolute, t->cwd[0] != 0 ? t->cwd : "/", sizeof(absolute));
+        at = strlen(absolute);
+
+        if (at == 0 || absolute[at - 1] != '/') {
+            if (at + 2 <= sizeof(absolute)) {
+                absolute[at++] = '/';
+                absolute[at] = 0;
+            }
+        }
+
+        size_t room = sizeof(absolute) - at;
+
+        if (room > 1)
+            strlcpy(absolute + at, path, room);
+    }
+
+    /* A trailing `/` is noise, and `/` is the answer `cd /` must give, so the loop stops
+     * at one character rather than at none. */
+    size_t n = strlen(absolute);
+
+    while (n > 1 && absolute[n - 1] == '/')
+        absolute[--n] = 0;
+
+    strlcpy(t->cwd, absolute, sizeof(t->cwd));
     t->cwd_ino = p.ino;
     t->cwd_mount = p.mount;
     return 0;
@@ -875,11 +929,26 @@ long vfs_read(file_t *f, void *buf, size_t len) {
                 ((uint8_t *)buf)[i] = (uint8_t)random_next();
             return (long)len;
 
-        case RAMFS_DEV_NULL:
         case RAMFS_DEV_CONSOLE:
-            /* The console has no input wired to a *file* yet -- the terminal is reached
-             * through the descriptor table, which is what the tty layer is for -- so a read
-             * of /dev/console is end of file rather than a hang. */
+            /* The console *is* the terminal, so a read of `/dev/console` is a read through
+             * the line discipline.  This returned 0 -- end of file, immediately, for ever --
+             * on the grounds that "the terminal is reached through the descriptor table,
+             * which is what the tty layer is for".
+             *
+             * That is true of `fd 0, 1 and 2`, which the process table owns, and false of
+             * every *program* that opens the console, which is what `/sbin/init` does
+             * before putting it on 0/1/2: `fd = open("/dev/console", O_RDWR)` and three
+             * `dup2` calls.  The descriptor the shell then reads from is this file, and
+             * this file said "end of file" to every read.  A shell at its prompt with a
+             * perfectly good keyboard underneath it, and a read that returns nothing at
+             * once.
+             *
+             * So the read goes where a terminal read goes.  The write side was already
+             * here, three lines below, which is the asymmetry that hid it: a program could
+             * write to `/dev/console` and could not read from it. */
+            return tty_read((uint64_t)(uintptr_t)buf, len);
+
+        case RAMFS_DEV_NULL:
             return 0;
 
         default:

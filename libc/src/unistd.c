@@ -112,8 +112,55 @@ int chdir(const char *path) {
     return (int)__syscall1(SYS_CHDIR, (long)(uintptr_t)path);
 }
 
+/* `getcwd()` is the one call in this libc whose kernel side returns a *length*.
+ *
+ * The kernel writes the path into the caller's buffer and answers with how long it is,
+ * which is the right answer for a door: a program that passed a short buffer gets a number
+ * it can act on rather than a pointer it cannot dereference.  POSIX wants the opposite --
+ * `getcwd()` returns the buffer -- so the conversion happens here, in the one place that
+ * knows both conventions.
+ *
+ * It used to be a cast: `(char *)__syscall2(...)`.  `getcwd()` therefore answered with the
+ * *length* wearing a pointer's type, `pwd` passed `1` to `puts()`, and the shell's `pwd`
+ * printed nothing at all -- on a machine whose working directory was perfectly well known.
+ *
+ * `buf == NULL` is the GNU extension, and it works here because the allocation is on this
+ * side: the kernel has no way to give a caller memory it did not ask for. */
 char *getcwd(char *buf, size_t n) {
-    return (char *)(uintptr_t)__syscall2(SYS_GETCWD, (long)(uintptr_t)buf, (long)n);
+    char  *owned = NULL;
+    size_t size = n;
+
+    if (buf == NULL || size == 0) {
+        /* Big enough for any path this kernel can hold, and the same bound the kernel
+         * checks, so the fallback cannot be the thing that fails. */
+        size = 4096;
+        owned = malloc(size);
+
+        if (owned == NULL)
+            return NULL;
+
+        buf = owned;
+    }
+
+    long r = __syscall2(SYS_GETCWD, (long)(uintptr_t)buf, (long)size);
+
+    if (r < 0) {
+        free(owned);
+        return NULL;            /* errno is already set by __syscall_ret() */
+    }
+
+    /* ERANGE: the buffer was too small, which the kernel reports as a failure.  POSIX
+     * requires the error to be `ERANGE` rather than `EINVAL`, and a program that grows its
+     * buffer and tries again depends on being able to tell the two apart. */
+    if ((size_t)r >= size) {
+        free(owned);
+        errno = ERANGE;
+        return NULL;
+    }
+
+    /* Terminated by the kernel, but a program is entitled to a C string either way. */
+    buf[r] = '\0';
+    return buf;
 }
 
 int umask(int mask) {
@@ -171,15 +218,26 @@ int pause(void) {
  * `flags` and `data` are passed and ignored.  They exist because every Unix has them and a
  * program written for another one passes them; accepting them and having no use for them is
  * what keeps such a program running, and refusing them would make it fail for a reason it
- * cannot see. */
+ * cannot see.
+ *
+ * `fstype` is *not* ignored.  It used to be, and the kernel's third argument is the
+ * filesystem type -- which is how it decides between devfs, procfs and ramfs -- so passing
+ * zero there made every `mount` fail with EFAULT, and `/sbin/init` reported
+ * "init: could not mount /dev on /dev: bad address" on every boot while the kernel had
+ * already mounted both.  A caller that passes the type twice, as most do, is unaffected. */
 int mount(const char *type, const char *target, const char *fstype,
           unsigned long flags, const void *data) {
-    (void)fstype;
     (void)flags;
     (void)data;
 
+    /* `type` first and `fstype` third, which is the order `mount(2)` has always had and the
+     * order the kernel reads.  A call that named only one of the two still works: which one
+     * is a NULL pointer is settled here rather than by the kernel refusing it. */
+    if (fstype == NULL)
+        fstype = type;
+
     return (int)__syscall3(SYS_MOUNT, (long)(uintptr_t)type,
-                           (long)(uintptr_t)target, 0);
+                           (long)(uintptr_t)target, (long)(uintptr_t)fstype);
 }
 
 int umount(const char *target) {

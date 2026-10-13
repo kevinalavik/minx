@@ -2163,6 +2163,22 @@ task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight
     if (parent != NULL) {
         memcpy(t->sig_slots, parent->sig_slots, sizeof(t->sig_slots));
         t->sig_blocked = parent->sig_blocked;
+
+        /* The child's directory, its ids and its mask are the parent's.
+         *
+         * `task_create()` gives all of these to a task it makes, and this is not that
+         * function -- a forked task is built here, from `kmalloc` and a `memset`, which is
+         * why it needed saying at all.  Without it the child starts in a current directory
+         * of *nothing*: `getcwd()` answers ENOENT, every relative path fails with ENOENT,
+         * and `cd /tmp` followed by `pwd` reports "no such file or directory" from inside a
+         * directory that exists.  Which is what a shell does when `init` forks it, so this
+         * is the difference between a shell and a shell that cannot find its own files. */
+        strlcpy(t->cwd, parent->cwd, sizeof(t->cwd));
+        t->cwd_ino = parent->cwd_ino;
+        t->cwd_mount = parent->cwd_mount;
+        t->uid = parent->uid;
+        t->gid = parent->gid;
+        t->umask = parent->umask;
     }
 
     /* Registered rather than given an identifier here: `task_register()` is what puts a
