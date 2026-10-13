@@ -85,7 +85,19 @@ static num_t num_make(uint64_t magnitude, int negative, unsigned base) {
 
     n.negative = negative;
     n.ndigits   = 0;
-    n.digits[0] = 0;              /* so a zero prints as one digit and not as none */
+
+    /* A zero is one digit, and that digit is the *character* '0'.
+     *
+     * It was a NUL -- which is what `memset()` leaves and what "no digit" reads like -- and
+     * the difference is invisible on a terminal and everywhere else.  `printf("%d", 0)`
+     * wrote a zero byte and nothing else, so a program printing a count that happened to be
+     * zero printed nothing at all: no "0", no newline of its own, just an absence.  It is
+     * not a crash, it is not an error, and it is the sort of thing that passes every test
+     * written against a program that never prints zero.
+     *
+     * The `ndigits = 1` is the other half of the same fix: without it the loop below never
+     * runs and there is no digit to be wrong. */
+    n.digits[0] = '0';
 
     if (magnitude == 0)
         n.ndigits = 1;

@@ -77,6 +77,17 @@ int usleep(useconds_t usec);
 #define SEEK_CUR 1
 #define SEEK_END 2
 
+/* The access modes, for `access()`.
+ *
+ * Here and in <fcntl.h> because both headers want them and because they are two different
+ * vocabularies that happen to share a spelling: these say "may I *do* this", `O_*` say "in
+ * what mode may I *open* this", and confusing them is how a program ends up asking whether
+ * a file is readable with the wrong constant. */
+#define F_OK 0    /* does it exist                        */
+#define X_OK 1    /* may I execute it                      */
+#define W_OK 2    /* may I write it                        */
+#define R_OK 4    /* may I read it                         */
+
 /* --- the flags <fcntl.h> also wants ----------------------------------------- */
 #define F_GETFD 1
 #define F_SETFD 2
