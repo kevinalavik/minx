@@ -1132,38 +1132,47 @@ separate defects, each invisible on its own:
 All three are committed separately with the reasoning in the commit messages.  `sh` now
 boots from a normal image, prints its banner and shows a prompt.
 
-**`sh <script>` produces nothing: the child does not start (open).**
+**`sh <script>` produces nothing: the program starts and its output is lost (open).**
 
 `shtest` writes a script, forks, `dup2`s a file onto descriptor 1, `execve`s `/bin/sh` with
-the script as `argv[1]`, and reads the output back.  The kernel logs
+the script as `argv[1]`, and reads the output back.  The output file exists and is **zero
+bytes**; the script itself is present with its correct 29-byte length; the script exits 0;
+and the shell's prompt, banner and every line of the script are absent.
 
-    exec: /bin/sh is now pid 54, entry 0x40ac90
+Much of this has been established with GDB, and the answer is no longer "the child does not
+start":
 
-and then **the child produces no output at all**: no `__libc_start_main()` probe, no `main`,
-no script, and the output file stays empty while the script itself is present with its
-correct 29-byte length.  The script exits 0.
+- **The exec works completely.**  With a breakpoint on sh's own entry point, it is reached,
+  in ring 3: `Breakpoint 2, 0x000000000040ac90`, `$cs = 0x23`.  Nothing is wrong with the
+  loader, the swap or the return.
+- **The task is set up correctly.**  At the end of `program_exec_into()` for `/bin/sh`,
+  task 30 has `state = 3`, `started = false`, `saved_in_user = 1`, `saved_rsp =
+  0x7fffffffefa0` (a user address), `user_frame` pointing into the direct map of the new
+  stack's top page, and `brk = 0x2403000`.
+- **`do_exec()` patches the frame it is about to return on.**  At `kernel/lib/syscall.c:766`
+  the frame is a valid ring-3 frame on a kernel stack — `cs = 0x23`, `rsp = 0x7fffffffec68`,
+  `rip = 0x406617` (the address in `shtest` that called `execve`) — and `entry = 0x40ac90`.
+- **Every write reaches the kernel.**  A breakpoint on `syscall_dispatch` filtered to
+  `SYS_WRITE` shows, in order: `WRITE fd=3 task=29` (shtest writes the script), `FORK
+  task=29`, `WRITE fd=2 task=30` and `WRITE fd=1 task=30` (the child's own probe, before the
+  exec), `EXEC task=30`, then `WRITE fd=1 task=30`, `WRITE fd=2 task=30`, `WRITE fd=3
+  task=30` — the shell writing to all three of its descriptors after the exec.
+- **And none of them produce output.**  Not on the serial port, and not in the file, which
+  is read back as zero bytes.  Both write paths — the console (`fd` 2, `FD_CONSOLE`) and a
+  regular file (`fd` 1, `FD_FILE`) — lose the data for this task, while task 29's writes to
+  the console come through.
 
-Established, and not established:
+Ruled out along the way: the shell (its entry point is reached); `exec` (it completes and
+the task is correct afterwards); the script argument (passing none changes nothing);
+`dup2` (removing it changes nothing); the loader; and the `.bss` bugs above.
 
-- **It is not the shell.**  A probe as the first statement of `__libc_start_main()` never
-  prints for this child, and the same binary prints it when the *kernel* starts a program.
-- **It is not `dup2`.**  Removing it changes nothing.
-- **It is not the script argument.**  Passing no argument at all changes nothing.
-- **It is not `fork`.**  `/sbin/init` forks and `exec`s `/bin/sh`, and in a normal image
-  the shell comes up and shows a prompt.  `exectest` execs without forking and passes.
-  Nothing else in the tree does fork-then-exec, which is why this went unnoticed.
-- **On some builds the child resumes at the *forking* program's entry point rather than
-  the new one** — `iret saw: rip=0x4004ec` where `0x4004ec` is `shtest`'s own `_start` and
-  the new entry was `0x40acb0` — so `do_exec()`'s `regs->rip = entry` did not take effect
-  for this call, and those builds panic in the kernel shortly afterwards:
-  `memcpy(dst=<kernel stack>, src=0x00007ffffffff000, n=80)`, `src` being exactly
-  `USER_STACK_TOP`, `error code 0: page not present, read, supervisor`.  Adding an
-  unrelated diagnostic to `memcpy()` or to `task_create_forked()` makes the panic go away,
-  so it is a race rather than a deterministic fault; it does not reproduce at `-smp 1`.
-- **Not diagnosed.**  The next thing to try is a GDB breakpoint on `program_exec_into` with
-  the task's `saved_rsp`, `user_frame`, `state` and `started` printed on return.  A GDB
-  session was attempted twice and both times QEMU exited before the breakpoint was reached;
-  that needs redoing, probably with `-smp 1` and fewer `continue`s.
+**Not diagnosed.**  The next move is to find why `fs_sys_write`'s two back-ends drop the data
+for task 30 and not for task 29 while the syscall itself is entered — the return value of
+those writes has not been read yet, and that is the first thing to get.  `finish` inside a
+GDB `commands` block does not survive the block, so the probe has to break at the *next*
+`syscall_dispatch` and read the `rax` left behind by the previous one, or break in
+`fs_sys_write` by address rather than by name (it is not currently a symbol in the
+kernel's debug information, which is worth fixing).
 
 **The ramfs node pool is exhausted, intermittently (open).**
 
@@ -1193,11 +1202,11 @@ for the length of a null pointer.
 
 ## Next
 
-**First: the fork-then-exec bug above.**  Nothing else in phase 9 is worth doing until a
-program that forks and then `exec`s comes back from the `exec`, because until it does there
-is no way to test the shell against a script at all.  A GDB breakpoint on
-`program_exec_into`, printing the task's `saved_rsp`, `user_frame`, `state` and `started` on
-return, is the next move.
+**First: the lost writes above.**  Everything upstream of them is now proven correct --
+the exec completes, the task is set up right, the new entry point is reached in ring 3 and
+every write syscall is entered.  So the question is narrow: why do a console write and a
+file write both come back empty for the task that forked and exec'd, and not for the task
+that forked it?  Read the return value of those writes first.
 
 **Then: reliability.**  The suite is one bad run in three, and the failing check moves
 around.  The two candidates found are the ramfs node pool (2048 inodes, released only by
@@ -1211,3 +1220,10 @@ do not move a job's process group to the foreground), then `shtest` to green, th
 Then phase 10: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
 `tr`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `echo`, `true`, `false`, `date`, `env`, `kill`),
 `grep -r`, an editor, and the rest of `/proc`.
+
+`gdb` is installed and works against this kernel: start the guest with
+`qemu-system-x86_64 ... -s -S -daemonize`, then
+`gdb -batch -q build/kernel.elf -ex 'target remote :1234' -ex 'break syscall_dispatch' -ex continue`.
+Two things to know: `arg(regs, n)` is not visible to GDB, so read `regs->rdi` and friends
+directly; and a stale guest still holding port 1234 will be attached to instead of the new
+one, which is `fuser -k 1234/tcp` away.
