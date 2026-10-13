@@ -1045,3 +1045,25 @@ code, which was replaced properly; it was the failure, and it is worth being abl
 
 Nothing builds against it. The numbers in it are years out of date and a program that
 included it would get an exit syscall that is now `lseek`.
+
+## The kernel's own console REPL is deprecated, not deleted
+
+`kernel/drivers/conio.c` implements a command language on the console before `/init` has
+finished mounting anything: `help`, `clear`, `uptime`, `meminfo`, `cpus`, `sched`, `ps`,
+`keys`, `irqs`, `reboot`, and a prompt that says `type help and press enter`.
+
+It is off by default now, behind `make KERNEL_SHELL=1`, and it is not removed.
+
+The reason is that it and `sh` are two readers of one terminal competing for one keyboard,
+and the kernel's copy wins the race because it is already sitting in its loop when `/init`
+runs. Anything typed meant for the shell is taken by the kernel before the shell is started,
+which is a worse failure than having no prompt at all: the machine looks like it swallowed
+your input.
+
+It is kept because it is the right tool for one job — the userspace shell cannot start, and
+`ps` and `irqs` and `meminfo` from ring 0 are exactly what you want then — and because the
+rule against removing committed code exists precisely so that a decision like this is made
+by turning something off and leaving it legible, rather than by deleting the evidence.
+
+What replaces it: nothing. `sh` is the shell, and when it works the kernel has no business
+reading the keyboard.

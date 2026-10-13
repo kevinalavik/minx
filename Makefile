@@ -152,6 +152,20 @@ COMMON   := -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 # than failing.
 # Not called `SHELL`: GNU make defines `SHELL` itself, always set to the shell's path, so an
 # option of that name is never empty and never equal to anything a person would type.
+# The kernel's own console REPL -- `uptime`, `ps`, `irqs`, `reboot`, and a prompt.
+#
+# Off by default and deprecated, not removed: it is a second reader of the console
+# competing with `/bin/sh` for the same keyboard, and it starts before init has mounted
+# anything.  The code is all still here and still builds; `make KERNEL_SHELL=1` turns it
+# back on, which is useful when the userspace shell cannot start and you need to know
+# whether the kernel is alive.  See docs/DECISIONS.md.
+KERNEL_SHELL ?= 0
+ifeq ($(KERNEL_SHELL),1)
+  KERNEL_SHELL_CFLAG := -DMINX_KERNEL_SHELL=1
+else
+  KERNEL_SHELL_CFLAG := -DMINX_KERNEL_SHELL=0
+endif
+
 WITH_SHELL   ?= 0
 SHELL_PROGS  := sh shtest
 ifeq ($(WITH_SHELL),1)
@@ -164,7 +178,7 @@ endif
 
 KERNEL_CFLAGS := $(COMMON) $(OPT) $(WARN) -std=gnu11 -D__KERNEL__=1 \
             -fno-stack-protector -fno-builtin $(SHELL_CFLAG) \
-            -DFLANTERM_PINNED_VERSION='"$(FLANTERM_VER)"'
+            -DFLANTERM_PINNED_VERSION='"$(FLANTERM_VER)"' $(KERNEL_SHELL_CFLAG)
 KERNEL_ASFLAGS := -ffreestanding -nostdinc -isystem $(FREESTD_INC) -MMD -MP \
             -I$(KERNEL_DIR)/include -I$(GEN_INC) -D__KERNEL__=1 -m64
 KERNEL_LDFLAGS := -n -T $(KERNEL_DIR)/boot/linker.ld -z max-page-size=4096 \

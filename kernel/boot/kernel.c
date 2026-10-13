@@ -791,7 +791,9 @@ static void boot_banner(void) {
             boot_info.interrupts_via_ioapic ? "IOAPIC" : "8259",
             boot_info.have_timer ? "armed" : "absent");
 
+#if MINX_KERNEL_SHELL
     conio_banner();
+#endif
 }
 
 static void interactive_console(void) {
@@ -803,11 +805,26 @@ static void interactive_console(void) {
      * if the console were ever the only thing left.  The cost of the pause is a
      * few hundred cycles; the cost of a halt that never wakes is a machine. */
     uint64_t last = timer_uptime_ms();
+
     for (;;) {
+#if MINX_KERNEL_SHELL
         if (conio_pump() == 0) {
             for (unsigned spin = 0; spin < 64; spin++)
                 pause_cpu();
         }
+#else
+        /* Nothing to read and nothing to answer.
+         *
+         * The boot task stays alive here for one reason only: it is the task that started
+         * `/init`, so it must not exit, and it must keep taking timer interrupts so the
+         * heartbeat below stays honest.  It used to sit in a REPL -- `uptime`, `ps`, `irqs`,
+         * `reboot`, and a prompt -- which is a second shell competing with the real one for
+         * the same keyboard, and it started before `/init` had finished mounting anything.
+         * Two readers of one terminal is not a feature; the shell in `/bin/sh` is the one
+         * that should have it, and `make KERNEL_SHELL=1` brings this back for debugging. */
+        for (unsigned spin = 0; spin < 64; spin++)
+            pause_cpu();
+#endif
         heartbeat(timer_uptime_ms(), &last);
     }
 }
