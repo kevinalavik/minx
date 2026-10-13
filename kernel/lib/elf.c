@@ -154,10 +154,33 @@ static bool load_segment(page_table_t *tables, const uint8_t *image, uint64_t vi
          * from the same program worked perfectly.  A loader that drops a segment's contents
          * is worse than one that refuses the segment, because nothing says it happened. */
         uint64_t file_from = seg_from;
-        uint64_t file_to = seg_from + filesz;
+        uint64_t file_to = file_from;
 
-        if (file_to > seg_to)
-            file_to = seg_to;
+        /* Only the part of the segment the *file* holds.  A `.bss` is the tail of a segment
+         * whose `filesz` is shorter than its `memsz`, and every page from the end of the
+         * file's contribution to the end of the segment gets nothing at all.
+         *
+         * The test is on the page, not on the arithmetic: a page that lies entirely beyond
+         * `virt + filesz` has no file bytes in it however small `filesz` is next to a page
+         * size, and clamping `seg_from + filesz` to `seg_to` says otherwise for as long as
+         * `filesz < seg_to`.  So `.bss` pages were copied `filesz` bytes out of the middle
+         * of the *image file*, from an offset the segment's `p_offset` + `filesz` has long
+         * since passed -- past the end of the buffer for a segment at the end of the file,
+         * which is every writable segment a linker produces.  Four hundred bytes of whatever
+         * the kernel's memory happened to hold were dropped at the start of each `.bss`
+         * page, silently, and the loader reported success.
+         *
+         * What that looks like is a global array that was zero in the source and full of
+         * rubbish in the program, and it is the reason `sh` died in `strcmp()` on a NULL
+         * name: the shell's 256-entry variable table had fourteen entries marked live with
+         * pointers into itself.  Nothing about it was reported, because from the loader's
+         * point of view the segment did load -- it loaded the wrong bytes. */
+        if (page < virt + filesz) {
+            file_to = seg_from + filesz;
+
+            if (file_to > seg_to)
+                file_to = seg_to;
+        }
 
         uint64_t phys;
         pte_t leaf = pt_get(tables, page);
