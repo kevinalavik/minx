@@ -1254,55 +1254,54 @@ for the length of a null pointer.
 
 ## Next
 
-**Phase 9, first: the child of a fork does not reach the new program's entry point.**
-This is now stated plainly because the previous entry in this file got it wrong, twice, in
-two directions.
+**Phase 9, first: a forked child does not reach the program it exec'd.**
 
-What is true: `shtest` forks, `execve`s `/bin/sh`, the kernel logs `exec: /bin/sh is now
-pid 54, entry 0x40ac90`, and **the child never executes one instruction of it**.  A marker
-as the first statement of `__libc_start_main()` prints for every other libc program in the
-image -- `ST 52` for the kernel-started one, `ST 53` for `shtest` -- and there is no marker
-for pid 54 at all.  `sh` never reaches libc startup, never reaches `main`, writes nothing,
-and the script runs to no output and an exit status of 0.
+The previous two entries in this file described this wrongly, twice, in two directions, both
+times from gdb runs that never got as far as `shtest` at all.  What is actually measured, on
+runs that do get there:
 
-What is true, and was also true: the task is set up correctly afterwards.  At the end of
-`program_exec_into()` for `/bin/sh` the task has `started = false`, `saved_in_user = 1`,
-`saved_rsp` a valid user address at the top of the new stack, `user_frame` pointing into
-the direct map of that stack's top page, and a correct `brk`.  `do_exec()` patches the
-ring-3 frame it is about to return on (`cs = 0x23`, `rsp` and `rip` valid, `rip` still the
-address in `shtest` that called `execve` at that point).
+- **`sh` never executes one instruction.**  A self-identifying marker as the first statement
+  of `__libc_start_main()` prints for every libc program in the image -- `ST 52` for the
+  kernel-started one, `ST 53` for `shtest` -- and there is **no marker for the child**.
+  There is no `exec: /bin/sh is now pid NN` line in the log either, and `/tmp/shpre`, which
+  the child writes immediately before calling `execve`, is never created.  The child does not
+  reach `execve`.
+- **The child does run.**  A `write(2, "RAW2")` placed just after `fork()` appears twice, once
+  per process, and a `waitpid` status probe reports a real child -- so the fork itself works
+  and the child is scheduled and executing.  `forktest` and `cowtest` agree.
+- **The frame handed to the child is correct.**  `regs` is printed at `sys_fork` and carries
+  `rax = 0x2d` (SYS_FORK) and a `rip` that differs for every call site in the image, so it is
+  the frame for *this* `fork` and not a stale one.  `regs_t` is 22 quadwords and
+  `REGS_WORDS` is 22, so the whole ring-3 frame is copied, and `frame[REGS_RAX_INDEX] = 0`
+  makes the child see `fork() == 0`.
+- **Output from the two processes interleaves character by character** (`PPRRIINNTT--NPOCFT
+  M3T` is `PRINT-NOFMT` and `PRINT-PCT 53` written concurrently), and both appear to be
+  inside `run_script` at once.  Only one fork is issued, so this is not a child re-forking;
+  it is unexplained, and it is the oldest thing in this file -- the doubled `shtest` report
+  has been here since the first run and was never chased.
 
-What was wrong: an earlier entry here said, from a gdb run, that "sh's own entry point IS
-reached, in ring 3 -- `Breakpoint 2, 0x000000000040ac90`, `$cs = 0x23`".  **It is not.**
-That run was one of the truncated ones this page warns about elsewhere -- a gdb-attached
-guest under TCG never reaches `shtest` -- and the breakpoint that appeared to be hit was
-the child's *pre-exec* context, which `iret saw: rip=0x4004ec` in the same logs was
-reporting at the time and which was read as something else.  The conclusion was drawn from
-a run that had not got there.  Two other claims from truncated runs -- that every write
-syscall from the child is entered, and that `dup2` is never dispatched -- should be treated
-the same way until they are re-measured on a run that gets there.
+So: fork works, the frame is right, the child runs, and the child does not get as far as
+`execve`.  The next thing to look at is the child's *first* entry into ring 3 -- whether
+`saved_rsp`, which `task_create_forked()` points at the copied frame on the child's kernel
+stack, is what the scheduler actually resumes it from, given `saved_in_user = 1` and
+`user_frame` being NULL for a forked child.  `task_enter_first` / `task_enter_user` are the
+first place to read.
 
-The next move is to find out what the child executes after `sys_exec` returns: whether the
-`iretq` at the end of the syscall path uses the frame `do_exec()` patched, or whether the
-task is switched away first and resumed through `saved_rsp` by a path that does not agree
-with it.  `t->started = false` and the scheduler's "has never been entered ring 3" path
-(`task_enter_first` -> `task_enter_user`) are where to look first.
+Also wrong and worth recording: `sys_wait()` reports `c->exit_code` as the status word
+unchanged.  POSIX puts a normal exit in the **high byte**, so a child that exits 1 reports
+a status of 1, which every caller decodes as "killed by signal 1" -- which is exactly what
+`shtest`'s own status probe reports for one of its two runs.  That is a real bug and it will
+break every shell that checks `$?`.
 
-**Phase 9, also: scrolling.**  `flanterm_fb_scroll()` re-queues every cell of the
-scrolling region -- 8000 on a 160x50 terminal -- so the flush re-plots all of them.  It is
-the same cost the old console had and that was fixed there by moving the framebuffer a row
-at a time.  A patch to flanterm's scroll, or a canvas-based backend, is the fix; it is not
-reachable from outside the library.
+**Phase 9, also: scrolling.**  `flanterm_fb_scroll()` re-queues every cell of the scrolling
+region -- 8000 on a 160x50 terminal -- so the flush re-plots all of them.  A patch to
+flanterm's scroll, or a canvas-based backend, is the fix; it is not reachable from outside
+the library.
 
 **Then phase 10**: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
 `tr`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `echo`, `true`, `false`, `date`, `env`, `kill`),
 `grep -r`, an editor, and the rest of `/proc`.
 
-`gdb` is installed and works against this kernel: start the guest with
-`qemu-system-x86_64 ... -s -S -daemonize`, then
-`gdb -batch -q build/kernel.elf -ex 'target remote :1234' -ex 'break syscall_dispatch' -ex continue`.
-Three things to know, all of which cost time here: `arg(regs, n)` is not visible to it, so
-read `regs->rdi` and friends directly; a stale guest holding port 1234 will be attached
-instead of the new one, which is `fuser -k 1234/tcp` away; and **a gdb-attached guest under
-TCG never reaches `shtest` at all**, so any conclusion about the later phases of the self
-tests drawn from a gdb run is not evidence.
+`gdb` is installed and works against this kernel, but **a gdb-attached guest under TCG never
+reaches `shtest`**, so no conclusion about the later phases drawn from a gdb run is evidence.
+Use a marker written to a file and read back by `shtest` instead.
