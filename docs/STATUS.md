@@ -856,44 +856,49 @@ attribution was the part that said something about the lock.
 
 ## Known bugs
 
-**The graphical console is now flanterm, and it renders and scrolls; the suite is not yet
-back to 44/44 (open).**
+**The graphical console is flanterm, and it is fixed (VERIFIED).**
 
 `docs/SPEC.md` named flanterm as the intended terminal emulator and it is now what draws
-the framebuffer console, behind `kernel/include/console.h` so that nothing else in the tree
-knows. `make TERMINAL=own` still selects the old first-party console, which is kept whole
-and still builds, because a console replaced on the strength of a claim about its
-replacement is not a decision.
+the framebuffer console, behind `kernel/include/console.h` so that nothing else in the
+tree knows.  `make TERMINAL=own` still selects the old first-party console, which is kept
+whole and still builds, because a console replaced on the strength of a claim about its
+replacement is not a decision, and because its bugs are the record of what that layer is.
 
-What is fixed and verified:
+`make test` is **44 of 44** and `libctest` 115 of 115.
 
-- **The framebuffer no longer freezes part way through the boot.**  It now scrolls, the
-  full boot log is visible, and the shell's prompt appears at the bottom of the screen
-  rather than the screen stopping on the first fifty lines.
-- **Scrolling is no longer a full-screen repaint.**  flanterm moves the framebuffer.
-- **Typing is not a screen repaint per keystroke.**  That was `clear_cursor()` repainting
-  the cursor's whole row; it is fixed in the old console too, which is what
-  `make TERMINAL=own` now gives.
+Four bugs, all of which presented as the same thing -- a console that looked wrong:
 
-What is not:
+1. **The framebuffer stopped updating part way through the boot.**  Fixed by using a
+   terminal emulator that was written for this job against this bootloader.  The old
+   console's own causes are recorded below and were fixed in it too.
+2. **`flanterm_flush()` was never called.**  flanterm marks cells dirty and draws them on a
+   timer it does not have here, so after the first flush nothing was drawn at all: a
+   partially updated grid with stale rows under the live ones.  Now flushed once per
+   `console_write()`.
+3. **Bare `\n` walked the text diagonally down the screen.**  A terminal's LF moves down a
+   line and leaves the column alone; CR returns to column zero.  Every kernel message and
+   every program's `printf` ends its lines with a bare `\n`, which is right -- a newline is
+   a newline in a byte stream and the *terminal* decides what it means -- so the carriage
+   return has to be put back on the way into the terminal.  That is the `ONLCR` bit of a
+   tty driver's output processing, done in `emit_locked()` on the framebuffer side only:
+   the serial port does not get it, because a terminal emulator on the other end of a
+   serial line does the same translating and sending it would make the log stair-step on
+   anything reading it as a dumb port.
+   **This was the "per-row horizontal stagger" recorded as not diagnosed in the previous
+   commit, and it was this.**  It was read as a row-stride problem because the symptom is a
+   stride problem -- each line starting where the one above ended -- and the pitch was
+   checked and found correct, which is true and was the wrong thing to be checking.
+4. **The serial mirror was a port write per byte.**  `emit_locked()` looped `serial_putc()`;
+   it now uses the `serial_write()` that already exists and takes the whole string.  For a
+   screenful of boot log that is several thousand port writes to mirror text already on
+   the framebuffer.
 
-- **A per-row horizontal stagger in the rendering.**  Each line of the boot log starts
-  progressively further right than the one above, as though the row stride were slightly
-  wrong, and the screen shows two screenfuls superimposed.  The framebuffer geometry is
-  right (`pitch` 5120, 32 bpp, 160x50 cells at 8x16, confirmed by reading it back out of
-  the kernel), and `flanterm_flush()` is being called on every write, so the rows being
-  drawn are the rows meant to be drawn.  Not diagnosed.
-- **`make test` is 43 of 45, not 44 of 44.**  The two failures across two runs were
-  `phase9-libc` and the ramfs/VFS checks -- "could not create a file in the root directory"
-  -- which is the ramfs node pool being exhausted, the flake already recorded below.  It is
-  worse than it was, and the likeliest reason is that flanterm does more work per character
-  than the old console did, so the self tests run slower and the pool is exhausted sooner.
-  That is a guess, not a measurement.
-
-Three kernel bugs found and fixed on the way, all committed separately: the `file_t`
-reference count that nothing moved, the `brk` that `exec` did not carry across the image
-swap, and the loader copying file bytes into the part of a segment the file does not cover.
-Those are the first three entries below.
+**Scrolling is still the expensive half, and it is flanterm's.**  `flanterm_fb_scroll()`
+pushes every cell of the scrolling region -- 8000 cells on a 160x50 terminal -- onto the
+dirty queue, and the flush then re-plots all of them.  That is the same cost the old
+console had and that was fixed there by moving the framebuffer a row at a time; inside
+flanterm it is not avoidable from here without patching the library.  It is the next thing
+to look at, and the honest options are a patch, a smaller grid, or a different backend.
 
 **The old console's cell buffer was allocated before the heap existed (fixed).**
 `console_init()` runs before the heap is up -- the next boot message is the heap announcing

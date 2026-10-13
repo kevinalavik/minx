@@ -112,31 +112,64 @@ void console_lock_init(void) {
 
 /* To both, in that order and under one lock, which is the whole point of this function:
  * the framebuffer and COM1 are the same console, and a program that can read one and not
- * the other is debugging two different machines. */
+ * the other is debugging two different machines.
+ *
+ * The serial mirror goes out in one `serial_write()`, which is what that call is for.  It
+ * used to be a `serial_putc()` per byte, and that is a port write per byte: for a screenful
+ * of boot log that is several thousand port writes to mirror text that is already on the
+ * framebuffer, and it was slow enough to be felt while scrolling.  The framebuffer is the
+ * expensive half of this and always was -- but the mirror should not be adding to it. */
 static void emit_locked(const char *data, size_t len) {
-    for (size_t i = 0; i < len; i++)
-        serial_putc(data[i]);
+    serial_write(data, len);
 
     if (ft != NULL && enabled) {
-        flanterm_write(ft, data, len);
+        /* With the carriage return put back.
+         *
+         * A terminal's LF moves down a line and leaves the column alone; CR returns to
+         * column zero and leaves the row alone.  Every kernel message and every program's
+         * `printf` ends its lines with a bare "\n" -- which is right, because a newline is
+         * a newline in a byte stream and it is the *terminal* that decides what it means.
+         * A terminal that treats it as LF alone moves down one column further for every
+         * line, so the text walks diagonally down the screen and each line starts where the
+         * one above it ended.  That is what this looked like, and it is the same bug the
+         * old console did not have because it did not implement LF as a separate motion at
+         * all.
+         *
+         * So this is the `ONLCR` bit of a tty driver's output processing, which is exactly
+         * what it is: the terminal emulator is doing the translating that a real tty line
+         * discipline would otherwise have done for it.  Done here, on the way in, rather
+         * than by asking every caller to write "\r\n", because the callers are a kernel
+         * log and every program in the tree and neither of them should have to know.
+         *
+         * The serial port does *not* get the carriage return: a terminal emulator on the
+         * other end of a serial line does the same translating, and sending it would make
+         * the log stair-step on anything reading it as a dumb port. */
+        size_t start = 0;
+
+        for (size_t i = 0; i < len; i++) {
+            if (data[i] != '\n')
+                continue;
+
+            if (i > start)
+                flanterm_write(ft, data + start, i - start);
+
+            flanterm_write(ft, "\r\n", 2);
+            start = i + 1;
+        }
+
+        if (start < len)
+            flanterm_write(ft, data + start, len - start);
+
 
         /* Render what was queued, now.
          *
          * flanterm does not draw on the write: it marks the cells that changed dirty and
-         * leaves drawing them to `flanterm_flush()`.  That is the right shape for a
-         * terminal whose backend is a framebuffer it does not own -- flush on a timer, so a
-         * burst of escape sequences is one redraw rather than fifty -- but this kernel's
-         * console has no timer and no other event that would ever call it.
+         * leaves drawing them to `flanterm_flush()`, normally called from a timer.  This
+         * kernel's console has no timer and no other event that would ever call it, so
+         * nothing would be drawn after the first flush.
          *
-         * So nothing was flushed, and what reached the screen was whatever the previous
-         * flush had drawn: a partially updated grid with whole rows still holding the
-         * lines that had scrolled off them, which reads as the text sliding sideways as the
-         * screen fills rather than as a terminal at all.
-         *
-         * The alternative -- `flanterm_set_autoflush()` -- is the same work behind a flag
-         * flanterm checks itself, and costs the same, so it would be the same answer with an
-         * indirection.  The flush belongs here because this is where the decision to draw
-         * synchronously is made. */
+         * Once per `console_write()`, not once per character: a boot log is thousands of
+         * `kprintf()` calls, and a flush per call is a redraw per line. */
         flanterm_flush(ft);
     }
 }
@@ -174,7 +207,8 @@ void console_putc_raw(char c) {
     serial_putc(c);
 
     if (ft != NULL && enabled) {
-        flanterm_write(ft, &one, 1);
+        /* Same ONLCR translating as `emit_locked()`; see the comment there. */
+        flanterm_write(ft, c == '\n' ? "\r\n" : &one, c == '\n' ? 2u : 1u);
         flanterm_flush(ft);
     }
 }
