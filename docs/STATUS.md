@@ -1254,11 +1254,39 @@ for the length of a null pointer.
 
 ## Next
 
-**Phase 9, first: `sh` against a script.**  Everything upstream of the shell is now proven
-correct -- `exec` completes, the task is set up right, the new entry point is reached in
-ring 3, and every write syscall is entered -- and the data comes back empty.  The return
-value of those writes has still never been read, and that is the first thing to get.  Then
-`shtest` to green and `WITH_SHELL` to 1 by default.
+**Phase 9, first: the child of a fork does not reach the new program's entry point.**
+This is now stated plainly because the previous entry in this file got it wrong, twice, in
+two directions.
+
+What is true: `shtest` forks, `execve`s `/bin/sh`, the kernel logs `exec: /bin/sh is now
+pid 54, entry 0x40ac90`, and **the child never executes one instruction of it**.  A marker
+as the first statement of `__libc_start_main()` prints for every other libc program in the
+image -- `ST 52` for the kernel-started one, `ST 53` for `shtest` -- and there is no marker
+for pid 54 at all.  `sh` never reaches libc startup, never reaches `main`, writes nothing,
+and the script runs to no output and an exit status of 0.
+
+What is true, and was also true: the task is set up correctly afterwards.  At the end of
+`program_exec_into()` for `/bin/sh` the task has `started = false`, `saved_in_user = 1`,
+`saved_rsp` a valid user address at the top of the new stack, `user_frame` pointing into
+the direct map of that stack's top page, and a correct `brk`.  `do_exec()` patches the
+ring-3 frame it is about to return on (`cs = 0x23`, `rsp` and `rip` valid, `rip` still the
+address in `shtest` that called `execve` at that point).
+
+What was wrong: an earlier entry here said, from a gdb run, that "sh's own entry point IS
+reached, in ring 3 -- `Breakpoint 2, 0x000000000040ac90`, `$cs = 0x23`".  **It is not.**
+That run was one of the truncated ones this page warns about elsewhere -- a gdb-attached
+guest under TCG never reaches `shtest` -- and the breakpoint that appeared to be hit was
+the child's *pre-exec* context, which `iret saw: rip=0x4004ec` in the same logs was
+reporting at the time and which was read as something else.  The conclusion was drawn from
+a run that had not got there.  Two other claims from truncated runs -- that every write
+syscall from the child is entered, and that `dup2` is never dispatched -- should be treated
+the same way until they are re-measured on a run that gets there.
+
+The next move is to find out what the child executes after `sys_exec` returns: whether the
+`iretq` at the end of the syscall path uses the frame `do_exec()` patched, or whether the
+task is switched away first and resumed through `saved_rsp` by a path that does not agree
+with it.  `t->started = false` and the scheduler's "has never been entered ring 3" path
+(`task_enter_first` -> `task_enter_user`) are where to look first.
 
 **Phase 9, also: scrolling.**  `flanterm_fb_scroll()` re-queues every cell of the
 scrolling region -- 8000 on a 160x50 terminal -- so the flush re-plots all of them.  It is
@@ -1276,10 +1304,5 @@ reachable from outside the library.
 Three things to know, all of which cost time here: `arg(regs, n)` is not visible to it, so
 read `regs->rdi` and friends directly; a stale guest holding port 1234 will be attached
 instead of the new one, which is `fuser -k 1234/tcp` away; and **a gdb-attached guest under
-TCG is far too slow to reach `shtest`**, so the self tests time out first.  A gdb run that
-ends at `exec` of `hello` has not shown that the later syscalls did not happen -- it has
-not reached them.
-
-**The kernel's console REPL is deprecated and off by default** (`make KERNEL_SHELL=1`
-brings it back).  It was a second reader of the keyboard competing with `sh` for it, and it
-started first.  docs/DECISIONS.md says so at length.
+TCG never reaches `shtest` at all**, so any conclusion about the later phases of the self
+tests drawn from a gdb run is not evidence.
