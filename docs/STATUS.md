@@ -5,7 +5,8 @@ phase 9's shell IN PROGRESS.**
 
 `make test` reports **`run-tests: PASS`, 44 of 44 checks**, the guest shuts down cleanly,
 `TEST-READY` is reached, the tally is readable and the framebuffer dump is captured.
-`libctest` reports **115 of 115** checks passing inside that run.
+`libctest` reports **115 of 115** checks passing inside that run.  Verified from a clean
+tree (`rm -rf build && make test`) three times consecutively on 2026-10-13.
 
 A normal boot (`make iso`, `-smp 4`) comes up with a graphical console, mounts `/dev` and
 `/proc`, finds `/init` in the initrd, runs it, and `init` execs `/sbin/init`, which mounts
@@ -1115,6 +1116,15 @@ What has been established, and what has not:
   `vars` explicitly at the top of `var_import_environ()` and see whether the shell then runs
   (which would confirm the table is being written between load and main, and by whom), and
   failing that, whether `__stdio_init()`'s buffer is landing inside `.bss`.
+
+**One flaky run, seen once in about six (open, low priority).**  A `make test` from a clean
+tree came back 41/44 with three filesystem failures — `phase8-ramfs: could not create a file
+two directories down`, and in `libctest` both `glob with GLOB_NOCHECK returns the pattern
+itself` and `the glob test directory is removed`.  Three runs immediately after it were
+44/44, and four more before it were 44/44.  All three failures are about creating or
+removing a directory under `/tmp`, which is the only thing they share, and none of the
+checks they touch changed; the natural next step is to look at the ramfs's directory
+insertion under concurrency rather than at `glob()`.
 
 Three libc and loader bugs found along the way, all fixed and all committed separately:
 `printf("%d", 0)` wrote a NUL byte instead of `"0"`; the argument block was laid out
