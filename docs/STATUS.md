@@ -1227,3 +1227,11 @@ Then phase 10: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`,
 Two things to know: `arg(regs, n)` is not visible to GDB, so read `regs->rdi` and friends
 directly; and a stale guest still holding port 1234 will be attached to instead of the new
 one, which is `fuser -k 1234/tcp` away.
+
+**A gdb-attached guest under TCG is far too slow to reach `shtest`**: the self tests time
+out first, and the run ends at `exec` of `hello` with `shtest` never reached.  A gdb run
+that ends with only `EXEC t=13` and nothing after it is a *truncated run*, not evidence
+that the later syscalls did not happen — that mistake was made once while chasing this and
+is recorded here so it is not made twice.  The observations about task 30 above come from
+the runs that did get that far, and they are consistent with each other; the ones about
+the fd table after the exec are not, and are flagged where they are used.
