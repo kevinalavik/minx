@@ -156,6 +156,24 @@ KERNEL_ASFLAGS := -ffreestanding -nostdinc -isystem $(FREESTD_INC) -MMD -MP \
 KERNEL_LDFLAGS := -n -T $(KERNEL_DIR)/boot/linker.ld -z max-page-size=4096 \
             -static --no-dynamic-linker -z noexecstack --build-id=none
 
+# The flags, as a file, so that changing a build option recompiles.
+#
+# An option that only adds a `-D` changes what every object *means* without changing any
+# object file's timestamp, which leaves make with nothing to notice and every object built
+# with the old definition.  `WITH_SHELL` is exactly that: it defines `MINX_SHELL_PROGRAM`,
+# and flipping it after a build left the kernel's self-test compiled to run `shtest` in an
+# image that no longer contained `shtest` or `sh`, so `phase9-sh` failed on a test that
+# should have said it was not there.  The image was wrong and so was the test, and neither
+# had been touched since the option changed.
+#
+# Same shape as `.proglist` below: compare before writing, so a build that does not change
+# the flags leaves the timestamp alone.
+BUILD_FLAGS := $(BUILD)/.build-flags
+
+$(BUILD_FLAGS): FORCE
+	@echo '$(COMMON) $(OPT) $(WARN) $(KERNEL_CFLAGS) $(KERNEL_ASFLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ || { mv $@.tmp $@; }; rm -f $@.tmp
+
 # Userspace and libc: normal hosted-less static build.
 # `-fno-builtin-setjmp` and its three neighbours are not pedantry.  A compiler recognises
 # `setjmp`, `longjmp`, `sigsetjmp` and `siglongjmp` as builtins and will *lower them
@@ -338,11 +356,11 @@ $(FONT_OBJ): $(FONT_C) | $(LIMINE_H)
 
 kernel: $(KERNEL_ELF) $(KERNEL_BIN)
 
-$(BUILD)/k/%.o: %.c | $(LIMINE_H)
+$(BUILD)/k/%.o: %.c $(BUILD_FLAGS) | $(LIMINE_H)
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/k/%.o: %.S | $(LIMINE_H)
+$(BUILD)/k/%.o: %.S $(BUILD_FLAGS) | $(LIMINE_H)
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_ASFLAGS) -c $< -o $@
 
@@ -505,7 +523,29 @@ $(BUILD)/bin/%: $(TESTS_DIR)/%
 
 # ---------------------------------------------------------------- initrd ---
 
-$(INITRD_ROOT)/.stamp: $(ALL_BIN) $(INITRD_SRC)/tree.stamp
+# The list of programs, as a file, so that changing *which* programs are in the build
+# rebuilds the image.
+#
+# Without it the initrd rule's prerequisites were the binaries themselves, and turning an
+# option that adds or removes a program -- `WITH_SHELL`, which is how this happened -- does
+# not change any of their timestamps.  Make therefore considered the image up to date,
+# skipped the rule that would have pruned the directory, and left the program that was just
+# excluded sitting in the image.  The image then shipped a program the build had been told
+# not to produce, and the test that exercises it ran, and failed, for reasons that had
+# nothing to do with the option anyone had actually changed.
+#
+# The list is compared rather than just rewritten, so that a build which does not change it
+# leaves the timestamp alone and the image stays incremental.
+PROG_LIST := $(BUILD)/.proglist
+
+.PHONY: FORCE
+FORCE:
+
+$(PROG_LIST): FORCE
+	@echo '$(ALL_BIN)' > $@.tmp
+	@cmp -s $@.tmp $@ || { mv $@.tmp $@; }; rm -f $@.tmp
+
+$(INITRD_ROOT)/.stamp: $(ALL_BIN) $(PROG_LIST) $(INITRD_SRC)/tree.stamp
 	@mkdir -p $(INITRD_ROOT)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(INITRD_ROOT)/bin $(INITRD_ROOT)/sbin $(INITRD_ROOT)/etc \
