@@ -130,8 +130,27 @@ COMMON   := -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
             -mno-mmx -mno-sse -mno-sse2 -msoft-float -mno-80387 \
             -nostdinc -isystem $(FREESTD_INC) -m64 -MMD -MP \
             -I$(KERNEL_DIR)/include -I$(GEN_INC) -D__MINX__=1
+#
+# make WITH_SHELL=1 puts `sh` and its test into the build.  Off by default, and the reason is in
+# docs/STATUS.md: the shell is written, it compiles, and it is not finished -- `sh`'s own
+# variable table comes up holding fifteen entries that were never set, and the first
+# assignment walks into one of them.  A test suite that is red for a known reason is a test
+# suite nobody reads, so the two programs are built on request and the kernel test that
+# would run them says so rather than failing.
+# Not called `SHELL`: GNU make defines `SHELL` itself, always set to the shell's path, so an
+# option of that name is never empty and never equal to anything a person would type.
+WITH_SHELL   ?= 0
+SHELL_PROGS  := sh shtest
+ifeq ($(WITH_SHELL),1)
+  SHELL_CFLAG := -DMINX_SHELL_PROGRAM=1
+  SHELL_MSG   := building the shell
+else
+  SHELL_CFLAG :=
+  SHELL_MSG   := shell not built (WITH_SHELL=1)
+endif
+
 KERNEL_CFLAGS := $(COMMON) $(OPT) $(WARN) -std=gnu11 -D__KERNEL__=1 \
-            -fno-stack-protector -fno-builtin
+            -fno-stack-protector -fno-builtin $(SHELL_CFLAG)
 KERNEL_ASFLAGS := -ffreestanding -nostdinc -isystem $(FREESTD_INC) -MMD -MP \
             -I$(KERNEL_DIR)/include -I$(GEN_INC) -D__KERNEL__=1 -m64
 KERNEL_LDFLAGS := -n -T $(KERNEL_DIR)/boot/linker.ld -z max-page-size=4096 \
@@ -189,8 +208,13 @@ KERNEL_OBJ := $(KERNEL_C:%.c=$(BUILD)/k/%.o) $(KERNEL_S:%.S=$(BUILD)/k/%.o) \
 # with no main() in it" is a rule the Makefile cannot check without running the compiler,
 # and a program that is silently not built is worse than one that is not a program.
 USER_COMMON_DIR := user/common
+
 USER_PROG_DIRS := $(sort $(dir $(wildcard user/*/*.c)))
 USER_PROG_DIRS := $(filter-out $(USER_COMMON_DIR)/,$(USER_PROG_DIRS))
+ifneq ($(WITH_SHELL),1)
+  USER_PROG_DIRS := $(filter-out $(addsuffix /,$(addprefix user/,$(SHELL_PROGS))),$(USER_PROG_DIRS))
+endif
+
 USER_PROGS     := $(sort $(notdir $(patsubst %/,%,$(USER_PROG_DIRS))))
 
 # The kernel image embeds the ring-3 test program, because there is no filesystem to

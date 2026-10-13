@@ -1796,6 +1796,30 @@ static void test_libc_program(void) {
     test_pass("phase9-libc");
 }
 
+/* Phase 9's other program: the shell.
+ *
+ * `shtest` writes a script, runs `/bin/sh` on it, and compares what came out against what it
+ * promised.  It is a program rather than a kernel-side check because the thing being tested
+ * is a ring-3 program: a test that ran the shell from the kernel would be testing the
+ * kernel's ability to run the shell, which `test_libc_program` already covers.
+ *
+ * It has to be a *separate* test from the libc one for a second reason: they fail
+ * differently.  `libctest` failing means the libc is wrong; `shtest` failing means the shell
+ * is, and the difference is the difference between "the foundation moved" and "the thing on
+ * top of it moved". */
+static void test_sh_program(void) {
+#if MINX_SHELL_PROGRAM
+    if (!run_program("shtest", "phase9-sh", "shtest would not load"))
+        return;
+    test_pass("phase9-sh");
+#else
+    /* The shell is built only with `make WITH_SHELL=1`, and a test for a program that is not in
+     * the image would fail for the right reason and say nothing useful.  Saying so is one
+     * line and is the difference between "phase9-sh failed" and "phase9-sh is not here". */
+    kprintf("phase9-sh: skipped -- the shell is not in this image (make WITH_SHELL=1)\n");
+#endif
+}
+
 /* Phase 8's program, and the only filesystem test that goes through `int $0x80`.
  *
  * `test_ramfs()` below tests the same tree from inside the kernel, and both are here on
@@ -2890,6 +2914,7 @@ void test_run_all(void) {
     test_ramfs();
     test_fs_program();
     test_libc_program();
+    test_sh_program();
     test_sched_queues();
     test_sched_parallel();
     test_sched_preempt();

@@ -887,7 +887,11 @@ long sys_exec(regs_t *regs) {
 
     #undef COPY_ONE
 
-    return do_exec(regs, name, exec_argv, exec_envp);
+    /* The arena is `char *[]` because that is what `COPY_ONE` fills in, and `do_exec`
+     * promises not to write through either vector.  The cast says that once, here, rather
+     * than making the whole path copy strings twice. */
+    return do_exec(regs, name, (const char *const *)exec_argv,
+                   (const char *const *)exec_envp);
 }
 
 long sys_open(regs_t *regs) {
