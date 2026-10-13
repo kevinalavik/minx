@@ -1446,7 +1446,25 @@ long sys_wait(regs_t *regs) {
                  * other pointer a program hands over.  A `wait` whose status pointer is
                  * unmapped is an error about the pointer, not about the child. */
                 if (status_ptr != 0) {
-                    int32_t status = (int32_t)c->exit_code;
+                    /* The status word, in the shape every caller expects.
+                     *
+                     * POSIX packs it: a normal exit is the exit code in the *high byte*, so
+                     * that the low seven bits are free to say "terminated by signal N"
+                     * instead, and `WIFEXITED()` is "the low seven bits are zero" --
+                     * `WIFEXITED((code << 8) | low)` is true for every code, and
+                     * `WIFEXITED(signal)` is false for every signal but 0.
+                     *
+                     * Reporting the code itself instead makes an exit of 1 come back as 1,
+                     * which every caller decodes as *killed by signal 1*.  A program that
+                     * ran `exit 1` and a program that was killed by SIGHUP became
+                     * indistinguishable, and the difference is exactly the one a shell's
+                     * `$?` is for.
+                     *
+                     * `task_t.exit_code` is negative for a signal death (see
+                     * `signal_send()`), which is how the two are told apart here. */
+                    int32_t code = (int32_t)c->exit_code;
+                    int32_t status = code < 0 ? (-code & 0x7f)
+                                              : ((code & 0xff) << 8);
 
                     if (!syscall_copy_to_user(status_ptr, &status, sizeof(status)))
                         errno_return(EFAULT);

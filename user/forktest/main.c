@@ -194,7 +194,15 @@ int minx_main(long argc, char **argv) {
         if (found < 0)
             return fail("wait() returned a pid that was never forked");
 
-        int status = st;
+        /* The status word, not the exit code.
+         *
+         * POSIX puts a normal exit in the *high byte* so that the low seven bits can say
+         * "killed by signal N" instead, and `WEXITSTATUS()` is how a program gets the code
+         * back out.  Comparing the raw word against a bare exit number only ever worked
+         * because the kernel reported the code itself -- which also meant a child that
+         * exited 1 was indistinguishable from one killed by SIGHUP.  The kernel is right
+         * and this comparison was the thing that was wrong. */
+        int status = (st >> 8) & 0xff;
 
         if (status != found + 1) {
             minx_put("forktest: child index ");

@@ -439,7 +439,10 @@ int minx_main(unsigned long argc, char **argv) {
         put("fork: FAILED, wait returned the wrong child\n");
         return 1;
     }
-    if (status != 7) {
+    /* `WEXITSTATUS()`: the exit code lives in the high byte of a wait status word, so
+     * that the low seven bits can carry "killed by signal" instead.  See the same change
+     * in user/forktest/main.c and the note on `sys_wait()`. */
+    if (((status >> 8) & 0xff) != 7) {
         put("fork: FAILED, status ");
         put_num((unsigned long)status);
         put("\n");
