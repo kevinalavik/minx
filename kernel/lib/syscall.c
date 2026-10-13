@@ -69,6 +69,7 @@ const char *syscall_name(unsigned nr) {
         [SYS_GETDENTS]   = "getdents",
         [SYS_DUP]        = "dup",
         [SYS_DUP2]       = "dup2",
+        [SYS_SYNC]       = "sync",
         [SYS_MKDIR]      = "mkdir",
         [SYS_RMDIR]      = "rmdir",
         [SYS_UNLINK]     = "unlink",
@@ -1204,6 +1205,7 @@ int syscall_init(void) {
     handlers[SYS_STAT]    = fs_sys_stat;
     handlers[SYS_LSTAT]   = fs_sys_lstat;
     handlers[SYS_FSYNC]   = fs_sys_fsync;
+    handlers[SYS_SYNC]    = fs_sys_sync;
     handlers[SYS_READLINK]= fs_sys_readlink;
     handlers[SYS_GETDENTS]= fs_sys_getdents;
     handlers[SYS_DUP]     = fs_sys_dup;

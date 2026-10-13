@@ -50,6 +50,7 @@ enum {
     SYS_GETDENTS= 10,
     SYS_DUP     = 11,
     SYS_DUP2    = 12,
+    SYS_SYNC    = 13,
 
     /* --- the filesystem, in memory -------------------------------------- */
     SYS_MKDIR   = 16,

@@ -20,7 +20,12 @@
  * This is the freestanding version, written against `user/common/minx_user.h` with no
  * libc.  It exists to prove the filesystem end to end -- a program read out of the initrd by
  * a path, mounting, opening, writing, reading back and `exec`ing another program from the
- * same filesystem -- and phase 9 replaces it with the one that owns job control.
+ * same filesystem -- and then to hand over to `/sbin/init`, which is the real PID 1 and
+ * owns job control, orphan reaping and stopping the machine.
+ *
+ * It stays freestanding on purpose.  The things it has to prove are about the kernel, and a
+ * libc in the way would make every failure look like a libc failure.  What it proves, it
+ * proves with nothing but `int $0x80`.
  */
 #include "../common/minx_user.h"
 #include "../common/print.h"
@@ -129,20 +134,39 @@ int minx_main(long argc, char **argv) {
 
     /* --- 4. the shell ----------------------------------------------------- */
 
-    say("init: exec /bin/hello\n");
+    /* `/sbin/init`, and `exec` keeps this process's pid -- so the program that ends up
+     * being PID 1 is the one that owns job control, reaps orphans and stops the machine,
+     * rather than a bootstrap stub that has none of those.
+     *
+     * That is the whole reason this program exists in two pieces.  A stub that forked the
+     * real init would leave the real init as PID 2 with no orphans ever re-parented to it,
+     * because the kernel hands orphans to PID 1 by definition; and a stub that *was* PID 1
+     * would have to grow into the full one, which is the program that wants libc, a shell
+     * and a TTY.  So the small one proves the filesystem end to end and then hands over.
+     *
+     * The fallback to `/bin/hello` is for a system whose initrd has no `/sbin`: the
+     * message below says which of the two happened, so nobody has to guess. */
+    say("init: exec /sbin/init\n");
 
     {
         char *args[2];
         char *envp[1];
 
-        args[0] = (char *)"/bin/hello";
+        args[0] = (char *)"/sbin/init";
         args[1] = NULL;
         envp[0] = NULL;
 
-        long r = minx_exec("/bin/hello", args, envp);
+        long r = minx_exec("/sbin/init", args, envp);
 
         /* Only reached on failure: a successful exec does not return, because the program
          * that called it is gone. */
+        say("init: exec /sbin/init failed with ");
+        say_num((unsigned long)(-r));
+        say("; falling back to /bin/hello\n");
+
+        args[0] = (char *)"/bin/hello";
+        r = minx_exec("/bin/hello", args, envp);
+
         say("init: exec /bin/hello failed with ");
         say_num((unsigned long)(-r));
         say("; nothing to run, so init exits\n");

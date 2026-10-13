@@ -338,11 +338,24 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 # per-function: it applies to this file only, because a program is not generally entitled to
 # it and the kernel has no business having it.
 $(BUILD)/u/$(LIBC_DIR)/src/stdlib.o: LIBC_INT128 := -mgeneral-regs-only
-$(BUILD)/u/%.o: %.c
+# Every libc object depends on the generated syscall table, whether it includes
+# <sys/sysdep.h> or not.
+#
+# It did not, and the result was a build that worked from a warm tree and failed from a cold
+# one: `make iso` in a fresh checkout compiles the libc objects in parallel with the
+# generator that writes `build/include/minx_syscall_table.h`, so whichever object lost the
+# race found no header.  `rm -rf build && make` is the build the Definition of Done is about
+# and it is the one nobody runs while there is still something to fix.
+#
+# The dependency is on the *variable* holding the file rather than on the path spelled here,
+# so renaming the generator's output does not silently un-fix it.
+LIBC_OBJ_DEPS := $(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC) $(USER_HDRS)
+
+$(BUILD)/u/%.o: %.c $(LIBC_OBJ_DEPS)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(LIBC_INT128) -c $< -o $@
 
-$(BUILD)/u/%.o: %.S
+$(BUILD)/u/%.o: %.S $(LIBC_OBJ_DEPS)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -423,8 +436,20 @@ define USER_PROGRAM_START
 $(if $(wildcard user/$(1)/libc),libc/src/exit.S,user/common/start.S)
 endef
 
+# The shared sources, for both styles.
+#
+# `start.S` is filtered out for *both* of them, and it is `USER_PROGRAM_START` above that
+# supplies it.  Leaving it in for the freestanding style -- which is what this used to do,
+# because the filter was inside an `$(if)` that only fired for the other style -- put
+# `user/common/start.S` on the link line twice and the link failed with "multiple definition
+# of `_start'".
+#
+# It stayed hidden because nothing relinked the freestanding programs until a header they
+# depend on changed.  A bug that only appears on a relink is not a bug that only appears
+# rarely; it is a bug that appears on every clean build from a fresh clone, which is the one
+# build nobody runs.
 define USER_PROGRAM_COMMON
-$(if $(wildcard user/$(1)/libc),$(filter-out user/common/start.S,$(COMMON_SRC)),$(COMMON_SRC))
+$(filter-out user/common/start.S,$(COMMON_SRC))
 endef
 
 define USER_PROGRAM_RULE
@@ -466,14 +491,18 @@ $(INITRD_ROOT)/.stamp: $(ALL_BIN) $(INITRD_SRC)/tree.stamp
 	# `init` goes at the root, where the kernel looks for it, and not in /bin as well:
 	# two copies of a program is two copies to keep in step, and the one in /bin is a
 	# second name for the same file that nobody asked for.
+	#
+	# `sbininit` is `/sbin/init`, which is where the specification says PID 1 lives and
+	# where a person looks for it.  The root `init` execs it, and `exec` keeps the pid, so
+	# `/sbin/init` *is* PID 1 -- the name in `/proc/1/exe` is the one from the filesystem
+	# the process last exec'd, and having that be `/sbin/init` rather than a bootstrap
+	# stub is worth one line in the initrd rule.
 	@for b in $(ALL_BIN); do \
 	    case $$(basename $$b) in \
-		init) install -m 755 $$b $(INITRD_ROOT)/init ;; \
-		*)     install -m 755 $$b $(INITRD_ROOT)/bin/ ;; \
+		init)     install -m 755 $$b $(INITRD_ROOT)/init ;; \
+		sbininit) install -m 755 $$b $(INITRD_ROOT)/sbin/init ;; \
+		*)        install -m 755 $$b $(INITRD_ROOT)/bin/ ;; \
 	    esac; \
-	done
-	@for b in $(INITRD_ROOT)/bin/init $(INITRD_ROOT)/bin/sh; do \
-	    test -f $$b || continue; \
 	done
 	@if [ -d $(INITRD_SRC)/etc ]; then cp -a $(INITRD_SRC)/etc/. $(INITRD_ROOT)/etc/; fi
 	@if [ -d $(INITRD_SRC)/home ]; then cp -a $(INITRD_SRC)/home/. $(INITRD_ROOT)/home/; fi
@@ -502,10 +531,21 @@ $(PROGRAMS_H): $(USER_IMAGE_H) tools/gen-programs-list.sh
 
 # One enum, one reader.  Depends on the kernel header so that renumbering the syscalls
 # regenerates this without anything having to remember to.
-$(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC): $(KERNEL_DIR)/include/syscall.h \
-                                         tools/gen-syscall-table.sh
+#
+# Two targets, two rules, one recipe -- and the split is not tidiness.  A rule listing both
+# outputs (`$(H) $(INC): deps`) is one rule with two targets, which in a parallel build means
+# make runs the recipe *twice at once*, once per target.  Both runs write the same `.tmp`
+# files and the first `mv` takes them, so the second fails with "cannot stat
+# `minx_syscall_table.h.tmp'" -- a race that only ever appears in a clean build, where these
+# files do not exist yet, and that looks like a generator bug rather than a makefile one.
+#
+# So the header is the real target, the generator writes both, and the `.inc` depends on the
+# header.  One recipe, one run, and the two files cannot come from different generations.
+$(SYSCALL_TABLE_H): $(KERNEL_DIR)/include/syscall.h tools/gen-syscall-table.sh
 	@mkdir -p $(GEN_INC)
 	@sh tools/gen-syscall-table.sh $< $(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC)
+
+$(SYSCALL_TABLE_INC): $(SYSCALL_TABLE_H)
 
 $(INITRD): $(INITRD_ROOT)/.stamp
 	@mkdir -p $(dir $@)

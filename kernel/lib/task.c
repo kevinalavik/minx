@@ -1495,6 +1495,105 @@ void sched_tick(void) {
         schedule();
 }
 
+/* ------------------------------------------------------------- re-parenting --- */
+
+/* Make `orphan` a child of `new_parent`, on both sides of the link.
+ *
+ * Two lists are involved and both have to move, which is the whole reason this is a
+ * function: `parent->child` is the list `wait` walks, and `orphan->sibling` is how an
+ * orphan is on it.  Fixing one without the other leaves a task that `wait` can find but
+ * nothing points at, or a task whose `parent` says one thing and whose `sibling` says
+ * another -- and the second of those is how a `wait(-1)` ends up returning the same child
+ * twice.
+ *
+ * Detaching from the old parent is done by identity, so a caller does not have to know
+ * whether `orphan` is the old parent's first child, its third, or the only one. */
+static void reparent(task_t *orphan, task_t *new_parent) {
+    task_t *old = orphan->parent;
+
+    if (old != NULL) {
+        task_t **linkp = &old->child;
+
+        while (*linkp != NULL && *linkp != orphan)
+            linkp = &(*linkp)->sibling;
+
+        if (*linkp == orphan)
+            *linkp = orphan->sibling;
+    }
+
+    orphan->sibling  = new_parent->child;
+    new_parent->child = orphan;
+    orphan->parent   = new_parent;
+
+    /* The group and session follow the parent, because a process's controlling terminal is
+     * its session's, and a job-control shell that does not know which session a grandchild
+     * is in cannot send it a ^C. */
+    orphan->pgrp    = new_parent->pgrp;
+    orphan->session = new_parent->session;
+}
+
+/* Hand every task whose parent has died to PID 1.
+ *
+ * Called when a task exits, before the exiting task itself leaves the tree.  The rule is
+ * the one every Unix uses: a child whose parent is gone belongs to init, so that something
+ * is left to wait on it and report its status.
+ *
+ * Without this the orphans are not merely unreported -- they are *unreachable*.  `wait`
+ * walks `parent->child`, so a task whose `parent` pointer names a task that has already gone
+ * is on nobody's list of children: init's `wait(-1)` does not see it, `ps` sees a process
+ * whose parent does not exist, and the task's stack and address space are never freed.  A
+ * shell running a background job and then exiting leaves one of those behind every time,
+ * which is a leak only a reboot clears.
+ *
+ * The walk is over `all_tasks` rather than over the tree, because a tree walk from the
+ * exiting task would miss orphans whose parent died in an earlier exit and were never
+ * adopted -- and it has to be a walk rather than a single fixup, because the exiting task
+ * may itself be an ancestor of the ones being adopted.
+ *
+ * Called with `all_tasks.lock` held and interrupts off.  Every link written here is also
+ * read by `sys_wait`, by procfs and by `fork`, none of which take a lock, so the only thing
+ * that makes a re-parent atomic is not being interrupted in the middle of it. */
+static void adopt_orphans(task_t *dying) {
+    /* PID 1.  Found by walking the list rather than kept as a pointer, because a cached one
+     * would have to be invalidated if init ever exited -- and init does not exit, which is
+     * precisely why it is worth finding rather than caching. */
+    task_t *init = NULL;
+
+    for (task_t *w = all_tasks.head; w != NULL; w = w->all_next)
+        if (w->id == 1) {
+            init = w;
+            break;
+        }
+
+    if (init == NULL)
+        return;                 /* no init yet: nothing to adopt to, and nothing is lost */
+
+    /* The exiting task first, and then everything else.
+     *
+     * Doing the exiting task before its descendants matters: a child of it would otherwise
+     * be adopted by the loop, and then have its `parent` overwritten by this, and the two
+     * would have to be undone against each other. */
+    if (dying != NULL && dying != init && dying->parent != NULL &&
+        dying->parent != init && dying->parent->state == TASK_DEAD)
+        reparent(dying, init);
+
+    for (task_t *w = all_tasks.head; w != NULL; w = w->all_next) {
+        if (w == init)
+            continue;
+
+        /* `state == TASK_DEAD` is the test for "gone".  A parent that is merely blocked,
+         * stopped or waiting is not an orphan, and adopting its children would take away the
+         * parent's ability to wait on them. */
+        if (w->parent == NULL || w->parent->state != TASK_DEAD)
+            continue;
+
+        if (w->parent == init)
+            continue;           /* already adopted; a second pass would splice it twice */
+
+        reparent(w, init);
+    }
+}
+
 void task_exit(void) {
     unsigned index = percpu_self_index();
     task_t *t = sched_current();
@@ -1508,6 +1607,14 @@ void task_exit(void) {
          * directory already gone should see the status it was promised, not a missing
          * file. */
         procfs_forget_task(t);
+
+        /* Whatever this task owned becomes init's, and so does this task if its own parent
+         * has already gone.  After the state store, because "is my parent dead" is answered
+         * by that field and it has to be answered before the question is asked. */
+        uint64_t flags = spin_lock_irqsave(&all_tasks.lock);
+
+        adopt_orphans(t);
+        spin_unlock_irqrestore(&all_tasks.lock, flags);
     }
 
     /* Nothing will ever run this processor again unless it has an idle task, and

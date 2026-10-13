@@ -163,6 +163,40 @@ int pause(void) {
     return (int)__syscall1(SYS_PAUSE, 0);
 }
 
+/* --- mounting and stopping ----------------------------------------------------- */
+
+/* The three calls that belong together rather than with the rest of <unistd.h>: they are
+ * the ones a program needs authority for, and a program that has it needs all three.
+ *
+ * `flags` and `data` are passed and ignored.  They exist because every Unix has them and a
+ * program written for another one passes them; accepting them and having no use for them is
+ * what keeps such a program running, and refusing them would make it fail for a reason it
+ * cannot see. */
+int mount(const char *type, const char *target, const char *fstype,
+          unsigned long flags, const void *data) {
+    (void)fstype;
+    (void)flags;
+    (void)data;
+
+    return (int)__syscall3(SYS_MOUNT, (long)(uintptr_t)type,
+                           (long)(uintptr_t)target, 0);
+}
+
+int umount(const char *target) {
+    return (int)__syscall1(SYS_UMOUNT, (long)(uintptr_t)target);
+}
+
+/* Nothing to do and succeeds.  Everything this kernel writes is already in memory -- there
+ * is no page cache behind a file and no disk under it -- so a program that flushes before
+ * shutting down must not have to know that the flush is a no-op. */
+int sync(void) {
+    return (int)__syscall0(SYS_SYNC);
+}
+
+int reboot(int how) {
+    return (int)__syscall1(SYS_REBOOT, (long)how);
+}
+
 /* `fork()` is a syscall and nothing else.  The parent's and child's returns differ by which
  * half of the kernel they were in, and a libc that tried to be clever about the child's
  * copy -- duplicating anything, flushing anything -- would be wrong about one of them. */

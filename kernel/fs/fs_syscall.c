@@ -191,6 +191,21 @@ long fs_sys_fsync(regs_t *regs) {
     return 0;
 }
 
+/* `sync()`, with no descriptor: flush everything.
+ *
+ * Its own syscall rather than `fsync()` of some magic descriptor, for one reason that is
+ * not tidiness.  The obvious spelling is `fsync(-1)`, and that makes "flush everything"
+ * indistinguishable from "flush the descriptor -1", which is not a descriptor -- so a
+ * program that meant to sync one file and passed an `fd` it never set gets a flush of
+ * everything, which is a success reported for a mistake.
+ *
+ * `init` calls this immediately before stopping the machine, and the answer is zero for the
+ * same reason `fsync`'s is: there is nothing to flush. */
+long fs_sys_sync(regs_t *regs) {
+    (void)regs;
+    return 0;
+}
+
 long fs_sys_fstat(regs_t *regs) {
     int fd = (int)(int64_t)syscall_arg(regs, 0);
     uint64_t out = syscall_arg(regs, 1);

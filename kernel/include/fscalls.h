@@ -26,6 +26,7 @@ long fs_sys_stat(regs_t *regs);
 long fs_sys_lstat(regs_t *regs);
 long fs_sys_fstat(regs_t *regs);
 long fs_sys_fsync(regs_t *regs);
+long fs_sys_sync(regs_t *regs);
 long fs_sys_readlink(regs_t *regs);
 long fs_sys_getdents(regs_t *regs);
 long fs_sys_dup(regs_t *regs);
