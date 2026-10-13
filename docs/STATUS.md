@@ -1254,36 +1254,32 @@ for the length of a null pointer.
 
 ## Next
 
-**First: the lost writes above.**  Everything upstream of them is now proven correct --
-the exec completes, the task is set up right, the new entry point is reached in ring 3 and
-every write syscall is entered.  So the question is narrow: why do a console write and a
-file write both come back empty for the task that forked and exec'd, and not for the task
-that forked it?  Read the return value of those writes first.
+**Phase 9, first: `sh` against a script.**  Everything upstream of the shell is now proven
+correct -- `exec` completes, the task is set up right, the new entry point is reached in
+ring 3, and every write syscall is entered -- and the data comes back empty.  The return
+value of those writes has still never been read, and that is the first thing to get.  Then
+`shtest` to green and `WITH_SHELL` to 1 by default.
 
-**Then: reliability.**  The suite is one bad run in three, and the failing check moves
-around.  The two candidates found are the ramfs node pool (2048 inodes, released only by
-`unlink`) and `PATH is set before main()`; counting nodes in use at the point `libctest`
-fails is the cheapest way to tell whether the first is the same problem as the second.
+**Phase 9, also: scrolling.**  `flanterm_fb_scroll()` re-queues every cell of the
+scrolling region -- 8000 on a 160x50 terminal -- so the flush re-plots all of them.  It is
+the same cost the old console had and that was fixed there by moving the framebuffer a row
+at a time.  A patch to flanterm's scroll, or a canvas-based backend, is the fix; it is not
+reachable from outside the library.
 
-**Then: `sh`.**  `job control` beyond the table (`fg`/`bg` currently record and report but
-do not move a job's process group to the foreground), then `shtest` to green, then flip
-`WITH_SHELL` to 1 by default.
-
-Then phase 10: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
+**Then phase 10**: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
 `tr`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `echo`, `true`, `false`, `date`, `env`, `kill`),
 `grep -r`, an editor, and the rest of `/proc`.
 
 `gdb` is installed and works against this kernel: start the guest with
 `qemu-system-x86_64 ... -s -S -daemonize`, then
 `gdb -batch -q build/kernel.elf -ex 'target remote :1234' -ex 'break syscall_dispatch' -ex continue`.
-Two things to know: `arg(regs, n)` is not visible to GDB, so read `regs->rdi` and friends
-directly; and a stale guest still holding port 1234 will be attached to instead of the new
-one, which is `fuser -k 1234/tcp` away.
+Three things to know, all of which cost time here: `arg(regs, n)` is not visible to it, so
+read `regs->rdi` and friends directly; a stale guest holding port 1234 will be attached
+instead of the new one, which is `fuser -k 1234/tcp` away; and **a gdb-attached guest under
+TCG is far too slow to reach `shtest`**, so the self tests time out first.  A gdb run that
+ends at `exec` of `hello` has not shown that the later syscalls did not happen -- it has
+not reached them.
 
-**A gdb-attached guest under TCG is far too slow to reach `shtest`**: the self tests time
-out first, and the run ends at `exec` of `hello` with `shtest` never reached.  A gdb run
-that ends with only `EXEC t=13` and nothing after it is a *truncated run*, not evidence
-that the later syscalls did not happen — that mistake was made once while chasing this and
-is recorded here so it is not made twice.  The observations about task 30 above come from
-the runs that did get that far, and they are consistent with each other; the ones about
-the fd table after the exec are not, and are flagged where they are used.
+**The kernel's console REPL is deprecated and off by default** (`make KERNEL_SHELL=1`
+brings it back).  It was a second reader of the keyboard competing with `sh` for it, and it
+started first.  docs/DECISIONS.md says so at length.
