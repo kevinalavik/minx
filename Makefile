@@ -131,12 +131,12 @@ COMMON   := -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
             -nostdinc -isystem $(FREESTD_INC) -m64 -MMD -MP \
             -I$(KERNEL_DIR)/include -I$(GEN_INC) -D__MINX__=1
 #
-# make WITH_SHELL=1 puts `sh` and its test into the build.  Off by default, and the reason is in
-# docs/STATUS.md: the shell is written, it compiles, and it is not finished -- `sh`'s own
-# variable table comes up holding fifteen entries that were never set, and the first
-# assignment walks into one of them.  A test suite that is red for a known reason is a test
-# suite nobody reads, so the two programs are built on request and the kernel test that
-# would run them says so rather than failing.
+# make WITH_SHELL=1 puts `sh` and its test into the build.  Off by default, and the reason is
+# in docs/STATUS.md: the shell is written, it compiles, it boots, and `sh <script>` does
+# nothing, because a program that forks and then execs does not come back from the exec.
+# A test suite that is red for a known reason is a test suite nobody reads, so the two
+# programs are built on request and the kernel test that would run them says so rather
+# than failing.
 # Not called `SHELL`: GNU make defines `SHELL` itself, always set to the shell's path, so an
 # option of that name is never empty and never equal to anything a person would type.
 WITH_SHELL   ?= 0

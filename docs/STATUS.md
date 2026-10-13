@@ -6,7 +6,16 @@ phase 9's shell IN PROGRESS.**
 `make test` reports **`run-tests: PASS`, 44 of 44 checks**, the guest shuts down cleanly,
 `TEST-READY` is reached, the tally is readable and the framebuffer dump is captured.
 `libctest` reports **115 of 115** checks passing inside that run.  Verified from a clean
-tree (`rm -rf build && make test`) three times consecutively on 2026-10-13.
+tree (`rm -rf build && make test`) three times consecutively on 2026-10-13, and again after
+this session's four kernel fixes (below).
+
+**The suite is flaky and now visibly so.**  Four `make WITH_SHELL=0 test` runs after the
+fixes in this session gave 44/44, **43/44** (`libctest: FAILED -- PATH is set before
+main()`), 44/44, and two `WITH_SHELL=1` runs gave a `ramfs: no node left` exhaustion
+during `libctest` and a kernel panic after `exec`.  The previous note on this page said one
+bad run in about six; it is closer to one in three now, and the failing check is not always
+the same one.  That is a regression in reliability even where the tally is 44/44, and it is
+not yet explained — see "Known bugs".
 
 A normal boot (`make iso`, `-smp 4`) comes up with a graphical console, mounts `/dev` and
 `/proc`, finds `/init` in the initrd, runs it, and `init` execs `/sbin/init`, which mounts
@@ -1069,14 +1078,14 @@ keys'                                                 # type at the console head
 ```
 
 ## Push status
-**Still not pushed. Everything through phase 8 is committed locally only.**
+**Still not pushed. Everything through phase 9 is committed locally only.**
 
 `git push origin HEAD` fails in this environment with
 `could not read Username for 'https://github.com'` — no credential helper and no
-token available, and AGENTS.md forbids putting tokens in files or remotes. Tried
-again at the end of phase 8; same answer. Every phase since phase one has
-committed locally for the same reason (see the commit "docs: record phase one push
-limitation").
+token available, and AGENTS.md forbids putting tokens in files or remotes. Retried
+at the end of phase 8 and again at the end of the four kernel fixes below; same
+answer both times. Every phase since phase one has committed locally for the same
+reason (see the commit "docs: record phase one push limitation").
 
 This is the one thing in this tree that is not a technical problem and the only
 thing that cannot be worked around: the work is all here, in order, with the
@@ -1084,47 +1093,95 @@ co-author trailer on every commit, and one `git push` away.
 
 ## Known bugs
 
-**`sh` comes up with fifteen variables that were never set (open).**
+**The shell's `.bss` bug is FIXED.  Three kernel bugs were behind it, and all three
+are fixed and committed.**
 
-`sh`'s own `static var_t vars[256]` in `user/sh/var.c` reads back with fifteen entries
-whose `set` flag is non-zero before a single `var_set()` has run.  The first
-`var_import_environ()` then walks into one of them and `strcmp()`s through a null name, so
-the shell dies in its own first statement with a `#GP` at address 0.  Reproducible from a
-clean tree with:
+The first theory on this page — that `load_segment()` conflated a page's distance from the
+segment's start with the segment's offset into the page — was **right**, and the note that
+said it was wrong was wrong about that.  What was true, and what is still true, is that
+rewriting the whole function broke `fstest`; the two are not the same claim.  Three
+separate defects, each invisible on its own:
 
-```
-make WITH_SHELL=1 iso
-# or, to see it without the self tests:
-#   sh is at /bin/sh in the image; run the test ISO and look at build/test-serial.log
-```
+1. **`file_t` had a reference count that nothing ever moved.**  `vfs_open()` set
+   `refs = 1` and `vfs_close()` freed the file whatever the count said, while `dup`, `dup2`
+   and `fork` all made a second descriptor name the same `file_t` without accounting for
+   it.  `int fd = open("/dev/console"); dup2(fd,0); dup2(fd,1); dup2(fd,2); close(fd);` —
+   which is exactly what `/sbin/init` does — freed the file out from under all three.  The
+   freed block stayed readable long enough that init kept working, and the failure turned up
+   later, as `EBADF` on a write to the console in a child that had inherited the descriptor.
+   Fixed by making `vfs_close()` decrement and free at zero, and retaining in `dup`, `dup2`
+   and `fd_table_copy()`.
+2. **`exec` did not carry the program break across the image swap.**  `program_exec_into()`
+   moved the page tables, the frame, the stack and the saved `rsp` from the scratch task but
+   not `brk`.  An `exec`'d process kept the previous program's break — zero for one the
+   kernel started — so `sbrk(0)` answered zero, the allocator took that as the base of its
+   heap, and the first `strdup()` wrote its string over a hundred kilobytes of `.bss`.
+   That is what put pointers into `sh`'s variable table.  A program started by the *kernel*
+   is loaded onto the task itself, where `elf_load()` sets the break directly, which is why
+   every test in the tree passed and `sh` — the one program init starts with `exec` — did
+   not.
+3. **The loader copied file bytes into the part of a segment the file does not cover.**
+   `load_segment()` decided whether a page held any of the file with arithmetic on `filesz`
+   alone, which says "copy `filesz` bytes" for as long as `filesz < page_size` — true of
+   every writable segment a linker produces.  Each `.bss` page was copied from an offset
+   the segment's file data ended long before, and for a segment at the end of the file,
+   from past the end of the image buffer.  About 0x170 bytes of whatever the kernel's
+   memory held were dropped at the start of every `.bss` page, silently, with the loader
+   reporting success.
 
-What has been established, and what has not:
+All three are committed separately with the reasoning in the commit messages.  `sh` now
+boots from a normal image, prints its banner and shows a prompt.
 
-- **It is not the loader's per-page file offsets.**  That was the first theory — the
-  formula in `load_segment()` did look as though it conflated "how far this page is from
-  the segment's start" with "where the segment starts within this page", and rewriting it
-  *did* change `sh`'s variable table from fifteen bad entries to none.  But the same change
-  made `fstest` fault on its first instruction with kernel registers in the user frame, and
-  the rewritten ranges were then shown to be byte-for-byte what the original computed for
-  that program.  The original formula is right and has been restored; `git log` on
-  `kernel/lib/elf.c` is the whole argument.
-- **`vars[0..5]` are zero and the rest are not.**  The first 128 bytes of the table dump as
-  sixteen null quadwords while `var_count()` — which reads the same memory — returns 15.
-- **It is not the heap.**  `BRK_START` is `USER_IMAGE_BASE + 0x02000000`, well clear of
-  `sh`'s image end at `0x43a8a8`.
-- **Not diagnosed.**  The next thing to try is a write-watchpoint style bisection: zero
-  `vars` explicitly at the top of `var_import_environ()` and see whether the shell then runs
-  (which would confirm the table is being written between load and main, and by whom), and
-  failing that, whether `__stdio_init()`'s buffer is landing inside `.bss`.
+**`sh <script>` produces nothing: the child does not start (open).**
 
-**One flaky run, seen once in about six (open, low priority).**  A `make test` from a clean
-tree came back 41/44 with three filesystem failures — `phase8-ramfs: could not create a file
-two directories down`, and in `libctest` both `glob with GLOB_NOCHECK returns the pattern
-itself` and `the glob test directory is removed`.  Three runs immediately after it were
-44/44, and four more before it were 44/44.  All three failures are about creating or
-removing a directory under `/tmp`, which is the only thing they share, and none of the
-checks they touch changed; the natural next step is to look at the ramfs's directory
-insertion under concurrency rather than at `glob()`.
+`shtest` writes a script, forks, `dup2`s a file onto descriptor 1, `execve`s `/bin/sh` with
+the script as `argv[1]`, and reads the output back.  The kernel logs
+
+    exec: /bin/sh is now pid 54, entry 0x40ac90
+
+and then **the child produces no output at all**: no `__libc_start_main()` probe, no `main`,
+no script, and the output file stays empty while the script itself is present with its
+correct 29-byte length.  The script exits 0.
+
+Established, and not established:
+
+- **It is not the shell.**  A probe as the first statement of `__libc_start_main()` never
+  prints for this child, and the same binary prints it when the *kernel* starts a program.
+- **It is not `dup2`.**  Removing it changes nothing.
+- **It is not the script argument.**  Passing no argument at all changes nothing.
+- **It is not `fork`.**  `/sbin/init` forks and `exec`s `/bin/sh`, and in a normal image
+  the shell comes up and shows a prompt.  `exectest` execs without forking and passes.
+  Nothing else in the tree does fork-then-exec, which is why this went unnoticed.
+- **On some builds the child resumes at the *forking* program's entry point rather than
+  the new one** — `iret saw: rip=0x4004ec` where `0x4004ec` is `shtest`'s own `_start` and
+  the new entry was `0x40acb0` — so `do_exec()`'s `regs->rip = entry` did not take effect
+  for this call, and those builds panic in the kernel shortly afterwards:
+  `memcpy(dst=<kernel stack>, src=0x00007ffffffff000, n=80)`, `src` being exactly
+  `USER_STACK_TOP`, `error code 0: page not present, read, supervisor`.  Adding an
+  unrelated diagnostic to `memcpy()` or to `task_create_forked()` makes the panic go away,
+  so it is a race rather than a deterministic fault; it does not reproduce at `-smp 1`.
+- **Not diagnosed.**  The next thing to try is a GDB breakpoint on `program_exec_into` with
+  the task's `saved_rsp`, `user_frame`, `state` and `started` printed on return.  A GDB
+  session was attempted twice and both times QEMU exited before the breakpoint was reached;
+  that needs redoing, probably with `-smp 1` and fewer `continue`s.
+
+**The ramfs node pool is exhausted, intermittently (open).**
+
+`ramfs: no node left for "shtest.sh"`, and during `libctest` in one run.  `RAMFS_NODES` is
+2048 in `kernel/lib/ramfs.c`.  A node is released only by `ramfs_unlink()`, never by
+`close()` — which is correct POSIX, since closing a file does not remove its name — so
+every file a program creates and closes without unlinking keeps its inode for the rest of
+the boot.  With 2048 inodes and a self-test that starts dozens of programs, some of which
+create files under `/tmp`, that is reachable.  Whether the tests are leaking more than they
+should or the pool is simply small has not been established; the first thing to count is how
+many nodes are in use when `libctest` fails.
+
+**`PATH is set before main()` fails intermittently (open).**
+
+Seen once in four post-fix runs, in `libctest`, and it is the whole of that run's failure
+(43/44).  `__libc_start_main()` reads `envp = argv + argc + 1` and installs
+`startup_env` when `*envp` is NULL, so for a kernel-started program `PATH` is always set —
+which is why an intermittent failure here is suspicious rather than explained.
 
 Three libc and loader bugs found along the way, all fixed and all committed separately:
 `printf("%d", 0)` wrote a NUL byte instead of `"0"`; the argument block was laid out
@@ -1136,9 +1193,20 @@ for the length of a null pointer.
 
 ## Next
 
-Finish `sh`: the open bug above, then `job control` beyond the table (`fg`/`bg` currently
-record and report but do not move a job's process group to the foreground), then run
-`shtest` to green.
+**First: the fork-then-exec bug above.**  Nothing else in phase 9 is worth doing until a
+program that forks and then `exec`s comes back from the `exec`, because until it does there
+is no way to test the shell against a script at all.  A GDB breakpoint on
+`program_exec_into`, printing the task's `saved_rsp`, `user_frame`, `state` and `started` on
+return, is the next move.
+
+**Then: reliability.**  The suite is one bad run in three, and the failing check moves
+around.  The two candidates found are the ramfs node pool (2048 inodes, released only by
+`unlink`) and `PATH is set before main()`; counting nodes in use at the point `libctest`
+fails is the cheapest way to tell whether the first is the same problem as the second.
+
+**Then: `sh`.**  `job control` beyond the table (`fg`/`bg` currently record and report but
+do not move a job's process group to the foreground), then `shtest` to green, then flip
+`WITH_SHELL` to 1 by default.
 
 Then phase 10: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
 `tr`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `echo`, `true`, `false`, `date`, `env`, `kill`),
