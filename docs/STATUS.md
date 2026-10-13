@@ -854,7 +854,54 @@ naming why: a per-task count says only that every task finished, which is a live
 property the scheduler provides on its own, with no lock involved. The per-processor
 attribution was the part that said something about the lock.
 
-## Known bugs / gaps
+## Known bugs
+
+**The graphical console is now flanterm, and it renders and scrolls; the suite is not yet
+back to 44/44 (open).**
+
+`docs/SPEC.md` named flanterm as the intended terminal emulator and it is now what draws
+the framebuffer console, behind `kernel/include/console.h` so that nothing else in the tree
+knows. `make TERMINAL=own` still selects the old first-party console, which is kept whole
+and still builds, because a console replaced on the strength of a claim about its
+replacement is not a decision.
+
+What is fixed and verified:
+
+- **The framebuffer no longer freezes part way through the boot.**  It now scrolls, the
+  full boot log is visible, and the shell's prompt appears at the bottom of the screen
+  rather than the screen stopping on the first fifty lines.
+- **Scrolling is no longer a full-screen repaint.**  flanterm moves the framebuffer.
+- **Typing is not a screen repaint per keystroke.**  That was `clear_cursor()` repainting
+  the cursor's whole row; it is fixed in the old console too, which is what
+  `make TERMINAL=own` now gives.
+
+What is not:
+
+- **A per-row horizontal stagger in the rendering.**  Each line of the boot log starts
+  progressively further right than the one above, as though the row stride were slightly
+  wrong, and the screen shows two screenfuls superimposed.  The framebuffer geometry is
+  right (`pitch` 5120, 32 bpp, 160x50 cells at 8x16, confirmed by reading it back out of
+  the kernel), and `flanterm_flush()` is being called on every write, so the rows being
+  drawn are the rows meant to be drawn.  Not diagnosed.
+- **`make test` is 43 of 45, not 44 of 44.**  The two failures across two runs were
+  `phase9-libc` and the ramfs/VFS checks -- "could not create a file in the root directory"
+  -- which is the ramfs node pool being exhausted, the flake already recorded below.  It is
+  worse than it was, and the likeliest reason is that flanterm does more work per character
+  than the old console did, so the self tests run slower and the pool is exhausted sooner.
+  That is a guess, not a measurement.
+
+Three kernel bugs found and fixed on the way, all committed separately: the `file_t`
+reference count that nothing moved, the `brk` that `exec` did not carry across the image
+swap, and the loader copying file bytes into the part of a segment the file does not cover.
+Those are the first three entries below.
+
+**The old console's cell buffer was allocated before the heap existed (fixed).**
+`console_init()` runs before the heap is up -- the next boot message is the heap announcing
+itself -- so its `kmalloc()`ed cell buffer sat in whatever the heap later made of it.  It is
+now static `.bss`, sized for a 256x64 console.  This did not turn out to be the cause of the
+freeze, but it was a live hazard and is recorded because it was real.
+
+ gaps
 - **The guest hangs at `-smp 4` about one run in three, with no panic and no fault.** Two
   distinct hangs: `hello` never returns from the pipe section (the suite reports 37 of 38
   and the status it quotes is the first fork child's deliberate 7, which it reads because

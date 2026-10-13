@@ -86,6 +86,19 @@ LIMINE_SRC_URL := https://github.com/limine-bootloader/limine/releases/download/
 LIMINE_SRC_SHA := e1c78e7148bd282a948fb408e13737c8f4a63ff095bdb291a12e5b59827052ab
 LIMINE_SRC_TAR := $(TP)/limine-$(LIMINE_VER).tar.bz2
 
+# Flanterm: the framebuffer terminal emulator.  BSD-2-Clause, freestanding C99, and
+# designed against exactly the Limine framebuffer this kernel is handed.  Pinned to a
+# release tag with the tarball's SHA-256 verified by tools/fetch.sh, the same as everything
+# else here; nothing about adding it is a manual step.
+#
+# The version, not a branch: the emulator's behaviour is the console's behaviour, and a
+# console that changes under you between two builds of the same tree is not a console.
+FLANTERM_VER  := 3.0.2
+FLANTERM_URL  := https://github.com/Mintsuki/Flanterm/archive/refs/tags/v$(FLANTERM_VER).tar.gz
+FLANTERM_SHA  := 90484ec7322651809e0633fde44d1013452c52833843efb67d3dc4751fd677b1
+FLANTERM_TAR  := $(TP)/flanterm-$(FLANTERM_VER).tar.gz
+FLANTERM_DIR  := $(TP)/flanterm-$(FLANTERM_VER)
+
 KBD_VER     := 2.9.0
 KBD_URL     := https://mirrors.edge.kernel.org/pub/linux/utils/kbd/kbd-$(KBD_VER).tar.xz
 KBD_SHA     := fb3197f17a99eb44d22a3a1a71f755f9622dd963e66acfdea1a45120951b02ed
@@ -150,7 +163,8 @@ else
 endif
 
 KERNEL_CFLAGS := $(COMMON) $(OPT) $(WARN) -std=gnu11 -D__KERNEL__=1 \
-            -fno-stack-protector -fno-builtin $(SHELL_CFLAG)
+            -fno-stack-protector -fno-builtin $(SHELL_CFLAG) \
+            -DFLANTERM_PINNED_VERSION='"$(FLANTERM_VER)"'
 KERNEL_ASFLAGS := -ffreestanding -nostdinc -isystem $(FREESTD_INC) -MMD -MP \
             -I$(KERNEL_DIR)/include -I$(GEN_INC) -D__KERNEL__=1 -m64
 KERNEL_LDFLAGS := -n -T $(KERNEL_DIR)/boot/linker.ld -z max-page-size=4096 \
@@ -208,11 +222,35 @@ USER_TEXT_BASE := 0x400000
 # Sources
 ########################################################################
 
-KERNEL_C := $(shell find $(KERNEL_DIR) -name '*.c' 2>/dev/null | sort)
+# Which terminal emulator draws the framebuffer console.
+#
+# `flanterm` is the default because a terminal emulator is not something to grow by
+# accident: `console.c` reached that status by having three bugs live in it at once -- a
+# screen repaint per character, a screen repaint per scrolled line, and a cell buffer
+# allocated before the heap existed and then taken over by it.  `own` keeps it building, and
+# keeps its self tests running, because the alternative to choosing is losing the record of
+# what it did wrong.  See docs/STATUS.md and docs/THIRD_PARTY.md.
+#
+# Whichever is chosen, `console.h` is the whole interface: `term_flanterm.c` and
+# `console.c` implement the same header and nothing else in the tree knows the difference.
+TERMINAL ?= flanterm
+ifeq ($(TERMINAL),own)
+  CONSOLE_C := $(KERNEL_DIR)/drivers/console.c
+else
+  CONSOLE_C := $(KERNEL_DIR)/drivers/term_flanterm.c
+endif
+
+KERNEL_ALL_C := $(shell find $(KERNEL_DIR) -name '*.c' 2>/dev/null | sort)
+KERNEL_C := $(filter-out $(KERNEL_DIR)/drivers/console.c $(KERNEL_DIR)/drivers/term_flanterm.c,$(KERNEL_ALL_C)) $(CONSOLE_C)
 KERNEL_S := $(shell find $(KERNEL_DIR) -name '*.S' 2>/dev/null | sort)
 
+# The terminal emulator's two translation units, compiled with the kernel's own flags and
+# nothing but the kernel's headers: flanterm is freestanding C99 and needs only memcpy and
+# memset, both of which `kernel/lib/string.c` already provides.
+FLANTERM_OBJ := $(BUILD)/k/thirdparty/flanterm.o $(BUILD)/k/thirdparty/flanterm_fb.o
+
 KERNEL_OBJ := $(KERNEL_C:%.c=$(BUILD)/k/%.o) $(KERNEL_S:%.S=$(BUILD)/k/%.o) \
-             $(FONT_OBJ)
+             $(FONT_OBJ) $(FLANTERM_OBJ)
 
 # Every directory under user/ that holds sources is one ring-3 program, except
 # user/common, which holds the code every program links in and is not itself a program.
@@ -316,7 +354,22 @@ help:
 
 # ---------------------------------------------------------------- assets ---
 
-fetch: $(LIMINE_TAR) $(LIMINE_SRC_TAR) $(FONT_PSF)
+fetch: $(LIMINE_TAR) $(LIMINE_SRC_TAR) $(FLANTERM_TAR) $(FLANTERM_SRC) $(FONT_PSF)
+
+$(FLANTERM_TAR):
+	@sh tools/fetch.sh flanterm "$(FLANTERM_URL)" "$(FLANTERM_SHA)" "$@"
+
+# Unpacking is a rule on the *sources* rather than on the directory.  A rule whose target
+# is a directory that make then has to find files inside is the kind of thing that works
+# once and fails on a clean build, because nothing tells make the files are coming; naming
+# them means the dependency is one make can actually check.
+FLANTERM_SRC := $(FLANTERM_DIR)/src/flanterm.c $(FLANTERM_DIR)/src/flanterm_backends/fb.c
+
+$(FLANTERM_SRC): $(FLANTERM_TAR)
+	@rm -rf $(FLANTERM_DIR)
+	@mkdir -p $(FLANTERM_DIR)
+	@tar -xzf "$(FLANTERM_TAR)" -C $(FLANTERM_DIR) --strip-components=1
+	@echo "unpacked flanterm -> $(FLANTERM_DIR)"
 
 $(LIMINE_TAR):
 	@sh tools/fetch.sh limine "$(LIMINE_URL)" "$(LIMINE_SHA)" "$@"
@@ -359,6 +412,25 @@ kernel: $(KERNEL_ELF) $(KERNEL_BIN)
 $(BUILD)/k/%.o: %.c $(BUILD_FLAGS) | $(LIMINE_H)
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The adapter needs flanterm's headers, so it gets its own rule rather than the pattern
+# rule's flags.  An explicit rule beats a pattern rule in make, so this one wins for this
+# file and every other kernel source is unaffected.
+# The source comes *first* on the prerequisite line, because `$<` is the first one and a
+# rule that compiles the wrong file reports the duplicate symbols of a file it is not
+# building -- flanterm's, twice over, with this file's name on both.
+$(BUILD)/k/$(KERNEL_DIR)/drivers/term_flanterm.o: $(KERNEL_DIR)/drivers/term_flanterm.c \
+                                  $(FLANTERM_SRC) $(BUILD_FLAGS)
+	@mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(FLANTERM_DIR)/src -c $< -o $@
+
+$(BUILD)/k/thirdparty/flanterm.o: $(FLANTERM_DIR)/src/flanterm.c $(BUILD_FLAGS)
+	@mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(FLANTERM_DIR)/src -c $< -o $@
+
+$(BUILD)/k/thirdparty/flanterm_fb.o: $(FLANTERM_DIR)/src/flanterm_backends/fb.c $(BUILD_FLAGS)
+	@mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(FLANTERM_DIR)/src -c $< -o $@
 
 $(BUILD)/k/%.o: %.S $(BUILD_FLAGS) | $(LIMINE_H)
 	@mkdir -p $(dir $@)
