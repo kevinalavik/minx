@@ -1254,54 +1254,36 @@ for the length of a null pointer.
 
 ## Next
 
-**Phase 9, first: a forked child does not reach the program it exec'd.**
+**Phase 9, first: the ramfs node pool.**  It is now the dominant failure, not a flake.  Four
+consecutive `make WITH_SHELL=1 test` runs gave 44/44 with `phase9-sh` skipped, 40/45 with
+`phase8-ramfs`, `phase8-vfs`, `phase9-libc`, `phase9-sh` and `phase5-parallel` all failing
+together, and twice with `program: no program called shtest`.  Those are all one failure:
+2048 inodes, released only by `ramfs_unlink()`, never by `close()`, and the self tests plus
+every program's image in the initrd consume them.  **The first thing to do is count the
+nodes in use when the pool empties**, and then either raise the pool or release a node when
+the last descriptor on a file closes *and* it is unnamed.  This is where the "one bad run in
+six" note below went, and it should not be worked around by re-running.
 
-The previous two entries in this file described this wrongly, twice, in two directions, both
-times from gdb runs that never got as far as `shtest` at all.  What is actually measured, on
-runs that do get there:
+**Phase 9, then: the exec panic.**  On `-smp 4`, after a *successful* exec, the kernel
+panics in a `memcpy` whose source is `0x00007ffffffff000` -- exactly `USER_STACK_TOP` --
+reading 80 bytes in supervisor mode.  The fork is correct (the child's frame has `rax = 0`
+and a valid `rip`, verified directly), the exec completes, and the task is set up correctly
+afterwards.  This is one fault and it is the last thing between here and a working `sh`.
 
-- **`sh` never executes one instruction.**  A self-identifying marker as the first statement
-  of `__libc_start_main()` prints for every libc program in the image -- `ST 52` for the
-  kernel-started one, `ST 53` for `shtest` -- and there is **no marker for the child**.
-  There is no `exec: /bin/sh is now pid NN` line in the log either, and `/tmp/shpre`, which
-  the child writes immediately before calling `execve`, is never created.  The child does not
-  reach `execve`.
-- **The child does run.**  A `write(2, "RAW2")` placed just after `fork()` appears twice, once
-  per process, and a `waitpid` status probe reports a real child -- so the fork itself works
-  and the child is scheduled and executing.  `forktest` and `cowtest` agree.
-- **The frame handed to the child is correct.**  `regs` is printed at `sys_fork` and carries
-  `rax = 0x2d` (SYS_FORK) and a `rip` that differs for every call site in the image, so it is
-  the frame for *this* `fork` and not a stale one.  `regs_t` is 22 quadwords and
-  `REGS_WORDS` is 22, so the whole ring-3 frame is copied, and `frame[REGS_RAX_INDEX] = 0`
-  makes the child see `fork() == 0`.
-- **Output from the two processes interleaves character by character** (`PPRRIINNTT--NPOCFT
-  M3T` is `PRINT-NOFMT` and `PRINT-PCT 53` written concurrently), and both appear to be
-  inside `run_script` at once.  Only one fork is issued, so this is not a child re-forking;
-  it is unexplained, and it is the oldest thing in this file -- the doubled `shtest` report
-  has been here since the first run and was never chased.
+**A trap, recorded so it is not walked into again: do not debug this with `-smp 1`.**  A
+single-processor guest faults during `phase7-cow` with `CR2 = 0` -- a NULL read in
+`memcpy` -- which has nothing to do with the phase 9 bug and is a different, pre-existing
+single-CPU defect.  Two sessions were spent chasing that one because it appears immediately
+before the phase 9 work in the log.  Everything about phase 9 must be measured on the harness,
+which runs `-smp 4`.
 
-So: fork works, the frame is right, the child runs, and the child does not get as far as
-`execve`.  The next thing to look at is the child's *first* entry into ring 3 -- whether
-`saved_rsp`, which `task_create_forked()` points at the copied frame on the child's kernel
-stack, is what the scheduler actually resumes it from, given `saved_in_user = 1` and
-`user_frame` being NULL for a forked child.  `task_enter_first` / `task_enter_user` are the
-first place to read.
-
-Also wrong and worth recording: `sys_wait()` reports `c->exit_code` as the status word
-unchanged.  POSIX puts a normal exit in the **high byte**, so a child that exits 1 reports
-a status of 1, which every caller decodes as "killed by signal 1" -- which is exactly what
-`shtest`'s own status probe reports for one of its two runs.  That is a real bug and it will
-break every shell that checks `$?`.
-
-**Phase 9, also: scrolling.**  `flanterm_fb_scroll()` re-queues every cell of the scrolling
-region -- 8000 on a 160x50 terminal -- so the flush re-plots all of them.  A patch to
-flanterm's scroll, or a canvas-based backend, is the fix; it is not reachable from outside
-the library.
+**Then the doubled `shtest` report.**  Parent and child output interleaves character by
+character and both appear to be inside `run_script` at once, with only one `fork()` issued.
+This has been in every log since the first run of this session and is still unexplained.
 
 **Then phase 10**: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
 `tr`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `echo`, `true`, `false`, `date`, `env`, `kill`),
 `grep -r`, an editor, and the rest of `/proc`.
 
-`gdb` is installed and works against this kernel, but **a gdb-attached guest under TCG never
-reaches `shtest`**, so no conclusion about the later phases drawn from a gdb run is evidence.
-Use a marker written to a file and read back by `shtest` instead.
+Use a marker written to a file and read back by `shtest`, not gdb: a gdb-attached guest
+under TCG never reaches `shtest`, so every conclusion drawn from one has been wrong.
