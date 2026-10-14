@@ -488,6 +488,16 @@ void signal_deliver_on_return_to_user(regs_t *regs) {
     uint64_t sp = regs->rsp - 32;
     sp &= ~15ull;                      /* the ABI wants a 16-byte aligned stack on entry */
 
+    /* Both writes below are ring-0 stores into pages the program owns, and a `fork` may
+     * have left either of them read-only and shared.  A ring-0 store to a read-only user
+     * page is not stopped by the processor without `CR4.WP`, which this kernel cannot
+     * have (see `CR4_WP` in kernel/include/pagetables.h), so a task that had forked would
+     * have the signal frame written into the frame its twin is also using.  The copy's
+     * own call does this too; the *check* before it does not, so without this line a
+     * forked process is told it has no stack to deliver a signal on and is killed for
+     * it. */
+    syscall_prepare_write(sp, 32);
+
     if (!syscall_user_range_ok(sp, 32, true)) {
         /* No room on the stack.  Falling back to the default action is the honest answer:
          * the alternative is an `iretq` into a stack the process does not have. */
@@ -506,6 +516,11 @@ void signal_deliver_on_return_to_user(regs_t *regs) {
     frame[2] = (uint64_t)(uintptr_t)&t->sig_saved;
     frame[3] = 0;
     syscall_copy_to_user(sp, frame, sizeof(frame));
+
+    /* And the interrupted frame itself, which is the same story one page up: this is a
+     * ring-0 store to the task's own stack, and the whole reason delivery is doing this
+     * is that it is about to redirect the task's registers. */
+    syscall_prepare_write((uint64_t)(uintptr_t)regs, sizeof(*regs));
 
     regs->rip = handler;
     regs->rsp = sp;

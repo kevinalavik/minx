@@ -225,7 +225,12 @@ bool syscall_user_range_ok_in(page_table_t *tables, uint64_t addr, size_t bytes,
 /* Resolve any copy-on-write page in a range the caller is about to write to.
  *
  * Call this before syscall_user_range_ok() on a *write*.  A page a fork has read-only is
- * about to be copied, not refused, and the range check cannot tell the two apart. */
+ * about to be copied, not refused, and the range check cannot tell the two apart.
+ *
+ * Every kernel-side *store* into a user page needs this, not just the copies: a ring-0
+ * store to a read-only user page is not stopped by the processor unless `CR4.WP` is set,
+ * and this kernel cannot have that bit (see `CR4_WP` in kernel/include/pagetables.h), so
+ * the store would land in the frame the twin shares and update it for both. */
 void syscall_prepare_write(uint64_t addr, size_t bytes);
 
 /* Copy out of / into user memory.  These are the only ways a program-supplied address

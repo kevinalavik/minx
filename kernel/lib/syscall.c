@@ -369,6 +369,23 @@ bool syscall_copy_from_user(void *dst, uint64_t src, size_t bytes) {
  *
  * Returns nothing: whether the range is writable is still the range check's answer, and
  * this only removes the one reason that answer would be wrong. */
+/* A ring-0 write into a user page needs the same preparation, and this is where the
+ * reason stops being subtle.
+ *
+ * A `fork` leaves the frames it shares read-only in *both* address spaces, and a ring-0
+ * store to a read-only user page is not stopped by the processor unless `CR4.WP` is set.
+ * It is not -- QEMU refuses to have the bit set at all (see `CR4_WP` in
+ * kernel/include/pagetables.h) -- so the store goes straight through into the *shared*
+ * physical frame, updating it for the twin as well.  The victim is the kernel's own
+ * syscall return: `syscall_dispatch()` writes the result into the program's frame, on the
+ * program's stack, which `fork` has just taken write permission away from.  The parent
+ * wrote its child's pid into the frame the child is about to read, so the child returned
+ * from `fork()` holding a non-zero pid, took the parent's branch, and ran the program a
+ * second time -- two copies, interleaved, writing over each other.
+ *
+ * Every kernel-side store into a user page goes through here for that reason.  There are
+ * few enough of them to name: this function itself, `syscall_dispatch()`'s return value,
+ * and signal delivery's patching of the frame. */
 void syscall_prepare_write(uint64_t addr, size_t bytes) {
     task_t *t = sched_current();
     page_table_t *tables = vmm_tables();
@@ -1122,6 +1139,22 @@ void syscall_dispatch(regs_t *regs) {
      * the *task*, which is what the wait queues are for. */
     uint64_t flags = irq_save();
 
+    /* Before the result is written, not after: the frame is the program's own stack, and a
+     * `fork` may have taken write permission away from it a moment ago.
+     *
+     * The frame is built as a copy of the one the syscall was entered with, so for every
+     * syscall after a `fork` this page is one of the pages the parent and the child share.
+     * Writing `rax` into it from ring 0 goes into the *shared* frame -- the processor does
+     * not stop a supervisor store to a read-only user page without `CR4.WP`, which this
+     * kernel cannot have (see `CR4_WP`) -- so the child read back the value the parent had
+     * just written there.  For `fork` that value is the child's own pid: the child did not
+     * get a zero, so it did not know it was a child, and it ran the parent's half of the
+     * program beside a copy of itself.
+     *
+     * One page walk per syscall, and it returns immediately for a task with nothing shared,
+     * which is every task that has never forked. */
+    syscall_prepare_write((uint64_t)(uintptr_t)regs, sizeof(*regs));
+
     regs->rax = (uint64_t)fn(regs);
 
     irq_restore(flags);
@@ -1483,6 +1516,7 @@ long sys_fork(regs_t *regs) {
     if (task_wakeup(child) != 0) {
         errno_return(ENOMEM);
     }
+
 
     return (long)child->id;
 }

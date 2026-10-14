@@ -104,6 +104,24 @@ void     pt_enable_nx(void);
 
 #define CR4_PAE       (1ull << 5)
 #define CR4_SMEP      (1ull << 7)
+
+/* CR4.WP, bit 16: "supervisor-mode writes are not allowed to write to read-only user
+ * pages".  Architecturally it is exactly what this kernel's copy-on-write needs -- with
+ * it clear, a ring-0 store to a page a `fork` gave up goes straight through into the frame
+ * the twin shares, which is how a child used to return from `fork()` holding the *parent's*
+ * pid.
+ *
+ * It is deliberately NOT set, because QEMU refuses the write with #GP: the accelerator
+ * models PAE and SMEP but not WP, so `mov cr4` with bit 16 raises a general protection
+ * fault and takes the machine down during `vmm_init()`.  Measured on QEMU 11.1.2 with both
+ * `-accel kvm` and `-accel tcg,thread=multi`, on this project's test image.
+ *
+ * So the property is established the other way instead: every write the *kernel* makes
+ * into a user page is preceded by `syscall_prepare_write()` (see kernel/lib/syscall.c),
+ * which gives the page its own copy first.  `CR4_WP` is kept here so the bit is named
+ * rather than rediscovered. */
+#define CR4_WP        (1ull << 16)
+
 #define CR4_SMAP      (1ull << 20)
 
 #define EFER_NXE      (1ull << 11)

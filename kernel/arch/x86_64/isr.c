@@ -197,8 +197,19 @@ static void isr_dispatch_inner(regs_t *regs) {
      *
      * Before this, a forked child that wrote to anything -- its stack, its data -- took a
      * #PF on a page the parent had every right to be using, and the only honest report the
-     * kernel could make was "page fault", which says nothing about why. */
-    if (vector == 14 && (regs->cs & 3) != 0) {
+     * kernel could make was "page fault", which says nothing about why.
+     *
+     * *Supervisor* faults are answered here too, and not as a courtesy.  The syscall
+     * door writes the return value into the program's own frame, on the program's own
+     * stack, which `fork` has just made read-only; that is a ring-0 store to a read-only
+     * user page, and it is answered the same way a program's store is.  It is only raised
+     * at all because `CR4.WP` is set (`vmm_init()`), and with it clear the store went
+     * straight through into the frame the child shares -- so the child returned from
+     * `fork()` holding the child's pid, took the parent's branch, and the two copies of
+     * the program wrote over each other for as long as they ran.  A fault in ring 0 on an
+     * address that is in no copy-on-write list still falls through to the report below,
+     * which is right: that is a real fault in the kernel. */
+    if (vector == 14) {
         task_t *t = sched_current();
 
         if (t != NULL && t->cow != NULL &&
