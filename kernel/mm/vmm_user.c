@@ -87,10 +87,30 @@ int vmm_address_space_destroy(page_table_t *tables) {
     if (tables == NULL || !vmm_active())
         return -1;
 
-    /* Walk each PML4 slot below 256 down to its leaves, freeing every table on the
-     * way.  Only the tables: the *pages* a user mapping covers belong to whoever
-     * allocated them, and a caller that wants them gone has to say so.  Guessing
-     * here would free pages the kernel is still handing out.
+    /* Walk each PML4 slot below 256 down to its leaves, freeing every table on the way
+     * and every *user* page under them.
+     *
+     * The pages are freed here now and were not, and the reason they used not to be is
+     * worth keeping: before `fork` copied, a child shared its parent's frames, so a child's
+     * address space owned no data pages and there was nothing to free.  Every page in it
+     * belonged to somebody else.  That is no longer true -- `fork_copy_page()` gives a
+     * child its own frame for every user page -- so the space now owns exactly as many
+     * frames as it has user pages, and the ones it owns are these.
+     *
+     * The rule is the user bit, and it is the same rule the identity mapping is exempt
+     * under: a leaf the processor can reach from ring 3 belongs to this address space,
+     * and a leaf it cannot is the kernel's.  That covers the TSS -- identity mapped at
+     * the linear address equal to its physical address, in the user half of the PML4 and
+     * deliberately *not* user-accessible, so that ring 3 cannot get at it -- and it is the
+     * one page below slot 256 that must survive this walk.
+     *
+     * A huge leaf is skipped, as before: there is nothing below it, and its frame is not
+     * one this walk can account for.
+     *
+     * Without this, every `exec` and every task exit leaked a whole address space.
+     * `coretest` forks forty-seven times and `sh` forks once per command substitution, so
+     * the leak was not slow: `ls` on a directory began failing with ENOMEM part way
+     * through a test run, in a machine with half a gigabyte of RAM in it.
      *
      * A leaf can be a huge page rather than a pointer, so presence and hugeness are
      * tested together -- a huge leaf has nothing below it to free. */
@@ -115,7 +135,9 @@ int vmm_address_space_destroy(page_table_t *tables) {
 
                 if (!pte_present(e2) || pte_huge(e2))
                     continue;
-                pmm_free_phys_page(pte_phys(e2));
+
+                if (pte_user(e2))
+                    pmm_free_phys_page(pte_phys(e2));
             }
 
             pmm_free_phys_page(pte_phys(e1));
