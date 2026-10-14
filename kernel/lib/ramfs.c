@@ -7,6 +7,7 @@
 #include "kprintf.h"
 #include "kmalloc.h"
 #include "pmm.h"
+#include "spinlock.h"
 #include "string.h"
 #include "syscall.h"
 
@@ -25,6 +26,27 @@ static uint64_t      data_bytes;
 static uint64_t      pool_used_bytes;
 static bool          mounted;
 
+/* The pool's lock.
+ *
+ * The node pool is touched from every processor and from contexts that have nothing to do
+ * with files: `procfs_note_task()` creates a node from `task_register()`, and a task is
+ * created by a fork, a timer, or another processor taking work off a queue.  The free list
+ * here is a singly linked chain threaded through the nodes themselves, so handing one out
+ * is a read-modify-write of `free_head` plus a read-modify-write of the next node's link --
+ * and two processors doing that at once hand the same node to two files.
+ *
+ * What that looks like is not a race.  Two directories end up sharing a node, so one file's
+ * contents appear under another's name; `node_used` drifts away from the truth, so the
+ * filesystem runs out of nodes while most of them are free; and a node freed twice carries
+ * the free list into a loop, so the next `create` spins for ever with nothing to show for
+ * it.  The last of those was this file's own "no node left" failures, on runs where the
+ * node count was nowhere near its limit.
+ *
+ * Irq-saving, because a node is allocated from the page-fault path as well as from a
+ * syscall, and an interrupt that spins on a lock the interrupted code holds never
+ * returns.  Held for the length of one list operation, never across a call that can block. */
+static ticket_lock_t pool_lock;
+
 /* cpio "newc": 6 bytes of magic, then 13 fields of 8 hex characters each.  Parsed with a
  * hand-rolled hex reader rather than `sscanf`, because this runs before there is a heap it
  * can trust and because a field-by-field read is the only way to say *which* field was
@@ -36,21 +58,27 @@ static bool          mounted;
 /* --- nodes ---------------------------------------------------------------- */
 
 static uint64_t node_alloc(void) {
+    uint64_t lflags = spin_lock_irqsave(&pool_lock);
     uint64_t ino = free_head;
 
-    if (ino == 0)
+    if (ino == 0) {
+        spin_unlock_irqrestore(&pool_lock, lflags);
         return 0;
+    }
 
     free_head = nodes[ino - 1].next_free;
     memset(&nodes[ino - 1], 0, sizeof(nodes[0]));
     nodes[ino - 1].ino = ino;
     node_used++;
+    spin_unlock_irqrestore(&pool_lock, lflags);
     return ino;
 }
 
 static void node_free(uint64_t ino) {
     if (ino == 0 || ino > RAMFS_NODES)
         return;
+
+    uint64_t lflags = spin_lock_irqsave(&pool_lock);
 
     /* Anything still holding data gives it back now: a node nobody has open is the only
      * kind that can be reclaimed at all, and `ramfs_grow` is the answer for the rest. */
@@ -68,6 +96,8 @@ static void node_free(uint64_t ino) {
     nodes[ino - 1].next_free = free_head;
     free_head = ino;
     node_used--;
+
+    spin_unlock_irqrestore(&pool_lock, lflags);
 }
 
 /* Grow a file's buffer in whole pages, never shrinking it -- a truncate that reallocates
@@ -180,7 +210,8 @@ uint64_t ramfs_create(uint64_t parent, const char *name, ramfs_kind_t kind,
     uint64_t ino = node_alloc();
 
     if (ino == 0) {
-        kprintf("ramfs: no node left for \"%s\"\n", name);
+        kprintf("ramfs: no node left for \"%s\" (%u of %u in use)\n", name, node_used,
+                (unsigned)RAMFS_NODES);
         return 0;
     }
 
