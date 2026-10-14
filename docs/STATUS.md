@@ -6,22 +6,62 @@ phase 9's shell IN PROGRESS.**
 `make test` reports **`run-tests: PASS`, 44 of 44 checks**, the guest shuts down cleanly,
 `TEST-READY` is reached, the tally is readable and the framebuffer dump is captured.
 `libctest` reports **115 of 115** checks passing inside that run.  Verified from a clean
-tree (`rm -rf build && make test`) three times consecutively on 2026-10-13, and again after
-this session's four kernel fixes (below).
+tree (`rm -rf build && make test`) on 2026-10-14, and three times again over the tree as
+committed (`c00307c`..`b875adf`).
 
-**The suite is flaky and now visibly so.**  Four `make WITH_SHELL=0 test` runs after the
-fixes in this session gave 44/44, **43/44** (`libctest: FAILED -- PATH is set before
-main()`), 44/44, and two `WITH_SHELL=1` runs gave a `ramfs: no node left` exhaustion
-during `libctest` and a kernel panic after `exec`.  The previous note on this page said one
-bad run in about six; it is closer to one in three now, and the failing check is not always
-the same one.  That is a regression in reliability even where the tally is 44/44, and it is
-not yet explained — see "Known bugs".
+**The flakiness this page reported is gone, and the reason is worth writing down** because
+it was never a flaky test: three allocators in this kernel had **no lock at all** while
+every processor used them.  `pmm`, `kmalloc` and the ramfs node pool are all read-modify-
+write of one word shared across four processors, so two of them could hand out the same
+frame, the same block, or the same node.  What that produced was never "one check in
+three": a filesystem that ran out of nodes with the pool nowhere near full, a test that
+failed once in three, and a machine that stopped with no fault and no message.  All three
+now have an irq-saving spinlock, and three consecutive `make test` runs are 44/44 from a
+clean tree.
+
+`make WITH_SHELL=1 test` fails **only** `phase9-sh`, and it is one defect now rather than
+four: see "Phase 9, where it got to".
 
 A normal boot (`make iso`, `-smp 4`) comes up with a graphical console, mounts `/dev` and
 `/proc`, finds `/init` in the initrd, runs it, and `init` execs `/sbin/init`, which mounts
 `/proc`, puts `/dev/console` on 0/1/2, takes a session and forks `/bin/sh`.  The shell is
 not in the default image yet (see "Known bugs"), so the shell's absence is reported on the
 console rather than being silent.
+
+### What this session fixed
+
+Nine defects, each with the shape of something else, and the order they were found in is
+the order they are worth reading in — every one of them was found by *running* the thing
+and reading the serial log, and none of them would have been found by reading the code.
+
+| | Defect | What it looked like |
+|---|---|---|
+| 1 | `dup2()` cleared its destination and then asked for a *free* descriptor, so `dup2(fd, 1)` with fd 3 answered `-EMFILE` | every shell redirection silently did nothing; `echo hello > f` printed on screen and created no file |
+| 2 | `execve()` copied argv through a 256-byte buffer | any path or argument longer than 255 bytes was refused |
+| 3 | A user range starting near the end of a page was checked against that page's tail | 64 bytes at a page's last 8 were refused; an accepted copy could run off the mapping |
+| 4 | `monotonic_ns()` divided by `tsc_hz` before the timer was armed, and guarded the same divisor three lines later | a #DE inside `kprintf()`, whose panic needs the console lock `kprintf()` is holding: **silence**, between the first line of boot output and the first frame drawn |
+| 5 | A task's copy-on-write list held only the pages the *most recent* `fork` took | a second `fork` gave its child read-only pages with no record of them, and the kernel correctly reported a page fault |
+| 6 | `vmm_fork_aspace()` cleared the copy-on-write list it was handed, and the caller then subtracted what it had been given from what the list held | a `memcpy` of **sixteen gibibytes** that walked over the page tables: the machine stopped with no fault, no panic and nothing on the serial port |
+| 7 | A page table was shared with a twin when nothing *underneath* it was writable — but `brk()` adds a mapping from ring 3 | the parent's `brk` replaced the frame under the child's heap; two address spaces, one page, neither faulting |
+| 8 | `pmm`, `kmalloc` and the ramfs node pool had no lock | see above |
+| 9 | A task's descriptors were not closed when it exited | a pipe's writer count never reached zero, so `$( )` blocked in `read()` for ever on a writer that had been dead for forty seconds |
+
+And in the shell itself, two more that were being blamed on the kernel:
+
+- **A bare assignment forked and exec'd a second shell.** `sh script.sh` reached the
+  first `x=42`, started an *interactive* shell on the console, and the script, its parent
+  and `waitpid` all waited for ever on a shell waiting for a person to type at it.
+- **`expand_assign()` freed the string it had just handed to its caller**, so every `x=42`
+  was a double free.  A block freed twice that happens to be larger than the block being
+  freed walks the allocator's free list into a ring of one, and the next allocation above
+  it spins for ever.  It was reported as the *kernel* hanging, because the shell's
+  `waitpid` never returned.
+
+Three of the four tools that made this findable are now part of the tree rather than
+scaffolding: a hung machine prints its whole task list (`sched_tick()`, on ten seconds of
+silence), a program that fails to exit prints its kernel stack as raw addresses and — for
+the shell test — the script it was given and the output it collected, and `memcpy()`
+refuses a length that would walk the page tables instead of trying and dying.
 
 ### What phase 8 added
 
@@ -64,8 +104,8 @@ Eight consecutive boots now produce zero interleaved lines.
 | 6 | Userspace entry | VERIFIED | Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel), `phase6-user` (the program is loaded, entered at ring 3, reads its own `argc` and `argv[0]`, writes to the console, is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a kernel pointer and ENOSYS for an unimplemented call, is preempted in ring 3 and resumed, and exits 0). **VERIFIED** by `make test` → `run-tests: PASS` and by three `-smp 4` runs at 38/38. |
 | 7 | Processes, signals, pipes | VERIFIED | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes, `exec`, and signals. `phase7-fork` (four children, four pipes drained, all reaped by `wait`, no children left), `phase7-cow` (the parent's 8192 bytes survive the child's writes through shared pages), `phase7-signal` (a handler runs with the right number and the interrupted registers are intact; a blocked signal is *pending*, not lost, and arrives on unblocking; a signal with no handler does its default thing, SIGCHLD ignored and SIGUSR2 fatal). See "Phase 7, where it got to". |
 | 8 | VFS + ramfs + initrd + devfs | VERIFIED | `phase8-ramfs` (the tree, from inside the kernel) and `phase8-vfs` (`fstest`, the same filesystem through `int $0x80` and nothing else -- create, write, read back through a new descriptor, the mode surviving, the errno for each of six distinct mistakes, a kernel address refused as a path, rename with both halves checked, a failed rename not creating its destination, a hard link being one inode with a count of 2 that drops to 1 when one name goes, a directory refusing to be hard-linked, `lstat` a link and `stat` the file, `readlink` giving a *relative* target, `getdents` listing every entry once each with the right `DT_*`, `rmdir` refusing a non-empty directory, and `/proc/self/status` describing the reading process). `make test` → 43/43, three runs. A normal boot mounts `/dev` and `/proc`, finds `/init` in the initrd and runs it; `init` execs `/bin/hello`, which reports `hello: ok`. |
-| 9 | TTY + libc + sh | NOT STARTED | |
-| 10 | Coreutils + procfs | NOT STARTED | |
+| 9 | TTY + libc + sh | IN PROGRESS | The graphical console and the keyboard are done (`make run` boots to a console you can type at), `libctest` is **115/115**, and `sh` runs most of a script. `make WITH_SHELL=1 test` fails **only** `phase9-sh`: the shell's script gets through `for`, `while`, `case`, functions, `cd`, redirections, `&&`, `||` and a nested `$( $( ) )` capture, and then a child process's heap is corrupted — a free-list node ends up holding a code address. See "Phase 9, where it got to" and "Known bugs". |
+| 10 | Coreutils + procfs | NOT STARTED | `procfs` is done enough for `/proc/self/status` (phase 8). No coreutils yet; `shtest`'s script needs `ls`, `cat`, `rm`, `wc`, `tail` and `head`, so it cannot pass until they exist. |
 | 11 | Hardening / stress | NOT STARTED | |
 | 12 | Polish | NOT STARTED | |
 
@@ -457,6 +497,60 @@ the summary, so the next session does not re-derive them.
 **The `-smp 4` hang is FIXED.** It was the lost wake described above:
 `-smp 4` goes from 3 of 8 clean runs to 6 of 6, and `make test` passes three times out of
 three under KVM, which is the gate.
+
+## Phase 9, where it got to
+
+`make WITH_SHELL=1 test` → **44 of 45**, and the one failure is `phase9-sh`.  Everything
+before it is green, including `libctest` at 115 of 115.
+
+**The shell now runs most of `shtest`'s script.**  With all nine kernel defects above
+fixed, `sh /tmp/shtest.sh` gets through, in order: quoting (`echo 'four  five'` keeps its
+two spaces), assignments, `${#x}`, `${v:-default}`, `${v:+set}`, `$( )` capture and
+command substitution, a *nested* `$( $( ) )` capture, `$(( ))`, `$*`, `$1`, `for`,
+`while`, `until`, `case` with patterns and `|`, `&&`, `||`, `( )`, `{ }`, shell
+functions, `cd`, `pwd`, `>` , `>>`, `2>` and `2>&1`.  Each of those was broken at some
+point in this session and each is now demonstrably working.
+
+**What is still broken, exactly.**  The failure is in `$( true && echo yes )` — a command
+substitution whose body forks *again*.  The child process's heap is corrupted: a block
+header in the allocator's free list is overwritten with `(size = 1, next = 0x407d0d)`,
+and `0x407d0d` is an address **inside the shell's own text segment**.  `free()` then walks
+the list into the text and faults, and the panic report shows the fault in `block_free`
+with `CR2` pointing into `.text`.
+
+So: one 16-byte write, into a heap block that was already free, carrying a small integer
+and a code address.  Those are exactly the two halves of a `struct timespec`
+(`tv_sec = 1`, `tv_nsec` = a code address) or of any `{size_t, pointer}` pair written by
+the kernel into a user buffer at the wrong place.
+
+**What has been ruled out**, so that the next session does not repeat it:
+
+- Not the copy-on-write list: `vmm_cow_fault()` is never asked to copy a page the task
+  cannot see (instrumented and checked), and the counts are now right across three
+  generations of fork.
+- Not the page tables: a twin's user tables are now fully private, so a copy can no
+  longer land in the parent's mapping, and `brk` can no longer add an entry to a shared
+  one.
+- Not a double free in the shell: the allocator's "this block is already free" check
+  fires on nothing in this run.
+- Not the shell's allocator walking into a cycle on its own: the corruption is *visible*
+  in the block header before the walk reaches it.
+- Not a lost wake or a broken `wait`: the exit record is correct and the child is
+  collected; where an early run showed `waitpid` returning 0 for a child that had not
+  exited, `sys_wait()` had been handed `options != 0` — see "Known bugs".
+
+**The most likely place left is a kernel handler writing a structure into a user buffer
+at a bad offset or a bad length.**  The suspects, in order: `sys_times`, `sys_getrusage`,
+`sys_uname` and anything else that copies a fixed-size struct out with
+`syscall_copy_to_user()`.  The one thing that would settle it in a single run is a
+bounds check on every `syscall_copy_to_user()` call site that logs the length it was
+asked for alongside the address — the same shape as the `memcpy()` guard that turned
+defect 6 from silence into a named report.
+
+**Not to be lost in the rewrite**: `phase9-sh` was briefly reported PASS while it was in
+fact hanging, because `run_program()` reported whatever exit it last read when its poll
+ran out of time.  That is fixed and is why the failure is visible at all now.  Do not
+reintroduce a "last status wins" read on either side of that loop.
 
 **Still open: `-smp 8` under TCG, about one run in four.** It is no longer a panic -- the
 corrupting failures are gone, and the queue's occupancy assertion has never fired -- so what
@@ -1097,6 +1191,35 @@ freeze, but it was a live hazard and is recorded because it was real.
 - `make run` opens a GUI window; automated verification uses `make test`, which
   is always headless.
 
+- **`phase9-sh`: a child's heap is corrupted by a 16-byte write carrying a code
+  address.**  The one remaining `make WITH_SHELL=1 test` failure, and it is a
+  corruption rather than a hang.  Full detail, including everything already ruled
+  out, is in "Phase 9, where it got to".  The shell itself gets through quoting,
+  assignments, parameter expansion, arithmetic, `for`/`while`/`until`/`case`,
+  functions, `cd`, redirections, `&&`/`||`, subshells and a nested command
+  substitution before it happens.
+- **`sys_wait()` is reachable with `options != 0` from a caller that passes
+  zero.**  An early run showed `shtest`'s `waitpid(54, &st, 0)` returning 0
+  while its child was still alive — the only path to 0 in `sys_wait()` is
+  `WNOHANG` — and a second run showed it returning 0 for a child that had *not*
+  been collected.  Since the same run had a child writing over the caller's
+  `pid` variable (the corruption above), the likeliest reading is that the
+  register was not what the trace said.  **Not diagnosed.**  `sys_wait()`
+  currently trusts `arg(regs, 2)`; the selector and the options are read from
+  the frame with no cross-check, and a frame that is one instruction stale would
+  be read as a valid `WNOHANG`.
+- **`vmm_address_space_destroy()` frees only tables, never the pages they
+  map.**  That is deliberate and commented, and it means every frame a process
+  ever mapped stays out of the pool for the life of the machine.  Correct, and
+  it will need a page reference count before a long-running machine can afford
+  it.
+- **`ramfs_grow()` is named in `ramfs.h` and does not exist.**  The header says
+  the node pool is a fixed array and that being wrong is "a refill rather than a
+  failure", and then describes a refill function.  There is none: `node_alloc()`
+  returns 0 when the free list is empty, which is what the "no node left" report
+  is.  With 2048 nodes and the pool now locked that is further off than it looks,
+  but the promise in the header is not kept.
+
 ## Needs human decision
 
 1. **Push access.** Every commit from phase 1 through phase 8 is local. `git push origin
@@ -1110,11 +1233,16 @@ freeze, but it was a live hazard and is recorded because it was real.
 ## Test commands
 ```
 make test        # headless boot, in-kernel self tests, framebuffer dump; non-zero on failure
+make WITH_SHELL=1 test   # ...with /bin/sh and shtest in the image: 45 checks, phase9-sh red
 make test-host   # host-compiled allocator fuzz test (fast, no QEMU)
 make run         # graphical console in a QEMU window (SMP=4 MEM=512M by default)
 GUI=0 make run   # headless: serial console only
 make debug       # boot paused for GDB (tools/gdb-run.sh drives it in batch)
 sh tools/shot.sh build/minx.iso /tmp/shot.ppm 10   # screenshot the framebuffer
+
+# Driving the shell at the graphical console, headlessly.  The banner is an argument
+# because WITH_SHELL=1 does not print the kernel's.
+sh tools/type-test.sh build/minx.iso /tmp/t.log 'echo one; x=42; echo "x=$x"' 'minx sh'
 
 # The matrix a phase claim rests on: repeated clean runs at the default processor count.
 for i in 1 2 3; do
@@ -1135,9 +1263,10 @@ keys'                                                 # type at the console head
 `git push origin HEAD` fails in this environment with
 `could not read Username for 'https://github.com'` — no credential helper and no
 token available, and AGENTS.md forbids putting tokens in files or remotes. Retried
-at the end of phase 8 and again at the end of the four kernel fixes below; same
-answer both times. Every phase since phase one has committed locally for the same
-reason (see the commit "docs: record phase one push limitation").
+at the end of phase 8, again after the four kernel fixes below, and again at the end
+of this session's nine; same answer every time. Every phase since phase one has
+committed locally for the same reason (see the commit "docs: record phase one push
+limitation").
 
 This is the one thing in this tree that is not a technical problem and the only
 thing that cannot be worked around: the work is all here, in order, with the
@@ -1254,36 +1383,45 @@ for the length of a null pointer.
 
 ## Next
 
-**Phase 9, first: the ramfs node pool.**  It is now the dominant failure, not a flake.  Four
-consecutive `make WITH_SHELL=1 test` runs gave 44/44 with `phase9-sh` skipped, 40/45 with
-`phase8-ramfs`, `phase8-vfs`, `phase9-libc`, `phase9-sh` and `phase5-parallel` all failing
-together, and twice with `program: no program called shtest`.  Those are all one failure:
-2048 inodes, released only by `ramfs_unlink()`, never by `close()`, and the self tests plus
-every program's image in the initrd consume them.  **The first thing to do is count the
-nodes in use when the pool empties**, and then either raise the pool or release a node when
-the last descriptor on a file closes *and* it is unnamed.  This is where the "one bad run in
-six" note below went, and it should not be worked around by re-running.
+**Phase 9, first, and only one thing: the 16-byte write that corrupts a child's heap.**
+Everything else in this list has been fixed, and what is left is a single corruption with a
+single symptom.  The evidence, the five hypotheses already ruled out and the one that
+survives are all in "Phase 9, where it got to"; the short version is that a block header in
+the shell's allocator has `(size = 1, next = <an address in the shell's own text>)` in it,
+in a child of a `$( ... )` capture whose body forks again.  The next step named there is to
+make every `syscall_copy_to_user()` call site log the length it was asked for beside the
+address it is writing to — the same instrument that turned the sixteen-gibibyte `memcpy`
+from silence into a named report — and then to read which one wrote those sixteen bytes.
 
-**Phase 9, then: the exec panic.**  On `-smp 4`, after a *successful* exec, the kernel
-panics in a `memcpy` whose source is `0x00007ffffffff000` -- exactly `USER_STACK_TOP` --
-reading 80 bytes in supervisor mode.  The fork is correct (the child's frame has `rax = 0`
-and a valid `rip`, verified directly), the exec completes, and the task is set up correctly
-afterwards.  This is one fault and it is the last thing between here and a working `sh`.
+**Then: a page reference count.**  `vmm_address_space_destroy()` frees tables and nothing
+else, so every frame a process ever mapped is out of the pool for the life of the machine.
+That is correct and it is now the thing that will decide how long this kernel can run.  It
+is a real change — the page needs a count, and the count has to survive the physical
+allocator being the only thing that knows which frames exist — so it belongs to phase 11's
+"hardening", not to phase 9.
 
-**A trap, recorded so it is not walked into again: do not debug this with `-smp 1`.**  A
-single-processor guest faults during `phase7-cow` with `CR2 = 0` -- a NULL read in
-`memcpy` -- which has nothing to do with the phase 9 bug and is a different, pre-existing
-single-CPU defect.  Two sessions were spent chasing that one because it appears immediately
-before the phase 9 work in the log.  Everything about phase 9 must be measured on the harness,
-which runs `-smp 4`.
-
-**Then the doubled `shtest` report.**  Parent and child output interleaves character by
-character and both appear to be inside `run_script` at once, with only one `fork()` issued.
-This has been in every log since the first run of this session and is still unexplained.
+**Then: `ramfs_grow()`.**  `ramfs.h` promises a refill and there is none.  2048 nodes is
+enough for the tests as they stand and will not be enough for phase 10, which creates files
+by the hundred.
 
 **Then phase 10**: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
 `tr`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `echo`, `true`, `false`, `date`, `env`, `kill`),
-`grep -r`, an editor, and the rest of `/proc`.
+`grep -r`, an editor, and the rest of `/proc`.  Note that `shtest`'s script uses `ls`,
+`cat`, `rm`, `wc`, `tail` and `head`, so **`phase9-sh` cannot pass until those six exist** —
+the shell test is, at the end of this session, gated on phase 10 as well as on the heap
+corruption.  Either write the six programs first or split the script, and the split is the
+better order because it separates "the shell is wrong" from "the program is missing".
 
-Use a marker written to a file and read back by `shtest`, not gdb: a gdb-attached guest
-under TCG never reaches `shtest`, so every conclusion drawn from one has been wrong.
+**A trap, recorded so it is not walked into again: do not debug this with `-smp 1`.**  A
+single-processor guest faults during `phase7-cow` with `CR2 = 0` -- a NULL read in
+`memcpy` -- which has nothing to do with phase 9 and is a different, pre-existing
+single-CPU defect.  Two sessions were spent chasing that one because it appears immediately
+before the phase 9 work in the log.  Everything about phase 9 must be measured on the
+harness, which runs `-smp 4`.
+
+**And a second trap, from this session: a backgrounded QEMU with a closed stdin exits.**
+Every "the guest hung and QEMU exited" measurement taken this session with
+`exec qemu-system-x86_64 ... &` and no `-monitor none` was really *QEMU quitting at once*,
+and the serial log that looked like a hang was the previous run's.  `-monitor none`, or a
+fifo the writer holds open, is what makes the difference; `-no-shutdown` is what keeps a
+triple fault on screen to be looked at with `gdb -ex "thread apply all bt"`.

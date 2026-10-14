@@ -1067,3 +1067,81 @@ by turning something off and leaving it legible, rather than by deleting the evi
 
 What replaces it: nothing. `sh` is the shell, and when it works the kernel has no business
 reading the keyboard.
+
+## A bare assignment in `sh` no longer runs a second shell
+
+**Date: 2026-10-14**
+
+`expand_command()` used to fork and `execve("/bin/sh", ...)` with no arguments for a
+command whose words were all assignments, on the reasoning that such a command "still runs
+something". That is now: set the variables, succeed, and run the redirections in a child if
+there are any.
+
+Two things are wrong with the old behaviour and the first is visible in any run — `sh
+script.sh` reached the first bare assignment, started an interactive shell whose standard
+input was the console, and the script, its parent and the program's `waitpid` all waited
+for ever on a shell that was waiting for a person to type at it. The second is that it was
+never what anyone wanted even when it did not hang: `PATH=/bin ls` is a command with
+*words*, so it takes the ordinary path and sets `PATH` for that one command, with no second
+shell anywhere.
+
+This is a behaviour change to committed code rather than an addition beside it, which is the
+one case where the no-deletion rule needs a reason beyond tidiness. The reason is that the
+old behaviour is a bug with two independent proofs against it and no behaviour anyone could
+have wanted, and leaving it selectable behind a flag would mean shipping a shell in which
+`x=1` starts an interactive session.
+
+## The ramfs, `kmalloc` and the pmm are locked rather than left to the caller
+
+**Date: 2026-10-14**
+
+All three had **no lock at all** while every processor used them, and each is a
+read-modify-write of one shared word: a bitmap bit and a cursor, a free-list head, a
+node-pool free-list head.
+
+What made them visible is not that they failed in an obvious way. It is that they did not
+fail in one way: a filesystem that ran out of nodes with the pool nowhere near full, a test
+that failed once in three, and a machine that stopped with no fault and no message. Each
+was recorded on this page as a separate mystery, and the reason they are one bug is that
+they are all the same bug.
+
+The alternative considered and rejected is a *per-cpu or per-task* allocator — no lock, but
+correct — because it changes the shape of `kmalloc`'s contract everywhere and because the
+heap is deliberately one region that the memory report quotes as a single number. The
+alternative that is still wanted, and is recorded as a known bug, is a page reference
+count: `vmm_address_space_destroy()` frees tables and nothing else, so every frame a
+process ever mapped stays out of the pool for the life of the machine. That is correct
+today and is the thing that will decide how long this kernel can run.
+
+## `memcpy` refuses an absurd length instead of attempting it
+
+**Date: 2026-10-14**
+
+Sixteen gibibytes is a subtraction that underflowed, and copying it is not slow — it is
+fatal, because the walk goes straight through the page tables, and when it reaches them the
+machine stops with no message, no fault and nothing on the serial port, because the page
+table it was writing through is the one the console would have been printed from.
+
+The alternative considered and rejected is letting it happen and hoping the guard is never
+hit, on the grounds that a check in the hottest function in the kernel is a cost. It is two
+instructions on a path that is almost never taken, and the cost of *not* having it was three
+days of work on a bug whose symptom was silence. A check that turns an unnameable failure
+into a named one is the cheapest diagnostic in the tree.
+
+The limit is 16 MiB, which nothing in this kernel copies anywhere near: the biggest copy in
+the tree is a 4 KiB page for a copy-on-write fault.
+
+## A hung machine prints its task list
+
+**Date: 2026-10-14**
+
+`sched_tick()` asks whether anything has been printed for ten seconds and, if not, prints
+every task. The alternative — leaving hangs silent and reading them out of the guest with a
+debugger — was what this project did for the whole of phase 9 and it does not work: a
+gdb-attached guest under TCG never reaches the test that is hanging, so every conclusion
+drawn from one has been wrong.
+
+Ten seconds is chosen against the *test run*, not against the machine: a run has stretches
+where nothing is printed while a program thinks, and a report that fires on those is a
+report nobody reads. The boot processor only, because four processors printing four copies
+of the same list is one copy of the list and three copies of noise.
