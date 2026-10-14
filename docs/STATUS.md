@@ -988,369 +988,64 @@ attribution was the part that said something about the lock.
 
 ## Known bugs
 
-**`make test-host` had never run. Its allocator fuzz test now runs, and it fails.**
+**The heap's redzone check was reading the wrong address. Now fixed, and it names two bugs in
+the shell.**
 
-This session's work started by finding that `make test-host` -- a documented gate -- did not
-link, because `kprintf.c` had grown a console lock and a silent-period check and the host
-harness had never been given those symbols.  Supplying them was the easy half.  The other
-half was that the harness then died with SIGSEGV before printing anything:
+`kmalloc()` poisons the redzone at `payload + want`, immediately after the caller's rounded
+request.  The check on free read `payload + (b->size - KM_REDZONE)`.  Those are the same
+address only when the block was split down to exactly the request -- and when the leftover
+could not hold a header of its own, `b->size` kept its capacity, so they were different
+places.  The check therefore looked past the poison into memory that had merely been zeroed,
+and reported a block written past its end on **every** unsplit free: always offset zero,
+always a zero where the pattern should have been.
+
+That is worse than no check.  A check that is always wrong teaches its reader to ignore it,
+which is exactly what happened -- it had been reporting this for as long as there was a
+redzone, and nobody read the output.
+
+**What it says once it works**, from the guest serial log:
+
+```
+free:  block 0x2403640 (32 bytes) was written past its end: 00 at +32, freed from 0x40940c
+malloc: block 0x2405840 (1984 bytes) was written after being freed: 90 at +0;
+        handing it to 0x405e8c
+```
+
+Both addresses resolve in `sh`:
+
+- **`cmd_free()` at `user/sh/` writes one byte past the end of a 32-byte block it is
+  freeing.**  This is the same function `kernel/include/kmalloc.h` already records as having
+  had a double free -- "the shell's `cmd_free()` released `c->stages` and `c->arms` a second
+  time" -- so it is the third distinct defect in one function, and the file that documents
+  the first two is in the same tree.
+- **`sb_putc()` writes to a block that has already been freed** -- a use after free, handed
+  straight back out by the next allocation.
+
+Neither fails a test today: both are warnings on stderr and the tests do not read stderr.
+That is why `shtest` is 53 of 53 while the shell is corrupting its own heap underneath it.
+
+**Not yet diagnosed.**  Both are in the shell and both are about `cmd_free()`'s ownership
+rules -- what it frees, in what order, and what the string builder holds a pointer to across
+a `cmd_free()`.  The fix is in `user/sh/`, not in the allocator, which is now telling the
+truth.
+
+**`make test-host` had never run. It does now, and it passes.**
+
+It did not link, because `kprintf.c` had grown a console lock and a silent-period check and
+the host harness had never been given those symbols.  Supplying them was the easy half.  The
+other half was that the harness then died with SIGSEGV before printing anything:
 `kmalloc_attach_region()` takes the allocator lock with `spin_lock_irqsave()`, which does
-`cli`, which is privileged and raises SIGSEGV in user mode.
+`cli`, which is privileged and raises SIGSEGV in user mode.  `io.h` now has a host path for
+`irq_save()`/`irq_restore()`, selected by `__minx_host__`, which only the harness's build line
+defines.
 
-So the gate had been red for a long time and nobody had run the thing inside it.  With
-`io.h`'s `irq_save()`/`irq_restore()` given a host path (`__minx_host__`, defined only by the
-harness's own build line), it runs, and its first output is:
+With that fixed the gate runs, and it found three things that are now also fixed: the test's
+own arithmetic was a redzone short and had failed a block whose header was exactly right;
+the kernel allocator stranded 896 bytes per fuzz run inside live blocks where no block
+described them; and `kmalloc_dump()` now walks every block of every region and accounts for
+every byte, because an incremental counter says the same number whether the accounting
+drifted or the bytes are gone.
 
-```
-[warn] heap: block 0x55aa190d6ec0 (2704 bytes) was written past its end: 0 at +2704, freed from 0x55aa1905d528
-FUZZ BAD HEADER after alloc: slot 34 len=819 size=896 free=0
-```
-
-**A block of 2704 bytes was written one byte past its end, and a slot's header no longer
-matches its length.**  That is a real allocator defect and it is in `kernel/mm/kmalloc.c`,
-which the header comment in `kernel/lib/stdlib.c` already describes as keeping its redzones
-and its freed-block poisoning permanently -- so the instrumentation that found this has
-always been in place and has never run.
-
-**Not yet diagnosed.**  The next thing to do is get the fuzz case down: the test prints the
-slot, the requested length, the header's own size and whether the block is free, which is
-enough to tell an overflow of the previous block from a corrupted header, but not enough to
-say which of the allocator's paths produced it.
-
-
-**The graphical console is flanterm, and it is fixed (VERIFIED).**
-
-`docs/SPEC.md` named flanterm as the intended terminal emulator and it is now what draws
-the framebuffer console, behind `kernel/include/console.h` so that nothing else in the
-tree knows.  `make TERMINAL=own` still selects the old first-party console, which is kept
-whole and still builds, because a console replaced on the strength of a claim about its
-replacement is not a decision, and because its bugs are the record of what that layer is.
-
-`make test` is **44 of 44** and `libctest` 115 of 115.
-
-Four bugs, all of which presented as the same thing -- a console that looked wrong:
-
-1. **The framebuffer stopped updating part way through the boot.**  Fixed by using a
-   terminal emulator that was written for this job against this bootloader.  The old
-   console's own causes are recorded below and were fixed in it too.
-2. **`flanterm_flush()` was never called.**  flanterm marks cells dirty and draws them on a
-   timer it does not have here, so after the first flush nothing was drawn at all: a
-   partially updated grid with stale rows under the live ones.  Now flushed once per
-   `console_write()`.
-3. **Bare `\n` walked the text diagonally down the screen.**  A terminal's LF moves down a
-   line and leaves the column alone; CR returns to column zero.  Every kernel message and
-   every program's `printf` ends its lines with a bare `\n`, which is right -- a newline is
-   a newline in a byte stream and the *terminal* decides what it means -- so the carriage
-   return has to be put back on the way into the terminal.  That is the `ONLCR` bit of a
-   tty driver's output processing, done in `emit_locked()` on the framebuffer side only:
-   the serial port does not get it, because a terminal emulator on the other end of a
-   serial line does the same translating and sending it would make the log stair-step on
-   anything reading it as a dumb port.
-   **This was the "per-row horizontal stagger" recorded as not diagnosed in the previous
-   commit, and it was this.**  It was read as a row-stride problem because the symptom is a
-   stride problem -- each line starting where the one above ended -- and the pitch was
-   checked and found correct, which is true and was the wrong thing to be checking.
-4. **The serial mirror was a port write per byte.**  `emit_locked()` looped `serial_putc()`;
-   it now uses the `serial_write()` that already exists and takes the whole string.  For a
-   screenful of boot log that is several thousand port writes to mirror text already on
-   the framebuffer.
-
-**Scrolling is still the expensive half, and it is flanterm's.**  `flanterm_fb_scroll()`
-pushes every cell of the scrolling region -- 8000 cells on a 160x50 terminal -- onto the
-dirty queue, and the flush then re-plots all of them.  That is the same cost the old
-console had and that was fixed there by moving the framebuffer a row at a time; inside
-flanterm it is not avoidable from here without patching the library.  It is the next thing
-to look at, and the honest options are a patch, a smaller grid, or a different backend.
-
-**The old console's cell buffer was allocated before the heap existed (fixed).**
-`console_init()` runs before the heap is up -- the next boot message is the heap announcing
-itself -- so its `kmalloc()`ed cell buffer sat in whatever the heap later made of it.  It is
-now static `.bss`, sized for a 256x64 console.  This did not turn out to be the cause of the
-freeze, but it was a live hazard and is recorded because it was real.
-
- gaps
-- **The guest hangs at `-smp 4` about one run in three, with no panic and no fault.** Two
-  distinct hangs: `hello` never returns from the pipe section (the suite reports 37 of 38
-  and the status it quotes is the first fork child's deliberate 7, which it reads because
-  the test timed out waiting for its own task), and, about one run in eight, the run stops
-  dead just after `PASS phase4-percpu`, before anything new has run. `make test` itself
-  passes, so this is not a gate failure -- it is a reliability failure, and phase 7 is not
-  called verified until it is gone. Full detail, and what has been ruled out, in "Phase 7,
-  where it got to" above.
-- A signal delivered to a program whose text spans two pages currently kills it on its
-  first instruction with `#GP` out of `iretq`. Not the frame order: swapping `SS` and `RSP`
-  breaks the one-page program too. See "Phase 7, where it got to".
-- **The phase-5/6 blocker is FIXED and verified** -- `make test` runs the whole suite to
-  the end, 38 of 38 PASS, no panic at 1 or 4 processors. Root cause, established by
-  reading the code rather than by inference: `schedule()` published the outgoing task to a run queue *before*
-  `task_switch()` wrote that task's `saved_rsp`. A stack-based context is not finished
-  until the instant its stack pointer is stored, so for the whole of the window between
-  the queue insertion and the store, the task was reachable by another processor while
-  its `saved_rsp` still named an *older* frame. That processor restored a stale `RSP`
-  and the task resumed on a frame already in use. Two live frames on one kernel stack
-  corrupts both, and the visible result is a processor that stops taking interrupts with
-  no fault reported anywhere -- which is what every captured symptom of this fault
-  actually was.
-  This accounts for all four captured messages at once, including the two that looked
-  like unrelated bugs: `current` holding a heap payload and `cpu[i].idle` holding a
-  kernel text address are both what a `task_t *` read through a corrupted stack looks
-  like, and the "re-entered `schedule()` from `task_sleep_ms`" report is what a context
-  saved at the wrong stack depth looks like.
-- The mutex and the semaphore spin instead of sleeping. Correct, and right for a
-  short critical section; wrong for one that can block, which is why the wait
-  queues they would need are not written yet either. Phase 5.
-- `kprintf` has no lock, so several processors announcing themselves at once
-  interleave their output on the framebuffer and the serial mirror ("smp: 2x" etc).
-  Spinlocks are phase 5; until then the interleaving is cosmetic and the `cpus`
-  command reports the real per-CPU state.
-- **RESOLVED -- the blocker below was a publish-before-save race.** Every message it
-  produced is accounted for by it; see "The two remaining failures, exactly" above for
-  what is left. Kept because the captured messages are the evidence for the fix, and
-  because a future session that sees one of them again needs to know it was this and not
-  something new. The one-line version: `schedule()` queued the outgoing task and *then*
-  called `task_switch()`, which writes that task's `saved_rsp` as its last act, so for the
-  window in between the task was reachable by another processor while its saved stack
-  pointer still named an older frame.
-  The captured messages, in the order they appeared:
-  - `sched: processor 2 has 0xffff800000100030 as its current task, and that has weight 0`
-    -- a heap payload used as a `task_t *`.
-  - `sched: [from this processor's idle task] processor 0 chose 0xffffffff8000a0a0, and
-    could not claim it` -- a *kernel text address* used as a `task_t *`.
-  - `sched: processor 3 re-entered schedule() from task_sleep_ms+178 while it was already
-    switching` -- `schedule()`'s frame was still live on the stack when `task_sleep_ms`
-    ran, which means a context was saved at the wrong place.
-  - `rip=0xdeadbeef`, which is `TASK_STACK_GUARD`: a stack pointer that came from a guard
-    word rather than from a stack.
-  Phase 6 cannot be signed off until this is fixed, because `phase6-user` is exactly the
-  test that dies of it.
-
-- **RESOLVED -- this was the same bug as the entry above, seen from the other side.** The
-  intermittent 4-processor failure and the phase-6 crash were one bug. `-smp 1` fails
-  identically, which is what identified it as logic rather than a race, and the fix is in
-  `task_save_publish_and_switch()`. What follows is the investigation as it stood, because
-  the reasoning that led to the fix is worth having and because several of the checks it
-  added are load-bearing.
-  It has been reduced from "a hang somewhere" to two named things, and one of them has
-  a fix that took it from 58% to 79% clean. `-smp 1` and `-smp 2` have not been seen to
-  fail.
-  **What is known.**
-  - `schedule()` has four ways to return without switching a task away. Two are
-    correct (the idle task re-picking itself; nothing to run). The other two were
-    *silent*, and a silent return is fatal to any caller that called `schedule()` in
-    order to sleep: nothing is switched to, it returns still asleep, and the one thing
-    that would have woken it is the reschedule flag that `schedule()` had just cleared.
-    Both are now reported rather than swallowed, and both were observed firing:
-    - The `TASK_RUNNABLE → TASK_RUNNING` claim on the chosen task fails. The chosen
-      task is reported with **where it came from**, and the answer is always the same:
-      `from this processor's idle task` — `cpu[index].idle` is not a task. So a
-      processor's scheduler state is being overwritten. `schedule()` now also validates
-      the idle task it is about to fall back to, and names it if it is wrong.
-    - `schedule()` is re-entered while already switching. With interrupts off across
-      the whole selection-and-switch this cannot be an interrupt, so it is a *nested
-      C call*, and the report now prints the return address of whoever did it. That
-      caller is not identified yet; it is the single most useful thing left to find.
-  - The other symptom, `sched: processor 2 has 0xffff800000100030 as its current task`,
-    is a heap payload used as a `task_t *`, and is very likely the same corruption
-    arriving from the other side.
-  - The visible failure that follows is one line:
-    `smp: task 1 (boot) is already linked into the blocked list and is being linked
-    into that same list again (state 4)` — `state 4` is `TASK_SLEEPING`, called from
-    `test_run_all` → `task_sleep_ms`. That is the sleep that never slept, above.
-  **Fixed along the way, each by measurement rather than argument.**
-  - The reschedule flag is now put back on a re-entrant `schedule()`. It was being
-    cleared and not restored, which is the sleep-never-wakes bug above. 7/12 → 11/14.
-  - The blocked list had no list-integrity checks, so removing a task that was not on
-    it set its head *and* tail to NULL and silently dropped every other sleeper.
-  - Every list walk — run queue and blocked list, head and every subsequent node —
-    checks that the node it is looking at is on the list it is walking. A walk that
-    starts on a node which is not on the list reads perfectly plausible `state`,
-    `weight` and `vruntime` fields, which is how a heap address reaches `current`:
-    not followed to, but simply the first thing looked at.
-  - **`steal_from()` no longer takes another processor's idle task.** At boot the boot
-    task is the only runnable task and the boot processor's own queue is always empty, so
-    it stole on every tick: took an idle task, ran it, and on the next tick took the next
-    one. The boot task was never picked again. Nothing looks wrong — every processor is
-    in its idle loop taking its timer — and the self-tests run on the boot task, so the
-    suite simply stopped after the scheduler came up. The in-schedule guard does not save
-    it: it defers a preemption of a processor whose own queue is empty, which is exactly
-    the processor stealing an idle task, so it never fires and there is no preemption to
-    break the cycle.
-  - **The build was the biggest single cause and it is fixed.** `make -j8 iso
-    iso-test` staged both ISOs through one shared directory; the test ISO came out
-    carrying the run ISO's `limine.conf`, so `minx.test=1` was never passed and
-    `make test` sat until the harness timed out reporting "the guest never reached
-    TEST-READY". Each ISO now stages into its own.
-  - **The cause, and the reason this entry is long: a preempted task is published to a run
-    queue before its context is finished.** `schedule()` requeues the old task *before* it
-    switches, and between the requeue and the switch there is a window -- a lock
-    acquisition, an address-space load -- in which the old task's saved stack pointer still
-    refers to a frame on the *preempting* processor's stack. A second processor that claims
-    it in that window switches to a context that is not finished: the registers and the stack
-    pointer come from wherever the preemptor had got to. A task running that way resumes
-    with the preemptor's registers, and the first thing anyone notices is a `task_t *` that
-    has become a kernel text address -- which is exactly what `cpu[index].idle` was observed
-    holding, and why the same corruption showed up three different ways (a kernel text
-    address, a heap payload, and a task whose `weight` was zero).
-  - **The fix is known and is not in the tree.** Finish the context *before* publishing the
-    task: split the switch into a save half and a restore half, and order them so that
-    between them the old task is saved, then published, then the new one restored. That is
-    not a cosmetic change to `task_switch` -- it moves the saved context out of the stack and
-    into the task, because a stack-based context is not finished until the instant it is
-    restored from, and the scheduler has to do work in between.
-  - **An attempt at that fix was made, broke the boot, and was reverted.** It is preserved in
-    `git stash` ("save-then-publish scheduler switch"); nothing committed was touched and
-    HEAD boots and reaches the graphical shell. Three mistakes were made in it, recorded here
-    because each is easy to repeat:
-    1. Publishing with a non-claimable `TASK_SWITCHING` state **deadlocks**: no picker will
-       take the task, and it only becomes claimable when it is resumed, which requires being
-       picked.
-    2. Splitting `task_switch` into a save half that *returns* leaves the six saved
-       registers **below** `schedule()`'s stack pointer, where the bookkeeping that follows
-       overwrites them. The context has to live in the task, not on the stack.
-    3. Even with the context in `task_t.regs`, a never-run task needs *both* context forms
-       populated. `task_stack_init()` builds the stack frame for `task_enter_first()`; if
-       `regs[]` is left zero then a restore loads `RSP = 0` and the machine triple-faults on
-       the first instruction -- which is what `-d int,cpu_reset` showed.
-    After (3) the fault moved to `vmm_address_space_switch()` being handed a `task->tables`
-    of `0x542618c3`, so there is at least one more cause behind it that the attempt did not
-    reach. **The next attempt should start from the stash and fix all three together, not one
-    at a time.**
-  **Also ruled out, by experiment.**
-  - A stack overflow: task and application-processor stacks were raised from 16 KiB to
-    32 KiB and the fault did not change. A guard word at the bottom of every task
-    stack plus a per-tick `%rsp` check (`sched_check_stack()`) make an overflow report
-    itself rather than corrupt a return address; it has never fired.
-  - `isr_common` losing `%rbp`. It does not lose it: `%rbp` is callee-saved and
-    survives the handler chain even when a handler switches stacks. Changing it to
-    save the frame address on the stack instead turned the intermittent fault into a
-    deterministic hang at exactly the same place, which is how the theory was
-    disproved. Reverted.
-  - `irq_restore()`'s `popfq` restoring stray trap or direction flags. Replacing the
-    whole-word `popfq` with `sti`/`cli` on the interrupt-enable bit alone hung the same
-    guest at exactly the same place, every time. Reverted.
-  **Next things to try, in order.**
-  1. Read the return address the re-entrancy report now prints and find the nested
-     `schedule()` call. That is the last unaccounted-for path by which the scheduler
-     fails to switch.
-  2. `-d int,cpu_reset -D build/q.log` on a failing run and check whether `cpu[]` is
-     written by something other than the scheduler — `cpu[index].idle` at offset 40 in
-     `sched_cpu_t` is the field observed going bad.
-  3. The boot-time hang (the serial log ends just after `sched: processor N entering
-     the scheduler`) is still unaccounted for. It has not been seen since the
-     publish-before-save fix and did not appear in the `-smp 4` matrix, but it is
-     not explained either, so it is not written off.
-
-- The framebuffer resolution is whatever Limine picks (1280x800 under QEMU
-  here); the `resolution:` option in `boot/limine.conf` is not honoured by the
-  BIOS path, so the console adapts to whatever arrives.
-- The initrd is unpacked by nothing yet: it is loaded and its size is reported,
-  but phase 8 writes the ramfs unpacker.
-- On QEMU, IRQ2 has no redirection entry of its own because the 8253's pin took
-  it; the line stays masked and claiming it fails. That is correct once the
-  8259s are masked for good, but it would need revisiting if a real IRQ2 device
-  ever appears.
-- `PTE_CACHE_*` still encodes the PAT field in bits 6:7 rather than the PAT MSR
-  or the PWT/PCD/PS combination the SDM describes, so "uncacheable" for MMIO is
-  currently write-combining. Nothing depends on the distinction yet.
-- The serial mirror emits raw ANSI escape bytes for colours and cursor moves.
-  That is honest (a dumb serial terminal renders them as characters) but it puts
-  control bytes at the start of some self-test result lines, so the harness
-  cross-checks the guest's own tally rather than trusting the line count alone.
-- `make run` opens a GUI window; automated verification uses `make test`, which
-  is always headless.
-
-- **`phase9-sh`: `fork()` sometimes returns non-zero in the child.**  The one remaining
-  `make WITH_SHELL=1 test` failure.  The shell itself gets through quoting, assignments,
-  parameter expansion, arithmetic, `for`/`while`/`until`/`case`, functions, `cd`, every
-  redirection, `&&`/`||`, subshells and a nested command substitution, and its heap
-  corruption (`cmd_free()`'s double free) is fixed.  Full detail, including the frame
-  measurements that rule the obvious explanations out, is in "Phase 9, where it got to".
-- **One kernel redzone report per run**: a 64-byte allocation written one byte past its
-  end, released by `node_free()` as a symlink target whose node holds a four-character
-  path.  **Not diagnosed**; `node_alloc()` does not bounds-check `free_head` before
-  indexing the pool, which is the shape a stale pool index would take.
-- **`CR4.WP` is off because QEMU refuses it**, not because it was judged unnecessary.
-  It is the architectural answer to every ring-0 write into a user page, this kernel
-  cannot have it, and so it prepares those three writes explicitly instead.  If a later
-  QEMU models the bit, setting it is the better fix and the three `syscall_prepare_write()`
-  calls can stay as they are: they are harmless when the page is already writable.
-- **`sys_wait()` is reachable with `options != 0` from a caller that passes
-  zero.**  An early run showed `shtest`'s `waitpid(54, &st, 0)` returning 0
-  while its child was still alive — the only path to 0 in `sys_wait()` is
-  `WNOHANG` — and a second run showed it returning 0 for a child that had *not*
-  been collected.  Since the same run had a child writing over the caller's
-  `pid` variable (the `fork()` fault above), the likeliest reading is that the
-  register was not what the trace said.  **Not diagnosed.**  `sys_wait()`
-  currently trusts `arg(regs, 2)`; the selector and the options are read from
-  the frame with no cross-check, and a frame that is one instruction stale would
-  be read as a valid `WNOHANG`.
-- **`vmm_address_space_destroy()` frees only tables, never the pages they
-  map.**  That is deliberate and commented, and it means every frame a process
-  ever mapped stays out of the pool for the life of the machine.  Correct, and
-  it will need a page reference count before a long-running machine can afford
-  it.
-- **`ramfs_grow()` is named in `ramfs.h` and does not exist.**  The header says
-  the node pool is a fixed array and that being wrong is "a refill rather than a
-  failure", and then describes a refill function.  There is none: `node_alloc()`
-  returns 0 when the free list is empty, which is what the "no node left" report
-  is.  With 2048 nodes and the pool now locked that is further off than it looks,
-  but the promise in the header is not kept.
-
-## Needs human decision
-
-1. **Push access.** Every commit from phase 1 through phase 8 is local. `git push origin
-   HEAD` needs a username this environment does not have. Nothing else is blocked on it.
-
-2. **`-smp 8` under TCG still faults intermittently.** Pre-existing, unchanged by phase 8,
-   and recorded rather than hidden: `-smp 4` (the default, and what `make test` uses) is
-   clean, three runs in a row at 43/43. Nothing has been diagnosed for the 8-processor case
-   because nothing in the tree depends on it — but it is a real open item, not a non-issue.
-
-## Test commands
-```
-make test        # headless boot, in-kernel self tests, framebuffer dump; non-zero on failure
-make WITH_SHELL=1 test   # ...with /bin/sh and shtest in the image: 45 checks, shtest included
-make test-host   # host-compiled allocator fuzz test + the shell's parser against bash -n
-make test-parser # just the parser harness; a second or two, and it names the line
-make run         # graphical console in a QEMU window (SMP=4 MEM=512M by default)
-GUI=0 make run   # headless: serial console only
-make debug       # boot paused for GDB (tools/gdb-run.sh drives it in batch)
-sh tools/shot.sh build/minx.iso /tmp/shot.ppm 10   # screenshot the framebuffer
-
-# Driving the shell at the graphical console, headlessly.  The banner is an argument
-# because WITH_SHELL=1 does not print the kernel's.
-sh tools/type-test.sh build/minx.iso /tmp/t.log 'echo one; x=42; echo "x=$x"' 'minx sh'
-
-# The matrix a phase claim rests on: repeated clean runs at the default processor count.
-for i in 1 2 3; do
-  timeout 300 qemu-system-x86_64 -m 512M -smp 4 -no-reboot -boot d \
-    -drive file=build/minx-test.iso,format=raw,if=none,id=c -device ide-cd,drive=c \
-    -serial file:build/m$i.log -vga std -display none -accel tcg,thread=multi
-  printf 'run %s: %s pass, %s fail\n' "$i" \
-    "$(tr -d '\0' < build/m$i.log | grep -c '^PASS')" \
-    "$(tr -d '\0' < build/m$i.log | grep -c '^FAIL')"
-done
-sh tools/type-test.sh build/minx.iso /tmp/t.log 'help
-keys'                                                 # type at the console headlessly
-```
-
-## Push status
-**Still not pushed. Everything through phase 9 is committed locally only.**
-
-`git push origin HEAD` fails in this environment with
-`could not read Username for 'https://github.com'` — no credential helper and no
-token available, and AGENTS.md forbids putting tokens in files or remotes. Retried
-at the end of phase 8, again after the four kernel fixes below, again after this
-session's nine, and again after the nine commits that finished phase 9, and again after the `exec`
-arena fix; same answer every time. Every phase since phase one has
-committed locally for the same reason (see the commit "docs: record phase one push
-limitation").
-
-This is the one thing in this tree that is not a technical problem and the only
-thing that cannot be worked around: the work is all here, in order, with the
-co-author trailer on every commit, and one `git push` away.
-
-## Known bugs
 
 **The shell's `.bss` bug is FIXED.  Three kernel bugs were behind it, and all three
 are fixed and committed.**

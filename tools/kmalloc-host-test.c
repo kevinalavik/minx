@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "types.h"
 #include "kmalloc.h"
 #include "spinlock.h"
 
@@ -31,29 +32,29 @@ static unsigned char arena[ARENA] __attribute__((aligned(4096)));
 int pmm_ready(void) { return 0; }
 uint8_t *pmm_alloc_pages(size_t frames) { (void)frames; return NULL; }
 
-/* Layout of the kernel's block header, mirrored here so the fuzz can inspect
- * the block behind a corrupted allocation.  Must match kernel/mm/kmalloc.c. */
-struct host_block {
-    struct host_block *prev;
-    struct host_block *next;
-    struct host_block *free_next;
-    struct host_block *free_prev;
-    size_t             size;
-    unsigned char      is_free;   /* bool in the kernel: one byte, at 0x28 */
-};
-#define HOST_HEADER_SIZE 48u
+/* The block header is the kernel's own, not a mirror of it.
+ *
+ * The mirror -- a struct written field for field here, with a `_Static_assert` that it had
+ * not drifted -- was the right idea and the wrong mechanism.  It caught the header growing
+ * only when the test was rebuilt, and it had already been wrong once: it said the header
+ * was 48 bytes and knew nothing about the redzone, so the arithmetic that checks an
+ * allocation was 16 bytes short and failed a block whose header was exactly right.
+ *
+ * The test includes `kmalloc.h` and uses `km_block_t`.  There is one definition of the
+ * layout now, so there is nothing to drift. */
 
-_Static_assert(sizeof(struct host_block) == HOST_HEADER_SIZE,
-               "mirror header size drifted from kernel/mm/kmalloc.c");
+typedef km_block_t host_block;
+#define HOST_HEADER_SIZE KM_HEADER_SIZE
+
 
 static void report_corrupt(const char *where, int slot, const unsigned char *p,
                            size_t len, size_t at) {
-    struct host_block *b = (struct host_block *)(void *)(p - HOST_HEADER_SIZE);
+    km_block_t *b = (km_block_t *)(void *)(p - HOST_HEADER_SIZE);
     printf("FUZZ CORRUPTION (%s): slot %d len=%zu byte=%zu value=%02x "
            "expected=%02x\n",
            where, slot, len, at, p[at], (unsigned char)0);
     printf("  block=%p size=%zu free=%d prev=%p next=%p\n",
-           (void *)b, b->size, b->is_free, (void *)b->prev, (void *)b->next);
+           (void *)b, b->size, b->free, (void *)b->prev, (void *)b->next);
     printf("  payload=%p  header at %p\n", (const void *)p, (void *)b);
     kmalloc_dump();
 }
@@ -104,16 +105,28 @@ static void fuzz(void) {
             slots[i].tag = tag;
             slots[i].live = 1;
 
-            /* The header must describe this allocation: at least the rounded
-             * request, and never so much more that a split was skipped when one
-             * was clearly possible. */
-            struct host_block *b =
-                (struct host_block *)(void *)(p - HOST_HEADER_SIZE);
-            size_t need = (len + 15u) & ~(size_t)15u;
-            if (b->is_free || b->size < need ||
+            /* The header must describe this allocation: at least the rounded request
+             * *plus the redzone*, and never so much more that a split was skipped when
+             * one was clearly possible.
+             *
+             * The redzone is the whole of what was wrong here.  This computed `need` as
+             * the rounded request alone, so it was 16 short of what the allocator
+             * promises, and a block of exactly `need + header + align` -- 832 + 48 + 16 =
+             * 896 -- failed the "no more than that" test while being precisely right: the
+             * allocator declined a split that would have left a zero-length remainder.
+             *
+             * `KM_REDZONE` and `KM_PATTERN` come from `kmalloc.h` rather than from a
+             * second copy here.  That copy is what let the two drift apart, and it drifted
+             * the moment a redzone was added to the kernel allocator and not to the
+             * arithmetic that checks it. */
+            km_block_t *b =
+                (km_block_t *)(void *)(p - HOST_HEADER_SIZE);
+            size_t need = ((len + (KM_ALIGN - 1u)) & ~(size_t)(KM_ALIGN - 1u)) +
+                          KM_REDZONE;
+            if (b->free || b->size < need ||
                 b->size >= need + HOST_HEADER_SIZE + 16u) {
                 printf("FUZZ BAD HEADER after alloc: slot %d len=%zu "
-                       "size=%zu free=%d\n", i, len, b->size, b->is_free);
+                       "size=%zu free=%d\n", i, len, b->size, b->free);
                 kmalloc_dump();
                 exit(1);
             }

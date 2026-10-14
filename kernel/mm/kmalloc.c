@@ -21,41 +21,6 @@
  * the atomic 128-bit FPU/SSE context areas and for the x87 control word.
  */
 
-#define KM_ALIGN       16u
-#define KM_HEADER_SIZE ALIGN_UP(sizeof(km_block_t), KM_ALIGN)
-
-/* Bytes past the end of every payload that nobody is ever told about.
- *
- * A write past the end of a block lands in the *next* block's header, or in the next
- * allocation's payload, and neither of them is anywhere the writer can see.  What it looks
- * like is memory corruption with no witness: a task that came back from `fork()` holding
- * somebody else's number, a free list holding an address in the program's own text, a test
- * that fails in a different place each run.
- *
- * This kernel hit exactly that, and the interesting part is *which* write it was: the
- * shell's `cmd_free()` released `c->stages` and `c->arms` a second time, and the second
- * release merged the wrong neighbour into a block that was already on the free list.  That
- * is a user-space bug, and it is in the shell rather than here.
- *
- * What made it findable was giving the user-space allocator the same redzone, which named
- * the caller at the `free()` instead of leaving a corrupt free list to be explained months
- * later.  The kernel heap gets the same thing, because it is the allocator that has no
- * other way of saying "that was not yours": the shell's corruption is fixed, and a kernel
- * one would be invisible in exactly the same way. */
-#define KM_REDZONE     16u
-#define KM_PATTERN     0xA5
-
-typedef struct km_block km_block_t;
-
-struct km_block {
-    km_block_t *prev;        /* physical neighbour, NULL at a region's start */
-    km_block_t *next;        /* physical neighbour                       */
-    km_block_t *free_next;   /* free-list linkage                        */
-    km_block_t *free_prev;
-    size_t      size;        /* payload bytes, excluding this header      */
-    bool        free;
-};
-
 static km_block_t *free_list;
 static size_t total_bytes;
 static size_t used_bytes;
@@ -241,9 +206,17 @@ void *kmalloc(size_t size) {
         free_list_remove(b);
 
         /* Split when the remainder can hold a header plus a usable payload.
-         * The new tail has to be spliced *into* the chain in front of whatever
-         * used to follow b: dropping b->next here would orphan the blocks after
-         * it, and a later coalesce would then merge across a live header. */
+         *
+         * The new tail has to be spliced *into* the chain in front of whatever used to
+         * follow b: dropping b->next here would orphan the blocks after it, and a later
+         * coalesce would then merge across a live header.
+         *
+         * When there is not enough room, `b->size` is deliberately left at its capacity.
+         * Shrinking it to the request would strand the few bytes between them inside a live
+         * block where no block describes them: with a 48-byte header and a 16-byte
+         * alignment that is up to 63 bytes per allocation, and a walk of the arena found
+         * 896 of them gone after one fuzz run.  A block is allowed to be bigger than what
+         * was asked of it -- that is what `want` is for. */
         if (b->size >= need + KM_HEADER_SIZE + KM_ALIGN) {
             km_block_t *tail = (km_block_t *)((uint8_t *)payload_of(b) + need);
             km_block_t *follows = b->next;
@@ -262,6 +235,8 @@ void *kmalloc(size_t size) {
 
             free_list_insert(tail);
         }
+
+        b->want = want;
 
         used_bytes += b->size;
         memset(payload_of(b), 0, b->size);
@@ -330,17 +305,30 @@ void kfree(void *ptr) {
      * either way -- refusing would leak it and hide the fault behind an allocation
      * failure somewhere else. */
     {
-        const uint8_t *z = (const uint8_t *)payload_of(b) + (b->size - KM_REDZONE);
+        /* From `want`, not from `size`.
+         *
+         * A block may be bigger than the allocation it is holding -- when the leftover
+         * could not hold a header of its own, the capacity stays where it was -- and the
+         * redzone is poisoned immediately after the *request*, so those are two different
+         * places.  Reading `b->size - KM_REDZONE` looked past the poison into memory that
+         * was merely zeroed, and so reported a block written past its end on *every*
+         * unsplit free: always offset zero, always a zero where the pattern should have
+         * been.  A check that is always wrong teaches its reader to ignore it, which is
+         * worse than having no check at all.
+         *
+         * `want` is only meaningful for a live block, and this is a live block: a free one
+         * returns above. */
+        const uint8_t *z = (const uint8_t *)payload_of(b) + b->want;
         size_t at = 0;
 
         while (at < KM_REDZONE && z[at] == KM_PATTERN)
             at++;
 
         if (at < KM_REDZONE) {
-            kprintf("[warn] heap: block %p (%lu bytes) was written past its end: "
-                    "%#x at +%lu, freed from %p\n", ptr,
-                    (unsigned long)(b->size - KM_REDZONE), z[at],
-                    (unsigned long)(b->size - KM_REDZONE + at),
+            kprintf("[warn] heap: block %p (%lu bytes, capacity %lu) was written past "
+                    "its end: %#x at +%lu, freed from %p\n", ptr,
+                    (unsigned long)b->want, (unsigned long)b->size, z[at],
+                    (unsigned long)(b->want + at),
                     __builtin_return_address(0));
         }
     }
@@ -408,6 +396,39 @@ size_t kmalloc_largest_free(void) {
 void kmalloc_dump(void) {
     kprintf("kmalloc: total=%zu free=%zu used=%zu regions=%u\n",
             total_bytes, free_bytes, used_bytes, region_count);
+
+    /* Every byte of every region, accounted for by walking the physical chains.
+     *
+     * `free_bytes` and `used_bytes` are both maintained incrementally, and an incremental
+     * counter is exactly the thing that cannot tell "the accounting drifted" from "the
+     * bytes are gone" -- it says the same number either way.  Walking the blocks is the only
+     * way to tell them apart, and it is what found the 896 bytes a too-eager split was
+     * stranding inside live blocks where no block described them.
+     *
+     * A region's head is the one block whose `prev` is NULL.  There is no array of them:
+     * `kmalloc_attach_region()` only links the head onto the free list, so the heads are
+     * found there. */
+    {
+        size_t sum_free = 0, sum_live = 0, nblk = 0;
+
+        for (km_block_t *h = free_list; h != NULL; h = h->free_next) {
+            if (h->prev != NULL)
+                continue;               /* not a region head */
+
+            for (km_block_t *b = h; b != NULL; b = b->next) {
+                nblk++;
+
+                if (b->free)
+                    sum_free += b->size;
+                else
+                    sum_live += b->size;
+            }
+        }
+
+        kprintf("kmalloc: walk blocks=%zu free=%zu live=%zu headers=%zu sum=%zu\n",
+                nblk, sum_free, sum_live, nblk * KM_HEADER_SIZE,
+                sum_free + sum_live + nblk * KM_HEADER_SIZE);
+    }
 
     unsigned i = 0;
     for (km_block_t *b = free_list; b != NULL; b = b->free_next) {
