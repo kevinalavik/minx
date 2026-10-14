@@ -341,7 +341,7 @@ ALL_BIN := $(USER_BIN) $(TEST_BIN)
 # Directory tree shipped in the initrd, built into build/initrd-root.
 INITRD_ROOT := $(BUILD)/initrd-root
 
-.PHONY: all kernel userspace iso iso-test run test test-host debug clean \
+.PHONY: all kernel userspace iso iso-test run test test-host test-parser debug clean \
         distclean help fetch font tools-check
 
 ########################################################################
@@ -358,7 +358,8 @@ help:
 	@echo "  iso        build $(ISO)"
 	@echo "  run        boot in QEMU (GUI=$(GUI) SMP=$(SMP) MEM=$(MEM))"
 	@echo "  test       headless automated test run; non-zero exit on failure"
-	@echo "  test-host  host-compiled unit tests (allocator, formatting)"
+	@echo "  test-host  host-compiled unit tests (allocator, formatting, sh parser)"
+	@echo "  test-parser  the shell's parser against bash -n (fast; needs bash)"
 	@echo "  debug      boot paused for GDB (SMP=$(SMP) MEM=$(MEM))"
 	@echo "  clean      remove build output"
 	@echo "  distclean  clean + remove fetched third-party assets"
@@ -813,8 +814,20 @@ test: $(ISO_TEST)
 # Host-compiled unit tests for the parts of the kernel that do not need a CPU
 # to exercise.  Fast, and they catch allocator and formatting bugs without a
 # 30-second boot cycle.
+#
+# `test-parser` is the shell's lexer and parser, compiled *unmodified* against the host
+# compiler and the host libc and compared against `bash -n` over a corpus.  It is here
+# for the same reason as the allocator test and more: five parser defects each cost a
+# five-minute boot to reproduce, and all of them showed the same sentence in the guest.
+# It needs bash, and it says so and fails rather than quietly passing without it.
 test-host: $(BUILD)/kmalloc-host-test
 	$(BUILD)/kmalloc-host-test
+	sh tools/sh-parser-test.sh
+
+.PHONY: test-parser
+
+test-parser:
+	sh tools/sh-parser-test.sh
 
 $(BUILD)/kmalloc-host-test: tools/kmalloc-host-test.c $(KERNEL_DIR)/mm/kmalloc.c \
                             $(KERNEL_DIR)/lib/string.c $(KERNEL_DIR)/lib/kprintf.c
