@@ -1079,12 +1079,28 @@ int expand_assign(const char *word, char **out) {
 
     expand_common(eq + 1, &one, 1);
 
+    /* The string is *moved* to the caller: not copied, and not freed.
+     *
+     * It used to be freed here as well as handed over, on the reasoning that `one` was a
+     * temporary.  It is not a temporary: `*out` is that very pointer, so the caller got a
+     * block that was already back on the allocator's free list, and its own `free()` --
+     * the `free(value)` at the bottom of the assignment loop in `expand_command()` -- was
+     * the second release of the same block.
+     *
+     * That is neither a leak nor an immediate crash: a block freed twice that happens to
+     * be larger than the block being freed walks the free list into a ring of one, and the
+     * next allocation or free above it spins for ever.  What it looked like was
+     * `sh script.sh` hanging on the first `x=42` in the script -- and the report blaming
+     * the *kernel*, because the shell's `waitpid` never returned and the task list said a
+     * task was blocked in `wait`.  It took the task list, the script the shell had been
+     * given, the allocator's disassembly and a print of the offending block to arrive at a
+     * function in the shell.
+     *
+     * The array is still ours to free: `expand_common()` allocated it and nothing after
+     * this line can reach it. */
     *out = (one != NULL && one[0] != NULL) ? one[0] : strdup("");
 
-    if (one != NULL) {
-        free(one[0]);
-        free(one);
-    }
+    free(one);
 
     return 0;
 }
