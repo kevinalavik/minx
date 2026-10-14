@@ -32,8 +32,28 @@ typedef uint64_t pte_t;
 #define PTE_WRITETHRU   (1ull << 3)
 #define PTE_CACHE_MASK  (3ull << 6)
 #define PTE_GLOBAL      (1ull << 8)
+#define PTE_COW         (1ull << 9)
 #define PTE_HUGE        (1ull << 7)
 #define PTE_NX          (1ull << 63)
+
+/* `PTE_COW` is ours, not the processor's: bit 9 is one of the three the architecture leaves
+ * available to the operating system.  It says "this page is read-only because a `fork` gave
+ * its write permission up, and a task's copy-on-write list has an entry for it".
+ *
+ * It is not decoration.  Read-only on its own cannot tell the two cases apart: a page that
+ * was never mapped writable (the text of a program, a shared read-only mapping) may be
+ * shared with a twin outright, while a page that is read-only *because of a fork* must have a
+ * private page table under it, or the copy that fixes one process up rewrites the other's
+ * mapping and the two end up writing to the same page -- which is the one thing copy-on-write
+ * exists to prevent.
+ *
+ * Without the bit, `vmm_fork_aspace()` duplicated a table for the second kind and shared it
+ * for the first, which is right.  With the second kind's pages arriving at the second fork
+ * already read-only, the second `fork` shared their table with the child, the child took a
+ * copy-on-write fault and wrote its replacement into the shared table, and the parent --
+ * whose entry now pointed at the child's private page and was writable -- wrote there too.
+ * The shell's two nested `$( )` children did exactly that, and the parent's allocator
+ * followed the list into the middle of its own text segment. */
 
 #define PTE_ADDR_MASK   0x000ffffffffff000ull
 
@@ -57,6 +77,7 @@ static inline pte_t pte_make(uint64_t phys, uint64_t flags) {
 
 static inline bool pte_present(pte_t e)    { return (e & PTE_PRESENT) != 0; }
 static inline bool pte_writable(pte_t e)   { return (e & PTE_WRITE) != 0; }
+static inline bool pte_cow(pte_t e)        { return (e & PTE_COW) != 0; }
 static inline bool pte_user(pte_t e)       { return (e & PTE_USER) != 0; }
 static inline bool pte_huge(pte_t e)       { return (e & PTE_HUGE) != 0; }
 static inline bool pte_nx(pte_t e)         { return (e & PTE_NX) != 0; }

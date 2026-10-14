@@ -137,6 +137,19 @@ typedef struct task {
      * `exit_code` on its own. */
     volatile int32_t exited;
 
+    /* A wake that arrived while this task was not yet waiting.
+     *
+     * Set by `unblock()` when its target is not `TASK_WAITING`, and consumed by
+     * `task_block_register()`, which then declines to block.  It closes the window between
+     * a caller testing a condition and registering on it, which no amount of "interrupts
+     * off" closes on this machine: the wake comes from another processor.
+     *
+     * The case that needed it is `wait`.  A parent scans its children, sees none exited and
+     * blocks; a child that exits in the gap wakes a task that is still running, so the wake
+     * went nowhere, and the parent slept for ever with its child already dead.  `shtest`
+     * hung there; `init` spawned shells nobody was waiting for. */
+    volatile int32_t woken;
+
     /* The pages this address space gave up write permission on for its twin, or NULL.
      *
      * Owned by the task and freed with it.  A page fault consults it through the running
@@ -447,10 +460,13 @@ void task_sleep_ms(uint64_t ms);
 /* Block until something calls task_wakeup() on this task. */
 void task_wait(void);
 
-/* Put the calling task on the blocked list without switching away, so a caller that has
- * to test a condition and register atomically can.  `task_wait()` is this plus
- * `schedule()`. */
-void task_block_register(void);
+/* Put the running task on the blocked list without yet switching away.
+ *
+ * Returns false, leaving the task runnable, when a wake arrived between the caller's test
+ * of its condition and this registration -- see `task_t.woken`, which exists for exactly
+ * that window.  A caller that has just tested a condition must treat false as "do not
+ * block" and go round again.  `task_wait()` is this plus `schedule()`. */
+bool task_block_register(void);
 
 /* --- wait queues -------------------------------------------------------- */
 
@@ -531,6 +547,10 @@ uint32_t wait_queue_count(const wait_queue_t *q);
  * and the walk are two separate calls and the second may see more. */
 unsigned task_count(void);
 task_t  *task_by_index(unsigned i);
+
+/* Print every task, one line each.  A hang is a relationship between tasks, and only the
+ * whole list shows which one is waiting for which; see the comment above the definition. */
+void tasks_report(void);
 
 /* Take a task off the all-tasks list before freeing it.  A task that has *exited* is not
  * removed -- `wait` and `ps` are still looking for it there -- so this is only for a task
