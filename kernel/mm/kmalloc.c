@@ -245,6 +245,30 @@ void *kmalloc(size_t size) {
         break;
     }
 
+    if (got == NULL) {
+        /* Say so, once.
+         *
+         * An allocation that fails silently is the hardest kind of failure to chase, and
+         * it is silent by default here because every caller already has to handle NULL --
+         * the report is about *where* the heap went, and the caller is somewhere else and
+         * no closer to it.  This is what `ls` on a directory was: `vfs_open()` could only
+         * return ENOMEM from here, and `open()` on a missing file correctly returned
+         * ENOENT, so the caller could tell the two apart only by guessing.  It could not.
+         *
+         * Once, not every time: a program in a loop that cannot allocate would otherwise
+         * fill the console with the same line and bury everything after it. */
+        static bool oom_reported;
+
+        if (!oom_reported) {
+            oom_reported = true;
+            kprintf("[warn] heap: out of memory asking for %lu bytes; %lu free, %lu used, "
+                    "%lu total, largest free %lu\n",
+                    (unsigned long)size, (unsigned long)free_bytes,
+                    (unsigned long)used_bytes, (unsigned long)total_bytes,
+                    (unsigned long)kmalloc_largest_free());
+        }
+    }
+
     spin_unlock_irqrestore(&heap_lock, lflags);
     return got;
 }
