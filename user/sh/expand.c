@@ -66,14 +66,37 @@ static void sb_putc(sbuf_t *b, char c, int quoted) {
     if (b->n + 2 > b->cap) {
         size_t want = b->cap ? b->cap * 2 : 32;
         char  *gp = realloc(b->p, want);
-        char  *gq = realloc(b->q, want);
+
+        /* Only asked for if the text was had.  Growing the flags on their own would move a
+         * buffer whose partner no longer exists, and the failure path below would then have
+         * to work out which of the two it was holding. */
+        char  *gq = gp != NULL ? realloc(b->q, want) : NULL;
 
         if (gp == NULL || gq == NULL) {
-            /* Out of memory.  Keeping the text and losing the flag is better than losing
-             * the text: a word with the wrong quoting is still a word, and a shell that
-             * freed its own buffer here would have nothing to show the error with. */
+            /* Out of memory, and every field of the buffer now says so.
+             *
+             * The comment this replaces said the opposite: "keeping the text and losing
+             * the flag is better than losing the text".  The code did neither.  It freed
+             * both buffers and returned with `b->p` and `b->q` still pointing at storage
+             * `realloc()` had already released -- `b->p` in particular, because a
+             * successful `realloc()` frees the block it moved out of -- and with `cap` set
+             * to zero while `n` was left at whatever it had been.
+             *
+             * So the next `sb_putc()` did two things at once.  It wrote `b->p[b->n]` into a
+             * block that was already on the allocator's free list, and it grew to a
+             * capacity of 32 and then wrote at index `n`, which by then could be larger than
+             * 32.  Those are the two things the allocator reported: a block handed straight
+             * back out after being freed, and a write one byte past the end of a 32-byte
+             * block.
+             *
+             * Leaving `n` alone is not the conservative choice either.  The text really is
+             * gone, so `n` has to go with it -- a buffer that counts characters it no longer
+             * holds is the bug, not the absence of one. */
             free(gp != NULL ? gp : b->p);
             free(gq != NULL ? gq : b->q);
+            b->p = NULL;
+            b->q = NULL;
+            b->n = 0;
             b->cap = 0;
             return;
         }

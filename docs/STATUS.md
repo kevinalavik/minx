@@ -987,223 +987,62 @@ attribution was the part that said something about the lock.
 
 ## Known bugs
 
-**The heap's redzone check was reading the wrong address. Now fixed, and it names two bugs in
-the shell.**
+**The shell still corrupts its own heap. Nine reports, all from the same allocator, all
+still open.**
 
-`kmalloc()` poisons the redzone at `payload + want`, immediately after the caller's rounded
-request.  The check on free read `payload + (b->size - KM_REDZONE)`.  Those are the same
-address only when the block was split down to exactly the request -- and when the leftover
-could not hold a header of its own, `b->size` kept its capacity, so they were different
-places.  The check therefore looked past the poison into memory that had merely been zeroed,
-and reported a block written past its end on **every** unsplit free: always offset zero,
-always a zero where the pattern should have been.
-
-That is worse than no check.  A check that is always wrong teaches its reader to ignore it,
-which is exactly what happened -- it had been reporting this for as long as there was a
-redzone, and nobody read the output.
-
-**What it says once it works**, from the guest serial log:
+Once the heap's redzone check read the right address (see "Known bugs" history in
+`docs/DECISIONS.md`), it began naming faults that had been there all along. Nine remain, and
+they are the same shape each time:
 
 ```
-free:  block 0x2403640 (32 bytes) was written past its end: 00 at +32, freed from 0x40940c
-malloc: block 0x2405840 (1984 bytes) was written after being freed: 90 at +0;
-        handing it to 0x405e8c
+free:  block 0x24036a0 (32 bytes) was written past its end: 80 at +32, freed from 0x40944c
+malloc: block 0x24053f0 (352 bytes) was written after being freed: 30 at +0;
+        handing it to 0x4099fb
 ```
 
-Both addresses resolve in `sh`:
+Both addresses resolve in `sh`: `0x40944c` is **`cmd_free()`** and `0x4099fb` is
+**`parse_pipeline()`**.
 
-- **`cmd_free()` at `user/sh/` writes one byte past the end of a 32-byte block it is
-  freeing.**  This is the same function `kernel/include/kmalloc.h` already records as having
-  had a double free -- "the shell's `cmd_free()` released `c->stages` and `c->arms` a second
-  time" -- so it is the third distinct defect in one function, and the file that documents
-  the first two is in the same tree.
-- **`sb_putc()` writes to a block that has already been freed** -- a use after free, handed
-  straight back out by the next allocation.
+**One of them is fixed.** `sb_putc()` in `user/sh/expand.c` grew its text buffer and its
+quote-flag buffer with two separate `realloc()` calls, and on failure freed both and
+returned -- leaving `b->p` and `b->q` pointing at storage `realloc()` had already released,
+with `cap` zeroed and `n` unchanged. The next `sb_putc()` then wrote into a block already on
+the free list, and grew to 32 before writing at an index `n` could already be past. The
+comment above that branch described the opposite behaviour from the one the code implemented,
+which is how it survived; every field is now cleared together.
 
-Neither fails a test today: both are warnings on stderr and the tests do not read stderr.
-That is why `shtest` is 53 of 53 while the shell is corrupting its own heap underneath it.
+**What is left, and what has been ruled out**, so the next attempt does not repeat it:
 
-**Not yet diagnosed.**  Both are in the shell and both are about `cmd_free()`'s ownership
-rules -- what it frees, in what order, and what the string builder holds a pointer to across
-a `cmd_free()`.  The fix is in `user/sh/`, not in the allocator, which is now telling the
-truth.
+- **Not `add_word()`, `add_assign()` or `add_pattern()`** -- the three places the word, assign
+  and pattern arrays grow. All three `realloc()` to `n + 2` slots and write only indices `n`
+  and `n + 1`, which is in bounds at every size. Checked individually.
+- **Not `cmd_free()`'s element loops** -- the pattern strings are *borrowed* from the lexer
+  and the loop frees only the array itself, which is `realloc()`'d. The comment above that
+  loop reads as though it says otherwise, which is worth fixing for the next reader.
+- **Not the `words` array.** A 32-byte block is two pointers once the 16-byte redzone is
+  accounted for, and the three arrays that size all write in bounds.
+
+**So: a write one byte past the end of a two-pointer array, freed through `cmd_free()`, and
+a use-after-free whose victim is handed to `parse_pipeline()`.** The next step is to find
+what writes `array[2]` into a two-element array, and the fastest way to that is a redzone
+check in the shell's own allocator path rather than more reading -- the same thing that made
+this findable.
 
 **`make test-host` had never run. It does now, and it passes.**
 
 It did not link, because `kprintf.c` had grown a console lock and a silent-period check and
-the host harness had never been given those symbols.  Supplying them was the easy half.  The
+the host harness had never been given those symbols. Supplying them was the easy half. The
 other half was that the harness then died with SIGSEGV before printing anything:
 `kmalloc_attach_region()` takes the allocator lock with `spin_lock_irqsave()`, which does
-`cli`, which is privileged and raises SIGSEGV in user mode.  `io.h` now has a host path for
-`irq_save()`/`irq_restore()`, selected by `__minx_host__`, which only the harness's build line
-defines.
+`cli`, which is privileged and raises SIGSEGV in user mode. `io.h` now has a host path for
+`irq_save()`/`irq_restore()`, selected by `__minx_host__`, which only the harness's build
+line defines.
 
-With that fixed the gate runs, and it found three things that are now also fixed: the test's
-own arithmetic was a redzone short and had failed a block whose header was exactly right;
-the kernel allocator stranded 896 bytes per fuzz run inside live blocks where no block
-described them; and `kmalloc_dump()` now walks every block of every region and accounts for
-every byte, because an incremental counter says the same number whether the accounting
-drifted or the bytes are gone.
+With that fixed the gate runs and is green: 20000 fuzz rounds clean, every byte accounted
+for, and the shell parser still agrees with `bash -n` on all 139 lines.
 
+**One documented flake, still open:** `libctest`'s "PATH is set before main()" fails
+intermittently -- seen in this session in three runs out of about ten, and never twice in a
+row. It is `__libc_start_main()` adopting an environment that is not there, which points at
+the loader's stack layout rather than at the libc. Unreproduced since the last run.
 
-**The shell's `.bss` bug is FIXED.  Three kernel bugs were behind it, and all three
-are fixed and committed.**
-
-The first theory on this page — that `load_segment()` conflated a page's distance from the
-segment's start with the segment's offset into the page — was **right**, and the note that
-said it was wrong was wrong about that.  What was true, and what is still true, is that
-rewriting the whole function broke `fstest`; the two are not the same claim.  Three
-separate defects, each invisible on its own:
-
-1. **`file_t` had a reference count that nothing ever moved.**  `vfs_open()` set
-   `refs = 1` and `vfs_close()` freed the file whatever the count said, while `dup`, `dup2`
-   and `fork` all made a second descriptor name the same `file_t` without accounting for
-   it.  `int fd = open("/dev/console"); dup2(fd,0); dup2(fd,1); dup2(fd,2); close(fd);` —
-   which is exactly what `/sbin/init` does — freed the file out from under all three.  The
-   freed block stayed readable long enough that init kept working, and the failure turned up
-   later, as `EBADF` on a write to the console in a child that had inherited the descriptor.
-   Fixed by making `vfs_close()` decrement and free at zero, and retaining in `dup`, `dup2`
-   and `fd_table_copy()`.
-2. **`exec` did not carry the program break across the image swap.**  `program_exec_into()`
-   moved the page tables, the frame, the stack and the saved `rsp` from the scratch task but
-   not `brk`.  An `exec`'d process kept the previous program's break — zero for one the
-   kernel started — so `sbrk(0)` answered zero, the allocator took that as the base of its
-   heap, and the first `strdup()` wrote its string over a hundred kilobytes of `.bss`.
-   That is what put pointers into `sh`'s variable table.  A program started by the *kernel*
-   is loaded onto the task itself, where `elf_load()` sets the break directly, which is why
-   every test in the tree passed and `sh` — the one program init starts with `exec` — did
-   not.
-3. **The loader copied file bytes into the part of a segment the file does not cover.**
-   `load_segment()` decided whether a page held any of the file with arithmetic on `filesz`
-   alone, which says "copy `filesz` bytes" for as long as `filesz < page_size` — true of
-   every writable segment a linker produces.  Each `.bss` page was copied from an offset
-   the segment's file data ended long before, and for a segment at the end of the file,
-   from past the end of the image buffer.  About 0x170 bytes of whatever the kernel's
-   memory held were dropped at the start of every `.bss` page, silently, with the loader
-   reporting success.
-
-All three are committed separately with the reasoning in the commit messages.  `sh` now
-boots from a normal image, prints its banner and shows a prompt.
-
-**`sh <script>` produces nothing: the program starts and its output is lost (open).**
-
-`shtest` writes a script, forks, `dup2`s a file onto descriptor 1, `execve`s `/bin/sh` with
-the script as `argv[1]`, and reads the output back.  The output file exists and is **zero
-bytes**; the script itself is present with its correct 29-byte length; the script exits 0;
-and the shell's prompt, banner and every line of the script are absent.
-
-Much of this has been established with GDB, and the answer is no longer "the child does not
-start":
-
-- **The exec works completely.**  With a breakpoint on sh's own entry point, it is reached,
-  in ring 3: `Breakpoint 2, 0x000000000040ac90`, `$cs = 0x23`.  Nothing is wrong with the
-  loader, the swap or the return.
-- **The task is set up correctly.**  At the end of `program_exec_into()` for `/bin/sh`,
-  task 30 has `state = 3`, `started = false`, `saved_in_user = 1`, `saved_rsp =
-  0x7fffffffefa0` (a user address), `user_frame` pointing into the direct map of the new
-  stack's top page, and `brk = 0x2403000`.
-- **`do_exec()` patches the frame it is about to return on.**  At `kernel/lib/syscall.c:766`
-  the frame is a valid ring-3 frame on a kernel stack — `cs = 0x23`, `rsp = 0x7fffffffec68`,
-  `rip = 0x406617` (the address in `shtest` that called `execve`) — and `entry = 0x40ac90`.
-- **Every write reaches the kernel.**  A breakpoint on `syscall_dispatch` filtered to
-  `SYS_WRITE` shows, in order: `WRITE fd=3 task=29` (shtest writes the script), `FORK
-  task=29`, `WRITE fd=2 task=30` and `WRITE fd=1 task=30` (the child's own probe, before the
-  exec), `EXEC task=30`, then `WRITE fd=1 task=30`, `WRITE fd=2 task=30`, `WRITE fd=3
-  task=30` — the shell writing to all three of its descriptors after the exec.
-- **And none of them produce output.**  Not on the serial port, and not in the file, which
-  is read back as zero bytes.  Both write paths — the console (`fd` 2, `FD_CONSOLE`) and a
-  regular file (`fd` 1, `FD_FILE`) — lose the data for this task, while task 29's writes to
-  the console come through.
-
-Ruled out along the way: the shell (its entry point is reached); `exec` (it completes and
-the task is correct afterwards); the script argument (passing none changes nothing);
-`dup2` (removing it changes nothing); the loader; and the `.bss` bugs above.
-
-**Not diagnosed.**  The next move is to find why `fs_sys_write`'s two back-ends drop the data
-for task 30 and not for task 29 while the syscall itself is entered — the return value of
-those writes has not been read yet, and that is the first thing to get.  `finish` inside a
-GDB `commands` block does not survive the block, so the probe has to break at the *next*
-`syscall_dispatch` and read the `rax` left behind by the previous one, or break in
-`fs_sys_write` by address rather than by name (it is not currently a symbol in the
-kernel's debug information, which is worth fixing).
-
-**The ramfs node pool is exhausted, intermittently (open).**
-
-`ramfs: no node left for "shtest.sh"`, and during `libctest` in one run.  `RAMFS_NODES` is
-2048 in `kernel/lib/ramfs.c`.  A node is released only by `ramfs_unlink()`, never by
-`close()` — which is correct POSIX, since closing a file does not remove its name — so
-every file a program creates and closes without unlinking keeps its inode for the rest of
-the boot.  With 2048 inodes and a self-test that starts dozens of programs, some of which
-create files under `/tmp`, that is reachable.  Whether the tests are leaking more than they
-should or the pool is simply small has not been established; the first thing to count is how
-many nodes are in use when `libctest` fails.
-
-**`PATH is set before main()` fails intermittently (open).**
-
-Seen once in four post-fix runs, in `libctest`, and it is the whole of that run's failure
-(43/44).  `__libc_start_main()` reads `envp = argv + argc + 1` and installs
-`startup_env` when `*envp` is NULL, so for a kernel-started program `PATH` is always set —
-which is why an intermittent failure here is suspicious rather than explained.
-
-Three libc and loader bugs found along the way, all fixed and all committed separately:
-`printf("%d", 0)` wrote a NUL byte instead of `"0"`; the argument block was laid out
-downward from its top, so `argv[0]` was written where `argv[argc]` belongs and every libc
-program read eight characters of `PATH=/bin:/usr/bin` as the end of its argv; and
-`fallback[]` in `build_stack()` was declared inside the `if` that used it, so its sixteen
-bytes were handed to the address arrays declared after it and the loader asked `strnlen()`
-for the length of a null pointer.
-
-## Next
-
-**Two things, and the second is older than the first.**
-
-1. **`ls` on a *directory* prints nothing and exits 1.**  `ls` of a file is fine.  It is in
-   "What is still broken" with everything that has been ruled out, and the honest summary is
-   that `getdents()` on an `O_DIRECTORY` descriptor fails and `ls` reports a stale `errno`
-   instead of saying so.
-
-2. **`make test-host` has never actually run**, and its allocator fuzz test now finds a real
-   defect -- a block written one byte past its end.  See "Known bugs".  This is first on the
-   list in the sense that matters: a gate that is red for want of a link is worse than no
-   gate, because it looks like one.
-
-**Phase 9 is done -- 45/45, `shtest` 53 of 53 -- and phase 10 has ten coreutils and the
-automated test per tool the spec asks for.**
-
-**Then: `node_alloc()` bounds-checking its free list.**  It indexes `nodes[ino - 1]`
-before checking that `ino` is a node number, and the kernel redzone reports a node whose
-`link_target` points at a block of the wrong size, which is what a stale pool index looks
-like.  The check is two lines; finding what put a bad value in `free_head` is not.
-
-**Then: a page reference count.**  `vmm_address_space_destroy()` frees tables and nothing
-else, so every frame a process ever mapped is out of the pool for the life of the machine.
-That is correct and it is now the thing that will decide how long this kernel can run.  It
-is a real change — the page needs a count, and the count has to survive the physical
-allocator being the only thing that knows which frames exist — so it belongs to phase 11's
-"hardening", not to phase 9.
-
-**Then: `ramfs_grow()`.**  `ramfs.h` promises a refill and there is none.  2048 nodes is
-enough for the tests as they stand and will not be enough for phase 10, which creates files
-by the hundred.
-
-**Then phase 10**: the coreutils (`ls`, `cat`, `grep`, `sort`, `uniq`, `wc`, `head`, `tail`,
-`tr`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `echo`, `true`, `false`, `date`, `env`, `kill`),
-`grep -r`, an editor, and the rest of `/proc`.  Note that `shtest`'s script uses `ls`,
-`cat`, `rm`, `wc`, `tail` and `head`, so **`phase9-sh` cannot pass until those six exist** —
-the shell test is, at the end of this session, gated on phase 10 as well as on the heap
-corruption.  Either write the six programs first or split the script, and the split is the
-better order because it separates "the shell is wrong" from "the program is missing".
-
-**A trap, recorded so it is not walked into again: do not debug this with `-smp 1`.**  A
-single-processor guest faults during `phase7-cow` with `CR2 = 0` -- a NULL read in
-`memcpy` -- which has nothing to do with phase 9 and is a different, pre-existing
-single-CPU defect.  Two sessions were spent chasing that one because it appears immediately
-before the phase 9 work in the log.  Everything about phase 9 must be measured on the
-harness, which runs `-smp 4`.
-
-**And a second trap, from this session: a backgrounded QEMU with a closed stdin exits.**
-Every "the guest hung and QEMU exited" measurement taken this session with
-`exec qemu-system-x86_64 ... &` and no `-monitor none` was really *QEMU quitting at once*,
-and the serial log that looked like a hang was the previous run's.  `-monitor none`, or a
-fifo the writer holds open, is what makes the difference; `-no-shutdown` is what keeps a
-triple fault on screen to be looked at with `gdb -ex "thread apply all bt"`.
