@@ -24,6 +24,27 @@
 #define KM_ALIGN       16u
 #define KM_HEADER_SIZE ALIGN_UP(sizeof(km_block_t), KM_ALIGN)
 
+/* Bytes past the end of every payload that nobody is ever told about.
+ *
+ * A write past the end of a block lands in the *next* block's header, or in the next
+ * allocation's payload, and neither of them is anywhere the writer can see.  What it looks
+ * like is memory corruption with no witness: a task that came back from `fork()` holding
+ * somebody else's number, a free list holding an address in the program's own text, a test
+ * that fails in a different place each run.
+ *
+ * This kernel hit exactly that, and the interesting part is *which* write it was: the
+ * shell's `cmd_free()` released `c->stages` and `c->arms` a second time, and the second
+ * release merged the wrong neighbour into a block that was already on the free list.  That
+ * is a user-space bug, and it is in the shell rather than here.
+ *
+ * What made it findable was giving the user-space allocator the same redzone, which named
+ * the caller at the `free()` instead of leaving a corrupt free list to be explained months
+ * later.  The kernel heap gets the same thing, because it is the allocator that has no
+ * other way of saying "that was not yours": the shell's corruption is fixed, and a kernel
+ * one would be invisible in exactly the same way. */
+#define KM_REDZONE     16u
+#define KM_PATTERN     0xA5
+
 typedef struct km_block km_block_t;
 
 struct km_block {
@@ -204,7 +225,12 @@ void *kmalloc(size_t size) {
     if (size == 0)
         return NULL;
 
-    size_t need = align_up_km(size);
+    /* What the caller asked for, and what the block is.  The difference is the redzone,
+     * which is inside the block's extent: it is never handed out and nothing is allocated
+     * across it, so coalescing and the physical chain keep treating `size` as the whole
+     * payload. */
+    size_t want = align_up_km(size);
+    size_t need = want + KM_REDZONE;
     void  *got = NULL;
     uint64_t lflags = spin_lock_irqsave(&heap_lock);
 
@@ -239,6 +265,7 @@ void *kmalloc(size_t size) {
 
         used_bytes += b->size;
         memset(payload_of(b), 0, b->size);
+        memset((uint8_t *)payload_of(b) + want, KM_PATTERN, KM_REDZONE);
         got = payload_of(b);
         break;
     }
@@ -266,13 +293,14 @@ void *krealloc(void *ptr, size_t size) {
     }
 
     km_block_t *b = block_of(ptr);
-    if (b->size >= align_up_km(size))
+    if (b->size >= align_up_km(size) + KM_REDZONE)
         return ptr;
 
     void *fresh = kmalloc(size);
     if (fresh == NULL)
         return NULL;
-    size_t copy = b->size < size ? b->size : size;
+    size_t have = b->size > KM_REDZONE ? b->size - KM_REDZONE : 0;
+    size_t copy = have < size ? have : size;
     memcpy(fresh, ptr, copy);
     kfree(ptr);
     return fresh;
@@ -288,6 +316,33 @@ void kfree(void *ptr) {
     if (b->free) {
         spin_unlock_irqrestore(&heap_lock, lflags);
         return;   /* double free: refuse rather than corrupt the list */
+    }
+
+    /* Written past the end of this block?
+     *
+     * `kmalloc()` painted the redzone at the end of the payload and nothing else ever
+     * touches it, so a byte that is not the pattern is a writer that did not know where
+     * its allocation stopped.  Reported here, where the block's owner is about to become
+     * nobody: the alternative is the write surfacing as corruption in whichever block
+     * happens to be allocated next, which can be seconds later and a different subsystem.
+     *
+     * A report rather than a refusal, because the block is *this* one's to give back
+     * either way -- refusing would leak it and hide the fault behind an allocation
+     * failure somewhere else. */
+    {
+        const uint8_t *z = (const uint8_t *)payload_of(b) + (b->size - KM_REDZONE);
+        size_t at = 0;
+
+        while (at < KM_REDZONE && z[at] == KM_PATTERN)
+            at++;
+
+        if (at < KM_REDZONE) {
+            kprintf("[warn] heap: block %p (%lu bytes) was written past its end: "
+                    "%#x at +%lu, freed from %p\n", ptr,
+                    (unsigned long)(b->size - KM_REDZONE), z[at],
+                    (unsigned long)(b->size - KM_REDZONE + at),
+                    __builtin_return_address(0));
+        }
     }
 
     /* Remember what this allocation itself accounted for: coalescing below can
