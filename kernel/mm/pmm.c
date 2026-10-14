@@ -7,6 +7,7 @@
 #include "pagetables.h"
 #include "pagemap.h"
 #include "panic.h"
+#include "spinlock.h"
 #include "string.h"
 #include "types.h"
 
@@ -37,6 +38,29 @@ static struct {
 } pmm;
 
 bool pmm_ready(void) { return pmm.ready; }
+
+/* The lock, and why this file needs one at all.
+ *
+ * The physical allocator is the only allocator every processor uses: a page table for a
+ * fault, a frame for a copy-on-write page, a frame for a program image.  Every one of
+ * those is a read-modify-write of one bit in one bitmap word, and `pmm.cursor` and
+ * `pmm.free_frames` are read-modify-writes too -- so two processors asking for a frame at
+ * the same time can both find the same one free, and both hand it out.
+ *
+ * That is not a rare race to shrug at.  Two address spaces then name the same physical
+ * page, so a program writes into another process's data and neither of them faults; a
+ * freed frame is still in a page table, so the next allocation writes into a mapping the
+ * processor is using; and `free_frames` drifts away from the truth, so the machine either
+ * claims memory it does not have or refuses memory it does.  Every one of those looks like
+ * something else entirely: a filesystem that runs out of nodes, a test that fails once in
+ * three, a machine that stops with no fault and no message.
+ *
+ * A spinlock, irq-saving.  It is held for a bitmap walk and a couple of counter updates,
+ * which is short, and it must be irq-saving because a frame is also allocated from an
+ * interrupt -- the timer tick waking a sleeper allocates nothing, but the page-fault path
+ * does, and an interrupt that spins on a lock its own interrupted code holds never
+ * returns. */
+static ticket_lock_t pmm_lock;
 
 /* --- bitmap primitives -------------------------------------------------- */
 
@@ -187,6 +211,7 @@ void pmm_reserve_phys_range(uint64_t phys, size_t bytes) {
 
     uint64_t first = ALIGN_DOWN(phys, page_size) / page_size;
     uint64_t last = ALIGN_UP(phys + bytes, page_size) / page_size;
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
 
     for (uint64_t frame = first; frame < last && frame < pmm.total_frames;
          frame++) {
@@ -196,6 +221,8 @@ void pmm_reserve_phys_range(uint64_t phys, size_t bytes) {
             pmm.reserved_frames++;
         }
     }
+
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 /* How many reclaimable ranges the boot-time record holds.  A machine with more
@@ -318,22 +345,32 @@ void pmm_release_boot_tables(void) {
 /* --- allocation --------------------------------------------------------- */
 
 uint64_t pmm_alloc_phys_page(void) {
-    if (!pmm.ready || pmm.free_frames == 0)
+    if (!pmm.ready)
         return 0;
 
-    uint64_t total = pmm.total_frames;
-    for (uint64_t i = 0; i < total; i++) {
-        uint64_t frame = (pmm.cursor + i) % total;
-        if (!bit_test(frame)) {
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    uint64_t got   = 0;
+
+    if (pmm.free_frames != 0) {
+        uint64_t total = pmm.total_frames;
+
+        for (uint64_t i = 0; i < total; i++) {
+            uint64_t frame = (pmm.cursor + i) % total;
+
+            if (bit_test(frame))
+                continue;
+
             bit_set(frame);
             pmm.free_frames--;
             /* Start the next search just past this frame. */
             pmm.cursor = (frame + 1) % total;
-            return frame * page_size;
+            got = frame * page_size;
+            break;
         }
     }
 
-    return 0;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return got;
 }
 
 uint8_t *pmm_alloc_zeroed_page(void) {
@@ -403,6 +440,8 @@ void pmm_free_phys_page(uint64_t phys) {
     if (frame >= pmm.total_frames)
         return;
 
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+
     /* Only a frame that was actually in use becomes free, so only that one is
      * counted.  Releasing a frame that is already free must not add to the
      * total, or a double free inflates the free count and the allocator starts
@@ -416,6 +455,8 @@ void pmm_free_phys_page(uint64_t phys) {
             pmm.reserved_frames--;
     }
     bit_clear(frame);
+
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 /* Release a whole range.  Frames that were never taken are counted once, the
@@ -423,6 +464,7 @@ void pmm_free_phys_page(uint64_t phys) {
 void pmm_free_phys_range(uint64_t phys, size_t bytes) {
     uint64_t first = ALIGN_DOWN(phys, page_size) / page_size;
     uint64_t last = ALIGN_UP(phys + bytes, page_size) / page_size;
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
 
     for (uint64_t frame = first; frame < last && frame < pmm.total_frames;
          frame++) {
@@ -433,6 +475,8 @@ void pmm_free_phys_range(uint64_t phys, size_t bytes) {
         }
         bit_clear(frame);
     }
+
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 bool pmm_phys_page_is_free(uint64_t phys) {
@@ -444,17 +488,25 @@ bool pmm_phys_page_is_free(uint64_t phys) {
 }
 
 uint64_t pmm_alloc_phys_page_at(uint64_t phys) {
-    if (!pmm_phys_page_is_free(phys))
+    if (!pmm.ready || !IS_ALIGNED(phys, page_size))
         return 0;
 
     uint64_t frame = phys / page_size;
-    bit_set(frame);
-    pmm.free_frames--;
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    uint64_t got   = 0;
 
-    /* Start the next search just past this frame, so a caller taking a specific
-     * low address does not leave the cursor parked at the bottom of memory. */
-    pmm.cursor = (frame + 1) % pmm.total_frames;
-    return phys;
+    if (frame < pmm.total_frames && !bit_test(frame)) {
+        bit_set(frame);
+        pmm.free_frames--;
+
+        /* Start the next search just past this frame, so a caller taking a specific
+         * low address does not leave the cursor parked at the bottom of memory. */
+        pmm.cursor = (frame + 1) % pmm.total_frames;
+        got = phys;
+    }
+
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return got;
 }
 
 void pmm_free_page(void *virt) {
