@@ -511,41 +511,85 @@ command substitution, a *nested* `$( $( ) )` capture, `$(( ))`, `$*`, `$1`, `for
 functions, `cd`, `pwd`, `>` , `>>`, `2>` and `2>&1`.  Each of those was broken at some
 point in this session and each is now demonstrably working.
 
-**What is still broken, exactly.**  The failure is in `$( true && echo yes )` — a command
-substitution whose body forks *again*.  The child process's heap is corrupted: a block
-header in the allocator's free list is overwritten with `(size = 1, next = 0x407d0d)`,
-and `0x407d0d` is an address **inside the shell's own text segment**.  `free()` then walks
-the list into the text and faults, and the panic report shows the fault in `block_free`
-with `CR2` pointing into `.text`.
+**The heap corruption is FIXED, and it was two double frees in the shell.**
+`cmd_free()` released `c->stages` and `c->arms` twice each — once after the loop that
+frees what they point at, and again in the list at the bottom.  A block that has already
+gone back on the free list is still a plausible address, so the second release is
+accepted, the forward merge takes the next block's size as if it were this one's, and the
+free list becomes a shape nobody wrote on purpose.  That is why the faulting address
+inside the shell's own text changed from one run to the next.
 
-So: one 16-byte write, into a heap block that was already free, carrying a small integer
-and a code address.  Those are exactly the two halves of a `struct timespec`
-(`tv_sec = 1`, `tv_nsec` = a code address) or of any `{size_t, pointer}` pair written by
-the kernel into a user buffer at the wrong place.
+**How it was found, which is the part worth keeping.**  Nothing in the tree pointed at it.
+The allocator spun in `block_free`; the kernel's `memcpy` guard fired once, for a length
+that turned out to be a different bug; the copy-on-write list was blamed and rebuilt; the
+page tables were blamed and duplicated.  The one instrument that named a *file* was a
+redzone on the user-space allocator, which reported `cmd_free` as the caller of the
+`free()` that found a block written past its end.  Both allocators now carry one — see
+"What was added to the tree to make this findable".
+
+### What was added to the tree to make this findable
+
+| | |
+|---|---|
+| `libc`: a freed block is poisoned, and every block carries a 16-byte redzone | names the caller of the `free()` that finds a block written past its end, and the caller of the `malloc()` that is handed a block somebody has written since |
+| `heap`: the kernel allocator carries the same redzone | the kernel has no other way of saying "that was not yours" |
+| `shtest`: a partial script write is reported, and a failing program dumps its files | a failure report that says "0 of 52 lines matched" is asking the reader to work out whether the script was empty, the output file was missing, or the shell printed nothing |
+| `CR4_WP` is defined but deliberately not set, with the measurement next to it | see "Why the kernel prepares user pages itself" below |
+
+### Why the kernel prepares user pages itself
+
+`fork` leaves every frame it shares read-only in both address spaces, and the only thing
+that normally gives the permission back is the processor taking a write fault.  For the
+*kernel's* stores that needs `CR4.WP`, and `CR4.WP` cannot be had here: **QEMU raises #GP
+for `mov cr4` with bit 16**, so `vmm_init()` would stop the machine.  Measured on QEMU
+11.1.2 with both `-accel kvm` and `-accel tcg,thread=multi`, on this project's test image.
+
+So without it a ring-0 store to a read-only user page goes straight through into the
+shared physical frame and updates it for both processes.  The syscall return is exactly
+that store: `syscall_dispatch()` writes the result into the program's frame, on the
+program's stack, which `fork` has just taken write permission away from — so the child's
+`rax` becomes whatever the parent wrote.  The kernel now calls `syscall_prepare_write()`
+before all three of its ring-0 stores into user memory (the syscall return, signal
+delivery's frame, signal delivery's register patch), and the page-fault handler answers
+supervisor write faults as well as ring-3 ones.
+
+### What is still broken
+
+One symptom, and it is the same shape as the one above but with the corruption gone:
+**`fork()` sometimes returns non-zero in the child.**  The child then takes the parent's
+branch and runs the program a second time, so `shtest`'s output arrives twice, interleaved
+character by character, and the second copy calls `waitpid` for a pid that is not its
+child.  What it has been observed to return is 1645 — an ordinary task id, which is the
+worst possible value for it to invent.
 
 **What has been ruled out**, so that the next session does not repeat it:
 
-- Not the copy-on-write list: `vmm_cow_fault()` is never asked to copy a page the task
-  cannot see (instrumented and checked), and the counts are now right across three
-  generations of fork.
-- Not the page tables: a twin's user tables are now fully private, so a copy can no
-  longer land in the parent's mapping, and `brk` can no longer add an entry to a shared
-  one.
-- Not a double free in the shell: the allocator's "this block is already free" check
-  fires on nothing in this run.
-- Not the shell's allocator walking into a cycle on its own: the corruption is *visible*
-  in the block header before the walk reaches it.
-- Not a lost wake or a broken `wait`: the exit record is correct and the child is
-  collected; where an early run showed `waitpid` returning 0 for a child that had not
-  exited, `sys_wait()` had been handed `options != 0` — see "Known bugs".
+- Not the frame: `task_create_forked()` copies the parent's 22 words and zeroes `rax`, and
+  instrumenting both that copy and the scheduler's first switch to the child shows
+  `rax = 0` at both ends of the window.
+- Not the restore path: `task_save_publish_and_switch()`'s ring-3 arm pops all fifteen
+  general registers in `regs_t`'s declaration order and zeroes past the vector and error
+  code before `iretq`, so `rax` comes from the frame.
+- Not `CR4.WP`: measured above, and the explicit preparation is in place regardless.
+- Not the shell's heap: the double free is fixed and no allocator report fires in the run
+  that still fails.
+- Not `waitpid`: the kernel collects the child and returns its id; the caller has already
+  lost the pid it was going to ask about.
 
-**The most likely place left is a kernel handler writing a structure into a user buffer
-at a bad offset or a bad length.**  The suspects, in order: `sys_times`, `sys_getrusage`,
-`sys_uname` and anything else that copies a fixed-size struct out with
-`syscall_copy_to_user()`.  The one thing that would settle it in a single run is a
-bounds check on every `syscall_copy_to_user()` call site that logs the length it was
-asked for alongside the address — the same shape as the `memcpy()` guard that turned
-defect 6 from silence into a named report.
+**So the corruption is between the two ends of that window, or the observation is wrong.**
+The window is: `task_wakeup(child)` in `sys_fork()`, through `task_attach_cow_twin()`'s
+allocations, to whichever processor claims the child.  The most useful next step is to
+record the child's frame `rax` *at the moment the processor that claims it enters the
+switch*, which is the one place in the window with no measurement on it — and to print it
+with the processor index, because a migration between the two is the obvious suspect.
+
+**One outstanding kernel redzone report**, one per run and stable: a 64-byte allocation is
+written one byte past its end with a zero, and it is released by `node_free()` as a
+symlink's `link_target`.  A symlink target is `kmalloc(strlen(target) + 1)`, so a 64-byte
+block is a 63-character target and the node holding `"copy"` (four characters) points at
+it — which says the node's field is stale, not that the copy overflowed.  **Not
+diagnosed.**  `node_alloc()` does not bounds-check `free_head` before indexing
+`nodes[ino - 1]`, which is the shape a corrupted pool index would take.
 
 **Not to be lost in the rewrite**: `phase9-sh` was briefly reported PASS while it was in
 fact hanging, because `run_program()` reported whatever exit it last read when its poll
@@ -1191,19 +1235,27 @@ freeze, but it was a live hazard and is recorded because it was real.
 - `make run` opens a GUI window; automated verification uses `make test`, which
   is always headless.
 
-- **`phase9-sh`: a child's heap is corrupted by a 16-byte write carrying a code
-  address.**  The one remaining `make WITH_SHELL=1 test` failure, and it is a
-  corruption rather than a hang.  Full detail, including everything already ruled
-  out, is in "Phase 9, where it got to".  The shell itself gets through quoting,
-  assignments, parameter expansion, arithmetic, `for`/`while`/`until`/`case`,
-  functions, `cd`, redirections, `&&`/`||`, subshells and a nested command
-  substitution before it happens.
+- **`phase9-sh`: `fork()` sometimes returns non-zero in the child.**  The one remaining
+  `make WITH_SHELL=1 test` failure.  The shell itself gets through quoting, assignments,
+  parameter expansion, arithmetic, `for`/`while`/`until`/`case`, functions, `cd`, every
+  redirection, `&&`/`||`, subshells and a nested command substitution, and its heap
+  corruption (`cmd_free()`'s double free) is fixed.  Full detail, including the frame
+  measurements that rule the obvious explanations out, is in "Phase 9, where it got to".
+- **One kernel redzone report per run**: a 64-byte allocation written one byte past its
+  end, released by `node_free()` as a symlink target whose node holds a four-character
+  path.  **Not diagnosed**; `node_alloc()` does not bounds-check `free_head` before
+  indexing the pool, which is the shape a stale pool index would take.
+- **`CR4.WP` is off because QEMU refuses it**, not because it was judged unnecessary.
+  It is the architectural answer to every ring-0 write into a user page, this kernel
+  cannot have it, and so it prepares those three writes explicitly instead.  If a later
+  QEMU models the bit, setting it is the better fix and the three `syscall_prepare_write()`
+  calls can stay as they are: they are harmless when the page is already writable.
 - **`sys_wait()` is reachable with `options != 0` from a caller that passes
   zero.**  An early run showed `shtest`'s `waitpid(54, &st, 0)` returning 0
   while its child was still alive — the only path to 0 in `sys_wait()` is
   `WNOHANG` — and a second run showed it returning 0 for a child that had *not*
   been collected.  Since the same run had a child writing over the caller's
-  `pid` variable (the corruption above), the likeliest reading is that the
+  `pid` variable (the `fork()` fault above), the likeliest reading is that the
   register was not what the trace said.  **Not diagnosed.**  `sys_wait()`
   currently trusts `arg(regs, 2)`; the selector and the options are read from
   the frame with no cross-check, and a frame that is one instruction stale would
@@ -1383,15 +1435,19 @@ for the length of a null pointer.
 
 ## Next
 
-**Phase 9, first, and only one thing: the 16-byte write that corrupts a child's heap.**
-Everything else in this list has been fixed, and what is left is a single corruption with a
-single symptom.  The evidence, the five hypotheses already ruled out and the one that
-survives are all in "Phase 9, where it got to"; the short version is that a block header in
-the shell's allocator has `(size = 1, next = <an address in the shell's own text>)` in it,
-in a child of a `$( ... )` capture whose body forks again.  The next step named there is to
-make every `syscall_copy_to_user()` call site log the length it was asked for beside the
-address it is writing to — the same instrument that turned the sixteen-gibibyte `memcpy`
-from silence into a named report — and then to read which one wrote those sixteen bytes.
+**Phase 9, first, and only one thing: `fork()` sometimes returns non-zero in the child.**
+Everything else in this list has been fixed, and what is left is a single symptom with a
+single measurement behind it.  The child's frame holds `rax = 0` when it is built *and*
+when the scheduler first switches to it, and the restore path reads `rax` out of that
+frame, so the corruption is inside the window between the two — or the reading of the
+evidence is wrong.  "Phase 9, where it got to" has the ruled-out list, the value the
+child invents (1645, an ordinary task id) and the one place in the window with no
+measurement on it.
+
+**Then: `node_alloc()` bounds-checking its free list.**  It indexes `nodes[ino - 1]`
+before checking that `ino` is a node number, and the kernel redzone reports a node whose
+`link_target` points at a block of the wrong size, which is what a stale pool index looks
+like.  The check is two lines; finding what put a bad value in `free_head` is not.
 
 **Then: a page reference count.**  `vmm_address_space_destroy()` frees tables and nothing
 else, so every frame a process ever mapped is out of the pool for the life of the machine.

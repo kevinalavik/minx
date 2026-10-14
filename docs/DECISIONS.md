@@ -1145,3 +1145,73 @@ Ten seconds is chosen against the *test run*, not against the machine: a run has
 where nothing is printed while a program thinks, and a report that fires on those is a
 report nobody reads. The boot processor only, because four processors printing four copies
 of the same list is one copy of the list and three copies of noise.
+
+## `CR4.WP` is off, and the kernel prepares user pages itself instead
+
+**Date: 2026-10-14**
+
+`CR4.WP` is the right answer to every ring-0 write into a user page: with it set, a
+supervisor store to a read-only *user* page takes the same `#PF` a program's store does,
+and the page-fault handler already knows how to answer that by giving the page a private
+copy. It covers user pages only, so the kernel's own read-only text and data and the
+write-only framebuffer mapping are untouched.
+
+**It cannot be set on this machine.** QEMU raises a general protection fault for
+`mov %cr4` with bit 16, so `vmm_init()` would panic before the first line of boot output.
+Measured on QEMU 11.1.2 with both `-accel kvm` and `-accel tcg,thread=multi`. The bit is
+defined in `kernel/include/pagetables.h` with that measurement next to it, so the
+experiment is not repeated.
+
+Without it, a ring-0 store to a page a `fork` gave up goes straight through into the
+shared physical frame and updates it for both processes — and the syscall return is exactly
+that store, because it writes the result into the program's own frame on the program's own
+stack. The alternative considered and rejected is leaving it to each call site to remember:
+there are three such writes today, a fourth is a matter of time, and the failure mode of
+the one that is forgotten is two processes corrupting each other silently. `syscall_prepare_write()`
+is called before all three instead, and the page-fault handler now answers supervisor
+write faults as well, so the two mechanisms agree.
+
+The cost is a page walk per syscall return, which returns immediately for any task that
+has never forked. If a later QEMU models the bit, setting it *and* keeping the three calls
+is strictly better than either alone.
+
+## Both allocators carry a redzone, and say so when it is written
+
+**Date: 2026-10-14**
+
+The libc's allocator poisons a freed block and gives every block a 16-byte redzone past
+the end of its payload; the kernel's `kmalloc()` does the same. A write past the end of a
+block lands in the next block's header or the next allocation's payload, and what it
+looks like from the outside is memory corruption with no witness.
+
+The argument for it is one afternoon. `cmd_free()` in the shell was releasing two pointers
+twice each, and *nothing* in the tree pointed at it: the allocator spun, the kernel's
+`memcpy` guard fired for a different bug, the copy-on-write list was blamed and rebuilt,
+the page tables were blamed and duplicated. The redzone reported the function, the caller
+and the offset on its first run.
+
+The argument against it is that it is a check in the hottest allocator in the system. It
+is sixteen bytes of memset and a sixteen-byte compare, against an allocator that already
+memsets every payload on the way out. A check that turns an unnameable failure into a
+named one is the cheapest diagnostic there is, and this project has now paid twice for not
+having one.
+
+Reported, not refused: a refusal would turn a use-after-free into a failed `malloc()`, which
+is a different failure with a different cause and would hide the one that is there.
+
+## Two double frees were left in place deliberately, and documented
+
+**Date: 2026-10-14**
+
+`cmd_free()` and `expand_assign()` each released memory they had already given away —
+`c->stages` and `c->arms` twice in the first, the string it had just handed its caller in
+the second. Both are fixed in place, which the no-deletion rule allows ("fixing bugs by
+editing lines in place"), and both are ordinary bugs with no behaviour anyone could have
+wanted: the observable effects were a shell that spun in its allocator and a script whose
+first assignment hung the machine.
+
+What is *not* obvious, and is recorded here because the rule's default reading is more
+cautious than this case needs: a duplicated `free()` of the same pointer twice in one
+function is not a feature that a flag can select between. Keeping both behind an option
+would mean shipping a shell whose `x=1` can either work or corrupt the heap, which is a
+worse artefact than either version alone.
