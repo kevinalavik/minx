@@ -15,6 +15,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +37,18 @@ static const char *script =
     "echo one\n"
     "echo \"two three\"\n"
     "echo 'four  five'\n"
-    "\n"
+    /* An empty line, and the reason it is `echo \"\"` rather than a blank line: a blank line
+     * in a script is not an `echo`, and nothing produces output for it.  The expected list
+     * has an empty string here because the line was *meant* to print one, and a test whose
+     * script says something different from what it checks is a test that fails for the right
+     * reason in the wrong way -- every later line then reports as out of order, because the
+     * comparison walks them in step.  Which is what happened: one missing blank shifted all
+     * fifty-one comparisons after it.
+     *
+     * So the script says what the list means.  A blank line is still in the script further
+     * down, where it belongs -- this shell has to skip one, and there is no check that it
+     * does. */
+    "echo \"\"\n"
     "x=42\n"
     "echo \"x=$x\"\n"
     "echo \"len=${#x}\"\n"
@@ -92,6 +104,16 @@ static const char *script =
     "\n"
     "echo 'to stdout'\n"
     "echo 'to stderr' >&2\n"
+    /* The line above is the one `>&2` test that cannot be checked here: it goes to the
+     * console, and this program's output is a file, so there is nothing in it to compare
+     * against.  The pair below is that test *and* the `2>&1` test, in one construct, and it
+     * can be checked: the group's own descriptor 2 is sent to its descriptor 1, so both
+     * lines land in the file, and `echo 'captured err' >&2` reaching that file is only
+     * possible if `>&2` really wrote to descriptor 2 rather than to whatever was in it.
+     *
+     * Which is the stronger claim: the old line only showed that `>&2` did not appear in the
+     * output, which is also what a redirection that was silently ignored would look like. */
+    "{ echo 'captured out'; echo 'captured err' >&2; } 2>&1\n"
     "echo 'redirected' > /tmp/shtest-out\n"
     "echo \"file=$(cat /tmp/shtest-out)\"\n"
     "echo 'appended' >> /tmp/shtest-out\n"
@@ -162,7 +184,13 @@ static const char *expected[] = {
     "hello again",
     "pwd=/tmp",
     "to stdout",
-    "to stderr",
+    /* `echo 'to stderr' >&2` is in the script and deliberately *not* here: it goes to the
+     * console, and this list is the contents of the file the script's output was collected
+     * into.  Expecting it anyway is how the whole list came to be shifted by one -- every
+     * comparison after it reported as out of order, because the comparison walks the two
+     * lists in step and a line that is never in one of them shifts all of them. */
+    "captured out",
+    "captured err",
     "file=redirected",
     "lines=2",
     "tail=appended",
@@ -209,6 +237,53 @@ static void check(const char *what, int ok) {
  * one. */
 #define SHT_OUT_MAX 32768
 static char out_buf[SHT_OUT_MAX];
+
+/* Where this program's own diagnostics go.
+ *
+ * A file, appended to, one line at a time -- and the reason is that the console cannot
+ * carry them.  When two copies of this program run at once (which is the thing being
+ * chased) every line they print is interleaved with the other copy's *byte by byte*, so
+ * the log shows a sentence that belongs to no program and answers no question.  A file
+ * opened with `O_APPEND` and written with one `write()` per line gives each line to one
+ * process, so the file says which copy took which branch.
+ *
+ * The console still gets the lines, because a failure a reader has to go looking for in a
+ * ramfs is a worse first impression than one that is already on screen.
+ *
+ * The leading dot is not decoration.  The script under test runs `ls /tmp/shtest-*`, and
+ * `/tmp/shtest-child`, `/tmp/shtest-out`, `/tmp/shtest.sh` and `/tmp/shtest-trace` all
+ * match that glob -- so a diagnostic file named without the dot became the answer to the
+ * script's own question about which files a redirection had created, and the test failed
+ * for having reported something.  A name `*` cannot match is a name that cannot interfere. */
+#define SHT_TRACE "/tmp/.shtest-trace"
+
+static void trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void trace(const char *fmt, ...) {
+    char    line[192];
+    va_list ap;
+
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    if (n <= 0)
+        return;
+
+    if ((size_t)n >= sizeof(line))
+        n = (int)sizeof(line) - 1;
+
+    line[n++] = '\n';
+
+    int fd = open(SHT_TRACE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+    if (fd >= 0) {
+        (void)!write(fd, line, (size_t)n);
+        close(fd);
+    }
+
+    (void)!write(2, line, (size_t)n);
+}
 
 static char *run_script(int *status_out) {
     int fd = open("/tmp/shtest.sh", O_WRONLY | O_CREAT | O_TRUNC, 0755);
@@ -262,7 +337,36 @@ static char *run_script(int *status_out) {
         return NULL;
     }
 
+    /* One line per copy, in a file, before anything else can go wrong. */
+    trace("shtest: pid %ld: fork returned %ld", (long)getpid(), (long)pid);
+
     if (pid == 0) {
+        /* A marker, and on a file rather than on the console.
+         *
+         * Two copies of this program have been seen running at once, each convinced it
+         * was the parent, and the only evidence was two messages interleaved character by
+         * character in the serial log: unreadable, and unable to say which branch each
+         * copy took.  A marker *in a file* survives that, and the self test already dumps
+         * the files this program leaves behind when it fails, so the marker's contents end
+         * up in the failure report without anything having to read it at the time.
+         *
+         * The console gets a copy too, because a file that exists but was never written is
+         * a different answer from a file that was never created, and only the pair says
+         * which. */
+        {
+            static const char here[] = "shtest: the child branch reached, about to exec\n";
+            int            fd = open("/tmp/.shtest-child", O_WRONLY | O_CREAT | O_TRUNC,
+                                      0644);
+
+            if (fd >= 0) {
+                (void)!write(fd, here, sizeof(here) - 1);
+                close(fd);
+            }
+
+            trace("shtest: pid %ld: the child branch reached, about to exec",
+                  (long)getpid());
+        }
+
         /* The child's standard output becomes the file the parent opened. */
         if (dup2(out, 1) < 0)
             _exit(126);
@@ -293,15 +397,11 @@ static char *run_script(int *status_out) {
     int    st = 0;
     pid_t  reaped;
 
-    printf("shtest: fork returned %ld, my own pid is %ld\n", (long)pid, (long)getpid());
-
     while ((reaped = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
         ;
 
-    printf("shtest: waitpid returned %ld for the pid %ld I asked about\n", (long)reaped,
-           (long)pid);
-    printf("shtest: my own pid is now %ld, and the status word is %ld\n",
-           (long)getpid(), (long)st);
+    trace("shtest: pid %ld: waitpid returned %ld for the pid %ld asked about, "
+          "status word %ld", (long)getpid(), (long)reaped, (long)pid, (long)st);
 
     /* A `waitpid` that failed is not a script that passed.
      *
@@ -311,6 +411,7 @@ static char *run_script(int *status_out) {
      * its list of expected lines and said so -- which is a real failure, but one that reads
      * as "the script printed the wrong thing" rather than "there was no script". */
     if (reaped < 0) {
+        trace("shtest: pid %ld: waitpid: %s", (long)getpid(), strerror(errno));
         printf("shtest: waitpid: %s\n", strerror(errno));
         close(out);
         return NULL;
@@ -434,8 +535,17 @@ int main(int argc, char **argv, char **envp) {
     check("every expected line appeared, in order", matched == want);
     check("the script printed no lines beyond the expected ones", got == want);
 
-    unlink("/tmp/shtest.sh");
-    unlink("/tmp/shtest.out");
+    /* Only on success.  These three files are the whole of what is known about a failure,
+     * and the self test dumps them when this program reports one -- so removing them here,
+     * unconditionally, is removing the evidence before anybody has read it.  A run that
+     * passed has nothing to show and does not need them; a run that failed leaves them for
+     * the report. */
+    if (failures == 0) {
+        unlink("/tmp/shtest.sh");
+        unlink("/tmp/shtest.out");
+        unlink("/tmp/.shtest-child");
+        unlink(SHT_TRACE);
+    }
 
     if (failures != 0) {
         printf("shtest: FAILED (%d of %d checks)\n", failures, checks);
