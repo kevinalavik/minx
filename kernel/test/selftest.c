@@ -2002,9 +2002,12 @@ static void test_libc_program(void) {
 static void test_sh_program(void) {
 #if MINX_SHELL_PROGRAM
     /* What `shtest` leaves behind, in the order that tells the story: the script it wrote,
-     * so the reader can see what it was asked to do, and the output it collected, so the
-     * reader can see how far it got. */
-    static const char *paths[] = { "/tmp/shtest.sh", "/tmp/shtest.out", NULL };
+     * so the reader can see what it was asked to do, the output it collected, so the
+     * reader can see how far it got, and the marker its forked child writes on the way to
+     * `exec`, which is the difference between "the child never took the child branch" and
+     * "the child took it and its output was lost". */
+    static const char *paths[] = { "/tmp/shtest.sh", "/tmp/shtest.out",
+                                   "/tmp/.shtest-child", "/tmp/.shtest-trace", NULL };
 
     hung_dump_paths = paths;
 

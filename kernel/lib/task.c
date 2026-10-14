@@ -55,6 +55,7 @@
 void task_switch(uint64_t *save_rsp, uint64_t new_rsp);
 void task_restore_context(uint64_t new_rsp);
 void task_enter_first(uint64_t new_rsp);
+void task_enter_first_ring3(uint64_t new_rsp);
 void task_start_shim(void);
 void task_start(void (*entry)(void *), void *arg);
 void task_enter_user(void);
@@ -107,6 +108,14 @@ void task_save_publish_and_switch(uint64_t *save_rsp, task_t *prev, sched_cpu_t 
                                  int32_t *next_saved_in_user,
                                  int32_t from_user,
                                  const void *out_ctx);
+
+/* The shape of a `regs_t`, which is the block the CPU pushed and which the scheduler both
+ * copies and consumes.  `rax` is the fifteenth of the fifteen general registers because a
+ * push moves the stack pointer down: the first one pushed ends up at the highest address.
+ * See `regs_t` in cpu.h for the whole layout, which is the memory layout and not free to be
+ * tidy. */
+#define REGS_WORDS       22
+#define REGS_RAX_INDEX   14        /* r15, r14, ... rbx, rax: fifteen, so rax is the 15th */
 
 static sched_cpu_t cpu[MAX_CPU_COUNT];
 
@@ -1402,13 +1411,82 @@ void schedule(void) {
      * stopped. */
     c->in_schedule = 0;
 
-    /* A task that has never run has no resume point of its own: what is on its stack is
-     * the bootstrap frame task_stack_init() built, and it goes through task_enter_first(),
-     * which turns interrupts on for it.
+    /* A task that has never run has no resume point of its own: what is on its stack is the
+     * frame its creator built for it, and it has to be entered rather than resumed.
      *
-     * Anything else is the save-publish-switch sequence, and there is no outgoing task
-     * to publish when there was no outgoing task -- which only happens on a processor
-     * that has not entered the scheduler yet, so there is nothing of its own to save. */
+     * *Which* of those frames it is decides *how* it is entered, and that is the whole
+     * question on this path.  A kernel task has the nine-word bootstrap frame
+     * `task_stack_init()` built, whose seventh word is where `ret` goes; a forked child has
+     * a 22-word ring-3 interrupt frame, whose seventh word is `r9`.  Entering a child with
+     * `task_enter_first()` pops its six callee-saved registers correctly and then jumps to
+     * `r9` -- a scratch register of whichever processor is doing the switching -- in ring 0.
+     *
+     * That is the intermittent `fork()` failure.  A child that reached the save-publish-
+     * switch path was entered correctly, because that path tests `saved_in_user` and chose
+     * `iretq`; a child that reached this one was not.  Which happened depended on whether
+     * the processor claiming the child already had a current task, which is why the same
+     * line of the same program worked on most boots and failed on the rest with a child
+     * that ran the *parent's* code from the wrong address.
+     *
+     * So the test here is `saved_in_user`: what kind of frame is on the stack is the only
+     * question that matters, and it is the same flag the switch path uses.
+     *
+     * The load of the address space is here because the sequence that normally does it is
+     * not on this path.  Both halves are needed: this one because the path exists at all,
+     * and the flag because a task that starts on the wrong tables faults on its first
+     * memory access and says nothing about why. */
+    /* A forked child about to be entered for the first time, checked against what its
+     * frame must be *absolutely*.
+     *
+     * The marker is `fork_checked`, claimed here so that it runs on the one switch that
+     * matters.  It is deliberately not `switch_count`, which is incremented a hundred lines
+     * earlier and is therefore already 1 by the time the scheduler gets here -- a
+     * first-switch check keyed on it can never fire, and a check that cannot fire reports
+     * nothing forever while looking as though it is watching.
+     *
+     * Recording what the frame said when it was built, and comparing against that, is the
+     * obvious check and it has a hole exactly where a bug of this shape lives: if the
+     * child's `task_t` or its stack has been recycled, the recorded words and the frame
+     * agree with each other and both belong to a task that no longer exists.  So the
+     * questions are asked absolutely, because no amount of recycling can fake them:
+     *
+     *   `rax` is zero, because `fork` returns zero to the child;
+     *   `rip` is in user space, because the child resumes in the program that called
+     *   `fork` and not in the kernel;
+     *   the frame is inside *this* task's own kernel stack, and at the offset
+     *   `task_create_forked()` put it at.
+     *
+     * This is the last moment at which that is knowable: after the switch the frame has been
+     * consumed, the task is running, and what it was given is a question about a past that
+     * has already happened on a processor this one cannot see.
+     *
+     * The consequence of getting it wrong is not a crash, which is why this is worth a
+     * report rather than a silent repair.  The child runs the parent's code, at an address
+     * the kernel handed it, in the parent's address space, having skipped the line after
+     * `fork()` that stores the result -- so it takes the parent's branch, and a program
+     * that forks twice looks like one that has lost track of which copy of itself is which.
+     * `shtest` reported a child whose `pid` was a leftover heap pointer and no child of its
+     * own, and nothing anywhere said a frame was wrong. */
+    if (next->is_user && next->fork_rip != 0 && next->fork_checked == 0) {
+        const uint64_t *f = (const uint64_t *)(uintptr_t)next->saved_rsp;
+        uint64_t       rsp = (uint64_t)next->saved_rsp;
+        uint64_t       built = next->stack_top - REGS_WORDS * sizeof(uint64_t);
+
+        next->fork_checked = 1;
+
+        if (f[REGS_RAX_INDEX] != 0 || f[17] >= USER_SPACE_END ||
+            rsp < next->stack_low || rsp >= next->stack_top) {
+            kprintf("[warn] task: forked task %lu is entered with a frame that is not its "
+                    "own: built rax %lu rip %p at %p, now rax %lu rip %p at %p; "
+                    "stack %p..%p, switches %lu, cpu %u\n",
+                    (unsigned long)next->id, (unsigned long)next->fork_rax,
+                    (void *)next->fork_rip, (void *)built,
+                    (unsigned long)f[REGS_RAX_INDEX], (void *)f[17], (void *)rsp,
+                    (void *)next->stack_low, (void *)next->stack_top,
+                    (unsigned long)next->switch_count, percpu_self_index());
+        }
+    }
+
     if (prev == NULL) {
         /* The address space is loaded here because the sequence that normally does it is
          * not on this path.  That path is for a processor that has not entered the
@@ -1419,9 +1497,33 @@ void schedule(void) {
          * `current` on its way out; task_exit() no longer does that.  Both halves are
          * needed: this one because the path exists at all, and the other because a task
          * that starts on the wrong tables faults on its first memory access and says
-         * nothing about why. */
+         * nothing about why.
+         *
+         * And the two entry paths are chosen by the frame, which is the point the comment
+         * above this branch is about.
+         *
+         * Reported, because this is the branch that decides *how* a task is entered and it
+         * has no other way to be observed: the switch it bypasses is a single instruction
+         * sequence in assembly, and a task entered by the wrong one of the two does not
+         * fail -- it runs, at the wrong address, and the damage is somewhere else entirely.
+         * The one number that matters is `rax`, because `fork` returns zero to the child. */
+        {
+            const uint64_t *f = (const uint64_t *)(uintptr_t)next->saved_rsp;
+
+            if (next->is_user)
+                kprintf("[task] cpu %u: first entry, no outgoing task, to user task "
+                        "%lu (%s) frame %p in_user %ld rax %lu rip %p\n",
+                        percpu_self_index(), (unsigned long)next->id, next->name,
+                        (void *)next->saved_rsp, (long)next->saved_in_user,
+                        (unsigned long)f[14], (void *)f[17]);
+        }
+
         vmm_address_space_switch(next_tables);
-        task_enter_first(next->saved_rsp);
+
+        if (next->saved_in_user)
+            task_enter_first_ring3(next->saved_rsp);
+        else
+            task_enter_first(next->saved_rsp);
     } else {
         /* Whether the outgoing context is a ring-3 frame is recorded by the interrupt
          * entry, not derived here: by the time schedule() runs the CPU has already
@@ -1442,7 +1544,8 @@ void schedule(void) {
 
         task_save_publish_and_switch(&prev->saved_rsp, prev, c, next->saved_rsp,
                                      next_tables, &prev->saved_in_user,
-                                     &next->saved_in_user, from_user, out_ctx);
+                                     &next->saved_in_user,
+                                     from_user, out_ctx);
     }
 
     /* Only reached when this task is switched back into.
@@ -2229,8 +2332,6 @@ void sched_task_enter(unsigned index) {
  *
  * Both belong next to the code that copies a frame rather than in cpu.h, because they are
  * only meaningful to a caller that is copying one -- which is this, and the ISR tail. */
-#define REGS_WORDS       22
-#define REGS_RAX_INDEX   14        /* r15, r14, ... rbx, rax: fifteen, so rax is the 15th */
 
 task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight) {
     task_t *t = NULL;
@@ -2360,6 +2461,11 @@ task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight
     t->saved_rsp = (uint64_t)frame;
     t->saved_in_user = 1;
 
+    /* Kept so that the scheduler can check the frame is still what was built here.  See
+     * `task_t.fork_rax`. */
+    t->fork_rax = frame[REGS_RAX_INDEX];
+    t->fork_rip = frame[17];
+
     return t;
 }
 
@@ -2417,8 +2523,9 @@ int task_attach_cow_twin(task_t *child) {
 
     if (tables == NULL || vmm_fork_aspace(tables, parent->tables, cow) != 0) {
         if (cow->full) {
-            kprintf("[warn] task: fork would need more than %d copy-on-write pages; "
-                    "refusing rather than sharing a page it should have copied\\n",
+            kprintf("[warn] task: fork would need more than %d pages copied for the "
+                    "child; refusing rather than sharing a page it should have had its "
+                    "own copy of\\n",
                     COW_MAX_PAGES);
         }
         return -1;

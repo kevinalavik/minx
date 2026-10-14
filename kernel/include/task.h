@@ -332,6 +332,37 @@ typedef struct task {
      * Written by task_save_publish_and_switch() in switch.S, read by nothing but the
      * restore there -- the C side cannot know the processor's current privilege level. */
     int32_t      saved_in_user;
+
+    /* What a forked child's frame said when it was built, so the scheduler can check that
+     * it still does.
+     *
+     * `fork` returns zero to the child, and the child resumes at the instruction after the
+     * `int $0x80` that asked for it.  Those two words are the whole contract between
+     * `task_create_forked()` and the scheduler, and nothing re-establishes it: the frame is
+     * a block of memory on the child's own kernel stack which the scheduler reads and the
+     * CPU then consumes, and one word of it changing turns the child into a copy of its
+     * parent that skipped the line after `fork()`.
+     *
+     * The symptom of that is not a crash.  The child runs the parent's code, at an address
+     * the kernel handed it, and a program that forks twice looks like a shell which has
+     * lost track of which copy of itself is which.  So the check is here, at the last point
+     * where the frame can still be read, and it says what it found and who wrote it.
+     *
+     * `fork_rax == 0 && fork_rip == 0` is "this task was not forked", which is the same
+     * pair a child would have if the syscall landed at a zero address -- so the check is
+     * only made for a task whose name is `fork`, which is how `task_create_forked()` names
+     * every one of them. */
+    uint64_t     fork_rax;
+    uint64_t     fork_rip;
+
+    /* Has the scheduler already checked the frame of this forked child?
+     *
+     * `fork_rip` stays set for the child's whole life, so testing it alone makes the check
+     * run on every switch into the child rather than on the one that matters -- and on
+     * every switch after the first the frame holds a live interrupt frame rather than the
+     * one `task_create_forked()` built, so a report there says nothing.  The check claims
+     * the child for itself, and a child is claimed exactly once. */
+    uint32_t     fork_checked;
 } task_t;
 
 /* The word written at the bottom of every task stack. */

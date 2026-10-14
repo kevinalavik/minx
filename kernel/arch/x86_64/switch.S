@@ -170,7 +170,15 @@ task_save_publish_and_switch:
      * It cannot stay in %r15: the first `popq %r15` is the *chosen* task's r15 -- zero for
      * a task that has never run -- and the test after the pops would then dereference zero.
      * That faulted on the very first switch on the machine, which is at least a memorable
-     * symptom for a mistake that is otherwise invisible. */
+     * symptom for a mistake that is otherwise invisible.
+     *
+     * The flag is `saved_in_user`, which is what this really asks: what kind of frame is on
+     * the stack this is about to restore.  A forked child's is a ring-3 interrupt frame and
+     * its flag is 1, so it takes the `iretq` path below; a kernel task that has never run
+     * has the nine-word bootstrap frame and takes the `ret` path.  Answering a different
+     * question here -- "has this task ever been entered" -- sends a forked child down the
+     * bootstrap path, whose seventh word in a 22-word interrupt frame is `r9`, and the
+     * child jumps there in ring 0. */
     movq    %r15, %r11
     cmpl    $0, (%r11)
     je      2f
@@ -264,6 +272,60 @@ task_enter_first:
     popq    %rbp
     ret
 .size task_enter_first, .-task_enter_first
+
+/* void task_enter_first_ring3(uint64_t new_rsp)
+ *
+ * The first switch onto a task whose stack holds a *ring-3 interrupt frame* rather than a
+ * bootstrap frame: `task_enter_first()`'s six pops and `ret`, for the fifteen registers
+ * and the `iretq`.
+ *
+ * The two are not interchangeable and the difference is the whole of a bug.  A forked
+ * child's stack holds a 22-word interrupt frame -- fifteen general registers, the vector and
+ * the error code, and the five words `iretq` pops -- and it has never been entered.  Given
+ * that frame to `task_enter_first()`, the six pops take r15 down to rbp correctly and the
+ * `ret` then jumps to the *seventh word*, which in that frame is `r9`: a scratch register
+ * holding whatever the switching processor happened to be using it for.  The child arrives
+ * in ring 0, at an address chosen by the kernel's own register state, having restored
+ * nothing but six registers.
+ *
+ * What that looks like from user space is nothing like a scheduler bug.  The child runs
+ * whatever code that address is in, with the kernel's stack and the kernel's CS, and in
+ * `shtest`'s case it was shtest's own text a little way *past* the `fork()` call -- so the
+ * child skipped the line that stores `fork()`'s result, took the parent's branch instead of
+ * the child's, and reported a `pid` that was whatever had been in that stack slot.
+ *
+ * Which path a child takes must therefore depend on what is on its stack, and it does:
+ * `schedule()` picks this one when `saved_in_user` says the frame is a ring-3 one.  The
+ * intermittency was which processor got the child: one that already had a current task took
+ * the save-publish-switch path, which tests the same flag and got it right, and one that did
+ * not came through here and did not.
+ *
+ * Interrupts are on before the `iretq`, for the reason they are in `task_enter_first()`:
+ * a task that has never run has no saved flags, and the interrupt gate has just cleared IF.
+ */
+.global task_enter_first_ring3
+.type task_enter_first_ring3, @function
+task_enter_first_ring3:
+    sti
+    movq    %rdi, %rsp
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rbp
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rbx
+    popq    %rax
+    addq    $16, %rsp            /* the vector and the error code */
+    iretq
+.size task_enter_first_ring3, .-task_enter_first_ring3
 
 /* Reached by the `ret` at the end of a first switch onto a task, so it runs with
  * the task's freshly built stack rather than a C frame.
