@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <internal.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -53,6 +54,38 @@ typedef struct block {
 static block_t *free_list;
 static char    *heap_base;       /* where the kernel says the break was, once known */
 static char    *heap_break;
+
+/* What a free block's payload is filled with, and what an allocated one is.
+ *
+ * A block that has been freed is memory nobody owns, and a block that has been allocated is
+ * memory exactly one caller owns.  In both cases the next write that is not the owner's is
+ * either a bug or a symptom of one, and filling the two states differently says which:
+ *
+ *   - `malloc()` hands out a block and finds the payload still poisoned from its last free,
+ *     which means somebody wrote to memory they had already given back: a use-after-free.
+ *     That is invisible everywhere else, because the block still looks like a plausible
+ *     size and a plausible address, so the allocator carries on until the free list is a
+ *     chain of nonsense and `free()` walks into the program's own text.
+ *
+ *   - `REDZONE` is the other half.  A write *past the end* of a block lands in the next
+ *     block's header, and that is how a free list ends up holding an address from the
+ *     program's own text: it is not the block that is wrong, it is the one after it.  So
+ *     every block carries a few bytes nobody is ever told about, at its end, and `free()`
+ *     checks them.
+ *
+ * The redzone is inside the block's extent, so it is never allocated to anybody and coalescing
+ * treats it as part of the block -- which is the point: nothing can be handed out inside it
+ * and nothing can be allocated across it.
+ *
+ * Reported rather than refused in both cases.  A refusal would turn one bug into a failed
+ * `malloc()`, which is a different failure with a different cause and would hide the one
+ * that is here.
+ *
+ * It costs a `memset` per allocation and per free, sixteen bytes of heap per allocation, and
+ * a sixteen-byte comparison at each end -- which is the same trade every allocator's debug
+ * mode makes. */
+#define FREED_PATTERN 0xA5
+#define REDZONE       16
 
 /* The page the kernel grows the heap in.
  *
@@ -130,6 +163,10 @@ static void block_free(block_t *b) {
             p->next = b->next;
         }
     }
+
+    /* Last, so the poison covers everything: if the backward merge swallowed the block
+     * below, that block's payload is part of this one now and nobody may write it either. */
+    memset((char *)b + BLOCK_HDR, FREED_PATTERN, b->size);
 }
 
 void *malloc(size_t n) {
@@ -144,6 +181,12 @@ void *malloc(size_t n) {
     if (need < MIN_BLOCK)
         need = MIN_BLOCK;
 
+    /* The block is `need` bytes of payload *plus* the redzone, and the redzone is inside
+     * the block's extent: it is never handed out and nothing is ever allocated across it,
+     * which is what lets coalescing keep treating `size` as the whole extent.  Every size
+     * below is therefore a span, not a payload. */
+    size_t span = need + REDZONE;
+
     /* First fit over a sorted list.  First fit rather than best fit because it is the one
      * that keeps the list's order useful: best fit needs the whole list every time, and
      * for the allocation patterns programs actually have -- mostly the same size over
@@ -151,19 +194,54 @@ void *malloc(size_t n) {
     block_t **slot = &free_list;
 
     while (*slot != NULL) {
-        if ((*slot)->size >= need) {
+        if ((*slot)->size >= span) {
             block_t *b = *slot;
+
+            /* Somebody wrote to a block that had been freed.
+             *
+             * The payload is poisoned on the way out, so this is the first moment the fact
+             * can be seen -- and seeing it here names both ends: the caller being given a
+             * block that is not as `free()` left it, and the sixteen bytes that say who
+             * changed it.  A program that frees something and keeps using it is a bug in
+             * that program, and it is invisible everywhere else: the block is still a
+             * plausible size and a plausible address, so the allocator carries on until the
+             * free list itself is a chain of nonsense and `free()` walks into the program's
+             * text.
+             *
+             * Reported rather than refused.  A refusal would turn a use-after-free into a
+             * failed `malloc()`, which is a different failure with a different cause and
+             * would hide the one that is here. */
+            {
+                const unsigned char *p = (const unsigned char *)b + BLOCK_HDR;
+                size_t               n = b->size < 16 ? b->size : 16;
+
+                for (size_t i = 0; i < n; i++) {
+                    if (p[i] != FREED_PATTERN) {
+                        char msg[200];
+                        int  k = snprintf(msg, sizeof(msg),
+                                          "malloc: block %p (%zu bytes) was written "
+                                          "after being freed: %02x at +%zu; handing it "
+                                          "to %p\n", (void *)p, b->size, p[i], i,
+                                          __builtin_return_address(0));
+
+                        if (k > 0)
+                            (void)!write(2, msg, (size_t)k);
+
+                        break;
+                    }
+                }
+            }
 
             /* Split when the remainder can hold a block of its own.  A remainder smaller
              * than a header plus a minimum payload is left attached, because splitting it
              * would produce a block whose payload is too small for anything to allocate. */
-            if (b->size >= need + BLOCK_HDR + MIN_BLOCK) {
-                block_t *rest = (block_t *)((char *)b + BLOCK_HDR + need);
+            if (b->size >= span + BLOCK_HDR + MIN_BLOCK) {
+                block_t *rest = (block_t *)((char *)b + BLOCK_HDR + span);
 
-                rest->size = b->size - need - BLOCK_HDR;
+                rest->size = b->size - span - BLOCK_HDR;
                 rest->next = b->next;
                 rest->free = 1;
-                b->size = need;
+                b->size = span;
 
                 /* The remainder *replaces* the block in the list, and the block leaves it.
                  *
@@ -185,6 +263,12 @@ void *malloc(size_t n) {
             }
 
             b->free = 0;
+
+            /* The redzone, painted rather than left alone: an overflow that writes zeros
+             * over it has to be caught as firmly as one that writes anything else.  See
+             * `REDZONE`. */
+            memset((char *)b + BLOCK_HDR + need, FREED_PATTERN, REDZONE);
+
             return (char *)b + BLOCK_HDR;
         }
 
@@ -206,29 +290,31 @@ void *malloc(size_t n) {
      * "calloc" failing before it had run a single `printf`. */
     char *before = heap_break;
 
-    if (sbrk((intptr_t)(BLOCK_HDR + need)) == NULL)
+    if (sbrk((intptr_t)(BLOCK_HDR + span)) == NULL)
         return NULL;
 
     size_t got = (size_t)(heap_break - before);
 
-    if (got < BLOCK_HDR + need)
+    if (got < BLOCK_HDR + span)
         return NULL;            /* cannot happen: the kernel rounds *up* */
 
     block_t *b = (block_t *)before;
-    size_t   rest = got - BLOCK_HDR - need;
+    size_t   rest = got - BLOCK_HDR - span;
 
-    b->size = need;
+    b->size = span;
     b->next = NULL;
     b->free = 0;
 
     if (rest >= BLOCK_HDR + MIN_BLOCK) {
-        block_t *tail = (block_t *)((char *)b + BLOCK_HDR + need);
+        block_t *tail = (block_t *)((char *)b + BLOCK_HDR + span);
 
         tail->size = rest - BLOCK_HDR;
         tail->next = NULL;
         tail->free = 1;
         block_free(tail);
     }
+
+    memset((char *)b + BLOCK_HDR + need, FREED_PATTERN, REDZONE);
 
     return (char *)b + BLOCK_HDR;
 }
@@ -240,6 +326,39 @@ void free(void *p) {
     /* The caller's pointer is the payload; the header is the eight bytes *before* the
      * sixteen-byte-aligned payload start, which is `BLOCK_HDR` bytes back. */
     block_t *b = (block_t *)((char *)p - BLOCK_HDR);
+
+    /* Written past the end of this block?
+     *
+     * A block carries `REDZONE` bytes at the end of its payload that nobody is ever told
+     * about, and `malloc()` paints them.  If they are not still painted, a caller wrote past
+     * what it was given -- and the write landed on the *next* block's header, which is how
+     * the free list ends up holding an address from the program's own text and `free()`
+     * walks into it.  Naming it here names the caller while it is still the only one who
+     * could have been it. */
+    {
+        size_t usable = b->size > REDZONE ? b->size - REDZONE : 0;
+
+        for (size_t i = 0; i < REDZONE; i++) {
+            size_t at = usable + i;
+
+            if (at >= b->size)
+                break;          /* a minimum-sized block has no room for a redzone */
+
+            if (((const unsigned char *)p)[at] != FREED_PATTERN) {
+                char msg[220];
+                int  k = snprintf(msg, sizeof(msg),
+                                  "free: block %p (%zu bytes) was written past its "
+                                  "end: %02x at +%zu, freed from %p\n", p,
+                                  usable, ((const unsigned char *)p)[at], at,
+                                  __builtin_return_address(0));
+
+                if (k > 0)
+                    (void)!write(2, msg, (size_t)k);
+
+                break;
+            }
+        }
+    }
 
     block_free(b);
 }
@@ -282,16 +401,22 @@ void *realloc(void *p, size_t n) {
 
     block_t *b = (block_t *)((char *)p - BLOCK_HDR);
 
-    /* Shrinking in place is free and always right. */
-    if (n <= b->size)
+    /* Shrinking in place is free and always right -- and the redzone moves with it, because
+     * the block is now `payload + REDZONE` and a smaller request has to leave its own
+     * redzone painted where the caller will look for it. */
+    if (n <= b->size) {
+        if (b->size > REDZONE)
+            memset((char *)p + (b->size - REDZONE), FREED_PATTERN, REDZONE);
+
         return p;
+    }
 
     void *q = malloc(n);
 
     if (q == NULL)
         return NULL;        /* the old block is untouched, as POSIX requires */
 
-    memcpy(q, p, b->size);
+    memcpy(q, p, b->size > REDZONE ? b->size - REDZONE : b->size);
     free(p);
 
     return q;
