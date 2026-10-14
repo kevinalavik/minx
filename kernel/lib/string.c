@@ -1,6 +1,7 @@
 #include "string.h"
 
 #include "io.h"
+#include "panic.h"
 #include "types.h"
 
 void *memset(void *dst, int c, size_t n) {
@@ -32,6 +33,27 @@ void memzero(void *dst, size_t n) {
 void *memcpy(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
+
+    /* A length like this is not a copy.
+     *
+     * Sixteen gibibytes is a subtraction that underflowed, or a length read out of
+     * something that was not a length -- and copying it is not slow, it is fatal.  The walk
+     * goes straight through the page tables, and when it reaches them the machine stops
+     * with no message, no fault and nothing on the serial port, because the page table it
+     * was writing through is the one the console would have been printed from.  That is
+     * what this replaces: a `fork` that handed its parent a list of pages, an unsigned
+     * subtraction of "what this fork took" from "what the list now holds", and silence.
+     *
+     * Refused rather than attempted.  A panic names the length, both addresses and the
+     * instruction that asked, and leaves the machine stopped where a register dump can be
+     * read.  The limit is generous -- nothing in this kernel copies more than a megabyte --
+     * so a real copy is never caught. */
+    if (n > (size_t)16 * 1024 * 1024) {
+        panic("memcpy: %lu bytes from %p to %p, called from %p -- refusing\n",
+              (unsigned long)n, src, dst, __builtin_return_address(0));
+        return dst;
+    }
+
     while (n >= 8 && !(((uintptr_t)d | (uintptr_t)s) & 7u)) {
         *(uint64_t *)d = *(const uint64_t *)s;
         d += 8;
