@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "kmalloc.h"
+#include "spinlock.h"
 
 /* The kernel build routes kprintf through the console; on the host the dump
  * goes to stdout instead. */
@@ -200,4 +201,60 @@ int main(void) {
     fuzz();
 
     return free_after >= free_before ? 0 : 1;
+}
+
+/* --- the kernel's output and its locks, absent from a host harness ------------------
+ *
+ * `kprintf()` grew a console lock and a "how long have we been silent" check, and this
+ * harness links `kprintf.c` directly -- so it needs those symbols even though there is
+ * nothing here to lock.
+ *
+ * The stubs are here rather than `#ifdef`-ed out of `kprintf.c` for two reasons.  The real
+ * definitions live in a driver that pulls in the framebuffer, a PS/2 font and a keyboard,
+ * none of which link on a host.  And a guarded-out call site is one build flag away from
+ * compiling in the wrong place, in the one file every program prints through.
+ *
+ * A missing symbol the harness supplies is a link error naming the harness.  A missing
+ * symbol a macro hides is a kernel that was never built the way anyone reads it.
+ *
+ * One processor, so every one of these is a no-op.  The one that is *not* a no-op is
+ * `panic()`: it must not return, because everything after it assumes the machine stopped. */
+static unsigned long harness_now_ms;
+
+uint64_t timer_uptime_ms(void) {
+    return harness_now_ms++;
+}
+
+void console_lock_init(void) {
+}
+
+void console_lock(void) {
+}
+
+void console_unlock(void) {
+}
+
+void console_write_locked(const char *data, size_t len) {
+    fwrite(data, 1, len, stdout);
+}
+
+void panic(const char *fmt, ...) {
+    va_list ap;
+
+    fputs("panic: ", stderr);
+
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+
+    fputc('\n', stderr);
+    exit(70);            /* the shell's convention for "stopped"; anything non-zero will do */
+}
+
+void ticket_lock(ticket_lock_t *l) {
+    (void)l;
+}
+
+void ticket_unlock(ticket_lock_t *l) {
+    (void)l;
 }

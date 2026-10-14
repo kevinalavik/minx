@@ -988,6 +988,36 @@ attribution was the part that said something about the lock.
 
 ## Known bugs
 
+**`make test-host` had never run. Its allocator fuzz test now runs, and it fails.**
+
+This session's work started by finding that `make test-host` -- a documented gate -- did not
+link, because `kprintf.c` had grown a console lock and a silent-period check and the host
+harness had never been given those symbols.  Supplying them was the easy half.  The other
+half was that the harness then died with SIGSEGV before printing anything:
+`kmalloc_attach_region()` takes the allocator lock with `spin_lock_irqsave()`, which does
+`cli`, which is privileged and raises SIGSEGV in user mode.
+
+So the gate had been red for a long time and nobody had run the thing inside it.  With
+`io.h`'s `irq_save()`/`irq_restore()` given a host path (`__minx_host__`, defined only by the
+harness's own build line), it runs, and its first output is:
+
+```
+[warn] heap: block 0x55aa190d6ec0 (2704 bytes) was written past its end: 0 at +2704, freed from 0x55aa1905d528
+FUZZ BAD HEADER after alloc: slot 34 len=819 size=896 free=0
+```
+
+**A block of 2704 bytes was written one byte past its end, and a slot's header no longer
+matches its length.**  That is a real allocator defect and it is in `kernel/mm/kmalloc.c`,
+which the header comment in `kernel/lib/stdlib.c` already describes as keeping its redzones
+and its freed-block poisoning permanently -- so the instrumentation that found this has
+always been in place and has never run.
+
+**Not yet diagnosed.**  The next thing to do is get the fuzz case down: the test prints the
+slot, the requested length, the header's own size and whether the block is free, which is
+enough to tell an overflow of the previous block from a corrupted header, but not enough to
+say which of the allocator's paths produced it.
+
+
 **The graphical console is flanterm, and it is fixed (VERIFIED).**
 
 `docs/SPEC.md` named flanterm as the intended terminal emulator and it is now what draws
@@ -1431,13 +1461,20 @@ for the length of a null pointer.
 
 ## Next
 
+**Two things, and the second is older than the first.**
+
+1. **`ls` on a *directory* prints nothing and exits 1.**  `ls` of a file is fine.  It is in
+   "What is still broken" with everything that has been ruled out, and the honest summary is
+   that `getdents()` on an `O_DIRECTORY` descriptor fails and `ls` reports a stale `errno`
+   instead of saying so.
+
+2. **`make test-host` has never actually run**, and its allocator fuzz test now finds a real
+   defect -- a block written one byte past its end.  See "Known bugs".  This is first on the
+   list in the sense that matters: a gate that is red for want of a link is worse than no
+   gate, because it looks like one.
+
 **Phase 9 is done -- 45/45, `shtest` 53 of 53 -- and phase 10 has ten coreutils and the
 automated test per tool the spec asks for.**
-
-The first thing on this list is one check: `ls` on a *directory* prints nothing and exits 1.
-`ls` of a file is fine.  It is in "What is still broken" with everything that has been ruled
-out, and the honest summary is that `getdents()` on an `O_DIRECTORY` descriptor fails and
-`ls` reports a stale `errno` instead of saying so.
 
 **Then: `node_alloc()` bounds-checking its free list.**  It indexes `nodes[ino - 1]`
 before checking that `ino` is a node number, and the kernel redzone reports a node whose

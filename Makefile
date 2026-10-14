@@ -841,14 +841,24 @@ test-host: $(BUILD)/kmalloc-host-test
 test-parser:
 	sh tools/sh-parser-test.sh
 
+# The headers are prerequisites for the same reason `$(LIBC)` is one for a user program: the
+# test `#include`s them, so a change to one has to rebuild it.  Without them, fixing a header
+# and re-running the test runs the *old* binary and reports it as a pass -- which is how the
+# `cli` fix in `io.h` appeared to do nothing at all on the first run.
+#
+# They are prerequisites and not sources, so the recipe filters them back out of `$^`.
+KERNEL_HDRS := $(wildcard $(KERNEL_DIR)/include/*.h)
+
 $(BUILD)/kmalloc-host-test: tools/kmalloc-host-test.c $(KERNEL_DIR)/mm/kmalloc.c \
-                            $(KERNEL_DIR)/lib/string.c $(KERNEL_DIR)/lib/kprintf.c
+                            $(KERNEL_DIR)/lib/string.c $(KERNEL_DIR)/lib/kprintf.c \
+                            $(KERNEL_HDRS)
 	@mkdir -p $(dir $@)
 	# The kernel declares strlcpy/strlcat, which glibc also declares with a
 	# different return type.  The kernel's versions are what the test wants,
 	# so the clash is silenced rather than papered over in the header.
 	$(CC) -std=gnu11 -O1 -g -Wno-incompatible-library-redeclaration \
-	      -I$(KERNEL_DIR)/include $^ -o $@
+	      -D__minx_host__=1 -I$(KERNEL_DIR)/include \
+	      $(filter-out $(KERNEL_HDRS),$^) -o $@
 
 # ----------------------------------------------------------------- clean ---
 

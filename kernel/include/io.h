@@ -97,6 +97,32 @@ static inline bool interrupts_enabled(void) {
     return (flags & 0x200) != 0;
 }
 
+/* `cli`, `sti` and `popfq` are privileged.  In user mode they raise #GP, which arrives as
+ * SIGSEGV, so a host harness that includes this header cannot use them.
+ *
+ * That is not hypothetical: `tools/kmalloc-host-test.c` compiles `kmalloc.c` against this
+ * header, and `kmalloc_attach_region()` takes the allocator lock with `spin_lock_irqsave()`,
+ * so the allocator's own initialisation killed the process with a segmentation fault before
+ * it printed anything.  `make test-host` has been a red gate rather than a working one.
+ *
+ * `__minx_host__` is defined by the harness's own build line and by nothing else, so a
+ * kernel build cannot accidentally take the host path.  The flags are still read and still
+ * returned, because callers pass them back to `irq_restore()` and a mismatch of shape is a
+ * worse thing than a no-op; only the privileged instructions go away. */
+#ifdef __minx_host__
+
+static inline uint64_t irq_save(void) {
+    uint64_t flags;
+    __asm__ volatile("pushfq\n\tpopq %0" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint64_t flags) {
+    (void)flags;
+}
+
+#else
+
 static inline uint64_t irq_save(void) {
     uint64_t flags;
     __asm__ volatile("pushfq\n\tpopq %0\n\tcli" : "=r"(flags) :: "memory");
@@ -107,6 +133,8 @@ static inline void irq_restore(uint64_t flags) {
     __asm__ volatile("pushq %0\n\tpopfq" :: "r"(flags) : "memory",
                      "cc");
 }
+
+#endif
 
 #define MSR_EFER   0xc0000080
 #define MSR_STAR   0xc0000081
