@@ -1215,3 +1215,54 @@ cautious than this case needs: a duplicated `free()` of the same pointer twice i
 function is not a feature that a flag can select between. Keeping both behind an option
 would mean shipping a shell whose `x=1` can either work or corrupt the heap, which is a
 worse artefact than either version alone.
+
+## `fork` copies every user page, because `CR4.WP` cannot be had
+
+**Decision.** `vmm_fork_aspace()` gives the child a private frame for every user page at the
+moment of the `fork`. It does not mark pages copy-on-write and hope for a write fault.
+`fork_copy_page()` in `kernel/mm/vmm_user.c` is the implementation.
+
+**Why.** `CR4.WP` is the bit that makes a read-only page mean something. It is not set,
+because QEMU 11.1.2 treats bit 16 of CR4 as reserved and raises #GP for `mov %cr4` with it
+set — measured three ways (`-accel kvm`, `-accel tcg,thread=multi`, `-cpu max`) and on the
+register form rather than the immediate one, so it is QEMU's CR4 mask and not the encoding.
+With the bit clear, a store to a read-only *user* page does not trap: it writes the frame.
+
+Every piece of the copy-on-write design assumed the opposite. The observable cost was a
+child that resumed perfectly — `fork` returned zero, the frame said `rax = 0` and the right
+`rip`, the child branched on `pid == 0` — and then its `ret` popped a stack word the parent
+had already reused for a later call's return address, so it landed past the branch and ran
+the parent's code. The parent's `trace` call, twenty instructions later on a different
+processor, was enough. That is the whole of the intermittent "fork returns non-zero in the
+child", and it was reported as a scheduler bug for days because nothing anywhere said a
+page was shared.
+
+**Alternatives considered.**
+
+- *Set `CR4.WP` anyway.* Not available; see above.
+- *Eager copy of writable pages only, share read-only ones.* Cheaper, and it leaves the
+  same class of bug one level down: a program that writes its own text would corrupt its
+  twin, silently, which is the identical failure with a rarer trigger.
+- *Keep marking, and have `syscall_prepare_write()` cover the parent's writes as well.* It
+  already does, and it was never the problem: `syscall_prepare_write()` covers the three
+  *kernel* stores into user memory. The parent's own ring-3 stores are nothing's business
+  but the processor's, and the processor is not watching.
+- *One `PTE_COW` bit read at fault time is cheaper.* There is no fault to read it at.
+
+**Cost.** Memory proportional to the parent's user address space per live child, instead of
+proportional to what it writes. Bounded by `COW_MAX_PAGES` (1024 pages, 4 MiB) per `fork`;
+past that `fork` fails and says so. A shell forks once per command substitution and forks
+about eight times in `shtest`, so the shell's whole address space is copied eight times and
+freed as the children exit.
+
+**Left in place deliberately.** `PTE_COW`, `vmm_cow_fault()`, the `cow_list_t` record and
+`syscall_prepare_write()` all still exist and are still correct; a `fork` simply no longer
+produces the state they exist to resolve. They are also the only thing that has to change
+the day a target with a working `CR4.WP` arrives — the marking is one function, and it is
+written so that putting it back is putting it back.
+
+**Why not record this as "a workaround".** It is not a degraded copy-on-write standing in
+for the real thing. On a machine where a write to a read-only page does not trap, copying
+at the `fork` *is* the correct implementation, and the lazy version is the incorrect one:
+it is only correct because of a processor feature the kernel cannot ask for. The cost is
+real and is stated above; the correctness is not a compromise.

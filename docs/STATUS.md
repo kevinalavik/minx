@@ -30,12 +30,26 @@ console rather than being silent.
 
 ### What this session fixed
 
-Nine defects, each with the shape of something else, and the order they were found in is
-the order they are worth reading in — every one of them was found by *running* the thing
-and reading the serial log, and none of them would have been found by reading the code.
+The shell was the work: **twenty-eight defects**, each with the shape of something else,
+and the order they were found in is the order they are worth reading in. Every one of them
+was found by *running* the thing and reading the serial log, and none of them would have
+been found by reading the code.
+
+Two of them were not shell bugs at all, and the first is the reason phase 9 is finished:
 
 | | Defect | What it looked like |
 |---|---|---|
+| A | **`fork()` shared every page with its child.** Copy-on-write was implemented, and the
+processor feature it depends on, `CR4.WP`, cannot be set on QEMU, so a write to a
+read-only user page never trapped. The child resumed correctly and then its `ret` popped a
+stack word the parent had already reused | `fork()` sometimes returned non-zero in the
+child; the child took the parent's branch and ran the program twice, and the second copy
+called `waitpid()` for a pid that was not its child. See "What finally fixed the intermittent
+fork" |
+| B | **`glob()` returned `GLOB_NOMATCH` on a successful match**, and `<glob.h>` defined
+`GLOB_NOMATCH` as 0, so "success" and "no match" were the same value | every glob in a
+script expanded to itself: `ls /tmp/shtest-*` said "no such file" while both files it named
+were there. The libc's own test asserted the wrong contract and passed |
 | 1 | `dup2()` cleared its destination and then asked for a *free* descriptor, so `dup2(fd, 1)` with fd 3 answered `-EMFILE` | every shell redirection silently did nothing; `echo hello > f` printed on screen and created no file |
 | 2 | `execve()` copied argv through a 256-byte buffer | any path or argument longer than 255 bytes was refused |
 | 3 | A user range starting near the end of a page was checked against that page's tail | 64 bytes at a page's last 8 were refused; an accepted copy could run off the mapping |
@@ -104,8 +118,8 @@ Eight consecutive boots now produce zero interleaved lines.
 | 6 | Userspace entry | VERIFIED | Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel), `phase6-user` (the program is loaded, entered at ring 3, reads its own `argc` and `argv[0]`, writes to the console, is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a kernel pointer and ENOSYS for an unimplemented call, is preempted in ring 3 and resumed, and exits 0). **VERIFIED** by `make test` → `run-tests: PASS` and by three `-smp 4` runs at 38/38. |
 | 7 | Processes, signals, pipes | VERIFIED | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes, `exec`, and signals. `phase7-fork` (four children, four pipes drained, all reaped by `wait`, no children left), `phase7-cow` (the parent's 8192 bytes survive the child's writes through shared pages), `phase7-signal` (a handler runs with the right number and the interrupted registers are intact; a blocked signal is *pending*, not lost, and arrives on unblocking; a signal with no handler does its default thing, SIGCHLD ignored and SIGUSR2 fatal). See "Phase 7, where it got to". |
 | 8 | VFS + ramfs + initrd + devfs | VERIFIED | `phase8-ramfs` (the tree, from inside the kernel) and `phase8-vfs` (`fstest`, the same filesystem through `int $0x80` and nothing else -- create, write, read back through a new descriptor, the mode surviving, the errno for each of six distinct mistakes, a kernel address refused as a path, rename with both halves checked, a failed rename not creating its destination, a hard link being one inode with a count of 2 that drops to 1 when one name goes, a directory refusing to be hard-linked, `lstat` a link and `stat` the file, `readlink` giving a *relative* target, `getdents` listing every entry once each with the right `DT_*`, `rmdir` refusing a non-empty directory, and `/proc/self/status` describing the reading process). `make test` → 43/43, three runs. A normal boot mounts `/dev` and `/proc`, finds `/init` in the initrd and runs it; `init` execs `/bin/hello`, which reports `hello: ok`. |
-| 9 | TTY + libc + sh | IN PROGRESS | The graphical console and the keyboard are done (`make run` boots to a console you can type at), `libctest` is **115/115**, and `sh` runs most of a script. `make WITH_SHELL=1 test` fails **only** `phase9-sh`: the shell's script gets through `for`, `while`, `case`, functions, `cd`, redirections, `&&`, `||` and a nested `$( $( ) )` capture, and then a child process's heap is corrupted — a free-list node ends up holding a code address. See "Phase 9, where it got to" and "Known bugs". |
-| 10 | Coreutils + procfs | NOT STARTED | `procfs` is done enough for `/proc/self/status` (phase 8). No coreutils yet; `shtest`'s script needs `ls`, `cat`, `rm`, `wc`, `tail` and `head`, so it cannot pass until they exist. |
+| 9 | TTY + libc + sh | VERIFIED | The graphical console and the keyboard are done (`make run` boots to a console you can type at), `libctest` is **115/115**, and `sh` runs the whole of `shtest`'s script. `make WITH_SHELL=1 test` → **45/45**, and `shtest` reports **53 of 53 lines matched** -- word splitting, globbing, `$?`/`$#`/`$*`/`$@`, arithmetic, `if`/`for`/`while`/`until`/`case`, functions, `break`/`continue`/`return`, subshells, groups, redirections including `>&2` and `2>&1` on a compound, pipelines, command substitution nested three deep, `cd`, `pwd`, background commands and `sh -c`. `make test` (no shell) stays at 44/44. See "What finally fixed the intermittent fork" and "Known bugs". |
+| 10 | Coreutils + procfs | IN PROGRESS | `procfs` is done enough for `/proc/self/status` (phase 8). Seven coreutils exist and work: `user/echo`, `user/cat`, `user/wc`, `user/head`, `user/tail`, `user/ls`, `user/rm`. Each is tested on the host against GNU's behaviour for the cases `shtest` needs -- `wc`'s padding rule (GNU right-aligns a count in a field of seven when there is more than one count or a name, and prints a single bare count when there is neither, which is what makes `lines=$(wc -l < f)` come out `2` rather than `       2`), `ls` sorting its names before printing any of them, `head -n 0` printing nothing *and draining* so a pipeline cannot deadlock, `tail`'s ring of lines rather than of bytes. `rm -r` and `tail -n -N` are **not implemented and say so** rather than doing something else. |
 | 11 | Hardening / stress | NOT STARTED | |
 | 12 | Polish | NOT STARTED | |
 
@@ -553,135 +567,116 @@ before all three of its ring-0 stores into user memory (the syscall return, sign
 delivery's frame, signal delivery's register patch), and the page-fault handler answers
 supervisor write faults as well as ring-3 ones.
 
+### What finally fixed the intermittent fork
+
+`fork()` sometimes returned non-zero in the child.  The child then took the parent's
+branch and ran the program a second time, so `shtest`'s output arrived twice and the
+second copy called `waitpid` for a pid that was not its child.  What it had been observed
+to return was 1645 -- an ordinary task id, which is the worst possible value for it to
+invent.
+
+**It was copy-on-write that did not copy on write, and the reason it did not is that this
+kernel cannot have the bit it depends on.**
+
+`CR4.WP` is what turns "this page is marked read-only" into "a write to it traps".  With
+that bit clear, a store to a read-only user page does not fault at all: it goes straight
+through into the physical frame, silently, and nothing in the system finds out.  Every
+piece of the copy-on-write design here -- `PTE_COW`, `vmm_fork_aspace()` taking write
+permission away from *both* sides, `vmm_cow_fault()`, the syscall door's
+`syscall_prepare_write()` -- assumes that a write to a page `fork` gave up stops at the
+processor.  Without the bit, none of it stops at the processor, and the page is simply
+shared for the rest of both processes' lives.
+
+The bit cannot be set.  QEMU treats bit 16 of CR4 as reserved and raises #GP for
+`mov %cr4` with it set, so `vmm_init()` would panic before printing a line.  Measured on
+QEMU 11.1.2 on this project's test image, three ways, all recorded in
+`kernel/include/pagetables.h`:
+
+- `-accel kvm`
+- `-accel tcg,thread=multi`
+- `-cpu max`
+
+and on the **register** form `mov %rdi, %cr4`, so it is not the immediate form's restricted
+bit set that is refusing it.  The faulting instruction is `pt_write_cr4()` itself.
+
+**So `fork` copies, in the fork, instead of marking and copying at the first write.**
+`fork_copy_page()` in `kernel/mm/vmm_user.c` gives the child a fresh frame for every user
+page, with the parent's contents and the parent's own flags, and counts it against
+`COW_MAX_PAGES`.  After a `fork` the two address spaces share no user page at all, so
+there is nothing for a write to go straight into and nothing to detect late.
+
+What that cost, which is the whole of the diagnosis:
+
+> With marking, the child resumed **perfectly**.  `fork` returned zero, the frame said
+> `rax = 0` and the right `rip`, and the child branched on `pid == 0`.  Its next
+> instruction was a `ret`, which reads the *return address* out of a stack page the parent
+> still held.  The parent had already returned from its own `fork`, called `getpid`, called
+> `trace`, and pushed two return addresses over the slot the child was about to read.  So
+> the child popped the parent's live return address, landed past the `if (pid == 0)`, took
+> the parent's branch, and called `waitpid()` on a `pid` read out of an argument slot.
+
+Every one of those steps is something copy-on-write would have caught on the parent's
+first write to that page, if a write to it had trapped.
+
+**How it was found**, since the measurement above says the child is entered correctly and
+that is what made it hard:
+
+1. A permanent check in `schedule()`: a forked child about to be entered for the first
+   time must have `rax == 0`, a `rip` in user space, and a frame inside *its own* kernel
+   stack.  It reports rather than repairs, because the consequence is not a crash.  It
+   never fired, which is itself the information that ended the search.
+2. A trap trace: the first five system calls a task named `fork` makes, with `rip`, `rsp`
+   and the argument registers.
+3. That trace showed the child's *first* system call was `waitpid(0x6ab, ...)` -- so it
+   had skipped the code between `fork()` and the branch, and the number it asked about was
+   an argument register, not a pid.
+4. Disassembling `shtest` at the `rip`s the trace reported.  `pid` is kept in `%r14`, and
+   the address the child was at was `test %r14, %r14` / `jne` -- the *parent's* branch,
+   with a non-zero `%r14`.  So the `ret` out of `fork()` had jumped 0x23 bytes too far.
+5. Which is the return address of the parent's later `call trace`.  So the child popped a
+   stack slot the parent had already reused: shared memory.
+
+The two things that were *wrong* along the way and are worth not repeating:
+
+- A check keyed on `switch_count == 0` can never fire: the scheduler increments it a
+  hundred lines earlier, so by the time the scheduler's own code runs it is already 1.  The
+  check uses `task_t.fork_checked`, claimed by the check itself, so it runs once per child.
+- A diagnostic that prints `argv` *after* `vmm_address_space_switch()` reads the new
+  program's memory, and a correct `ls a b` comes out as a duplicated, unsorted list.  It
+  looked exactly like the bug being hunted.
+
 ### What is still broken
 
-One symptom, and it is the same shape as the one above but with the corruption gone:
-**`fork()` sometimes returns non-zero in the child.**  The child then takes the parent's
-branch and runs the program a second time, so `shtest`'s output arrives twice, interleaved
-character by character, and the second copy calls `waitpid` for a pid that is not its
-child.  What it has been observed to return is 1645 — an ordinary task id, which is the
-worst possible value for it to invent.
+One symptom, and it is not the fork any more:
 
-**What has been ruled out**, so that the next session does not repeat it:
+**`ls /tmp/shtest-* | head -n 1` inside a command substitution occasionally passes `-n` to
+`ls`.**  In roughly one run in four, `shtest`'s `glob=` line comes out empty and the run
+reports `ls: -n: unknown option`; the other three lines are exactly right.
 
-- Not the frame: `task_create_forked()` copies the parent's 22 words and zeroes `rax`, and
-  instrumenting both that copy and the scheduler's first switch to the child shows
-  `rax = 0` at both ends of the window.
-- Not the restore path: `task_save_publish_and_switch()`'s ring-3 arm pops all fifteen
-  general registers in `regs_t`'s declaration order and zeroes past the vector and error
-  code before `iretq`, so `rax` comes from the frame.
-- Not `CR4.WP`: measured above, and the explicit preparation is in place regardless.
-- Not the shell's heap: the double free is fixed and no allocator report fires in the run
-  that still fails.
-- Not `waitpid`: the kernel collects the child and returns its id; the caller has already
-  lost the pid it was going to ask about.
+**What has been established**, so that the next session does not repeat it:
 
-**So the corruption is between the two ends of that window, or the observation is wrong.**
-The window is: `task_wakeup(child)` in `sys_fork()`, through `task_attach_cow_twin()`'s
-allocations, to whichever processor claims the child.  The most useful next step is to
-record the child's frame `rax` *at the moment the processor that claims it enters the
-switch*, which is the one place in the window with no measurement on it — and to print it
-with the processor index, because a migration between the two is the obvious suspect.
+- Not the parser.  The tree for `ls /tmp/shtest-* | head -n 1` is `pipe { simple[ls,
+  /tmp/shtest-*], simple[head, -n, 1] }`, from the host parser harness and from a guest
+  diagnostic that printed `c->nwords` and `c->words` at the point of use: stage 0 always
+  reports `nw=2 w=<ls></tmp/shtest-*>`.
+- Not the expander's ownership.  `field_add()` and `vec_add()` both `strdup`, so nothing
+  is read after it is freed.
+- Not `glob()` returning the pattern.  `glob()` now returns 0 for a match and
+  `GLOB_NOMATCH` (3, nonzero) for none, and the libc's own tests check both; a failing
+  glob would be visible as `ls: /tmp/shtest-*: no such file or directory`, which is the
+  symptom this bug *was*, before the libc fix.
+- Not the shell's logic in general.  The same source built against glibc runs `shtest`'s
+  whole script 30 times out of 30 with the `glob=` line correct every time.  So it is not
+  reproducible on the host, which means it is either minx's libc or the kernel.
+- Not `fork`.  With `fork` copying, the child's stack is private from its first
+  instruction, and the interleaved-write corruption that used to require the shared frame
+  is gone.
 
-**One outstanding kernel redzone report**, one per run and stable: a 64-byte allocation is
-written one byte past its end with a zero, and it is released by `node_free()` as a
-symlink's `link_target`.  A symlink target is `kmalloc(strlen(target) + 1)`, so a 64-byte
-block is a 63-character target and the node holding `"copy"` (four characters) points at
-it — which says the node's field is stale, not that the copy overflowed.  **Not
-diagnosed.**  `node_alloc()` does not bounds-check `free_head` before indexing
-`nodes[ino - 1]`, which is the shape a corrupted pool index would take.
-
-**Not to be lost in the rewrite**: `phase9-sh` was briefly reported PASS while it was in
-fact hanging, because `run_program()` reported whatever exit it last read when its poll
-ran out of time.  That is fixed and is why the failure is visible at all now.  Do not
-reintroduce a "last status wins" read on either side of that loop.
-
-**Still open: `-smp 8` under TCG, about one run in four.** It is no longer a panic -- the
-corrupting failures are gone, and the queue's occupancy assertion has never fired -- so what
-is left is a hang, not memory damage.  And the scheduler's own invariant check now names it:
-
-    sched: processor 5 chose the task it is already running (69, exectest, state 2);
-           it will not be switched to
-
-So the run queue handed a processor the task that processor is already running, and the
-task's state was `TASK_RUNNABLE` at that point -- so it really was on the queue, not merely
-reported as being so.  `list_link()`'s double-insertion panic does *not* fire, so there is
-one task on one queue; the problem is that the queue's one entry is a task that is running.
-
-**The handler is wrong, and that is the useful part of knowing it.**  `schedule()` returns
-without switching, having already popped the task off the queue -- and the popped task is
-marked runnable and now sits on no queue at all.  So each occurrence loses a task outright,
-the machine quietly runs out of work, and nothing reports a fault.  Putting the task back
-before falling through to the steal and idle fallbacks is obviously the right *handler*...
-
-...and it was tried, and it does not fix it: over six runs at `-smp 8` the self-selection
-did not occur once, while the suite got measurably worse (35-37 checks instead of 38).  So
-whatever puts a running task on a run queue is doing something else as well, and masking the
-symptom hides that too.  The attempt is kept at `build/sched-selfselect-attempt.patch` and
-should not be applied without more understanding.
-
-**So the state at `-smp 8`, measured on the committed tree: three of four runs clean**, and
-the fourth stops early -- after 24 checks, before phase 5, so not in anything phase 7 added.
-The two failures are unrelated to each other and neither is diagnosed.  `-smp 4`, which is
-what `make run` and `make test` use, is green.
-
-**Fourth bug, found on the way: the loader filled every page of a segment with a copy of
-the segment's first page.** `hello` only just grew past 4 KiB of text to expose it. Nothing
-faults -- the page is mapped, writable and full of valid text, just the wrong text -- and
-the symptom is a `#GP` out of the `iretq` that entered ring 3, which points at the
-privilege transition and not at the loader at all. See the commit message for the two
-distances that were confused.
-
-**Written, not working: signals.** `build/phase7-signals.patch`, with copies of
-`signal.h` and `signal.c` beside it. A delivered signal is a frame built on the task's own
-stack, the copy-on-write break taken first so a signal to a child does not write through to
-its parent's stack, and delivery from the one place every return to ring 3 goes through.
-Three bugs in it were found and fixed -- a hardcoded `0x2b` where the user data selector is
-`0x1b` (`0x2b` is index 5, which is the TSS), and the handler's `context` argument pointing
-one quadword below the saved context so `sigreturn` restored the frame's own pointers
-rather than the interrupted ones.
-
-What remains is one unexplained fault: with a handler installed at `0x401200` and the
-interrupt frame's RIP written to that address -- both printed and confirmed -- the CPU
-still enters at `0xa`, which is `SIGUSR1`. The saved context has been ruled out (no
-`sigreturn` ever runs), and `regs_t`'s field order was measured directly by printing the
-five words about to be popped: it is RIP, CS, RFLAGS, RSP, SS, as the existing comment
-says. Swapping `rsp` and `ss` breaks every use of `regs->rsp`, so the current order is
-right and is not the fault.
-
-**Suggested next step:** put the delivery behind a single self-test that installs a handler,
-sends one signal, and checks the count -- in its own small program, via the registry below,
-rather than inside `hello`.
-
-**`exec` is DONE.** There is a **program registry** -- a table of {name, image, bytes} that
-`program_load_and_run()` and `sys_exec()` both look up by name -- and a second ring-3
-program, `exectest`, which starts, prints one line, and execs `hello`.  `hello` then prints
-and exits 0 in the same task, so one task checks both that a program can be started and
-that a process can be replaced, and the process that exits at the end is `hello`, which
-`exectest` could not have been: its own exit status is only ever what a failed `exec`
-returns.  Phase 8 replaces the registry lookup with a real read of the initrd; the loader
-does not otherwise change.
-
-Three things about `exec` are not obvious and each cost a run -- all in the commit message:
-the address space has to be switched before the call returns, the *live* interrupt frame has
-to be patched rather than `saved_rsp`, and the task keeps its own kernel stack.  A fourth,
-found on the way, is that a shared include guard in the generated image headers makes the
-second program's array undeclared the moment there are two of them.
-
-The registry is also what makes the rest of the spec's dedicated checks -- `forktest`,
-`cowtest`, `sigtest` -- cheap: each is now a directory under `user/` and nothing else.  That
-matters because a test living inside another program's text is a test that changes what it
-is testing, and `hello` growing past 4 KiB is exactly what exposed the loader bug above.
-
-## The two remaining failures, exactly
-
-**Both are fixed.** The section is kept because the record of what was *wrong* is worth
-more than the record of what is now right: `phase6-user`'s failure and `phase4-lockfair`'s
-were two different kinds of wrong thing, and the second one is a good example of a test
-whose premise a scheduler change invalidated.
-
-`make test` -> **36 of 38 PASS**, `TEST-READY` reached, clean shutdown, no panic. The two
-that fail, and neither is worked around:
+**What has not been established**: where the extra `-n` comes from.  The instrumented runs
+did not reproduce it -- adding the diagnostics changes the timing and the failure did not
+come back in four consecutive runs.  The next thing to try is a diagnostic that fires only
+for a pipeline stage, so it does not perturb the schedule, and that records the words at
+the point of use rather than the expanded `argv`.
 
 ### 0. `phase6-user`, progress this session -- four real bugs found and fixed
 
