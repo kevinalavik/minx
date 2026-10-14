@@ -4,6 +4,7 @@
 
 #include "kprintf.h"
 #include "pmm.h"
+#include "spinlock.h"
 #include "string.h"
 #include "types.h"
 
@@ -40,6 +41,29 @@ static size_t used_bytes;
 static size_t free_bytes;
 static unsigned region_count;
 static bool pmm_backed;   /* the heap has taken real frames at least once */
+
+/* The heap's lock, and why it is not optional.
+ *
+ * Every processor allocates: a page table for a fault, a `task_t`, a pipe, a console
+ * context.  The free list is a singly linked chain threaded through the blocks themselves,
+ * so an allocation is a read-modify-write of `free_list` plus a read-modify-write of two
+ * neighbouring headers -- and two processors doing that at once produce a list with a block
+ * on it twice and a block on it not at all.
+ *
+ * What that looks like is nothing like a race.  A `kmalloc()` that walks into the cycle
+ * spins for ever holding no lock and printing nothing, and the machine is silent: there is
+ * no fault, no panic, and the last line of the log is the line before whatever asked for
+ * memory.  A block handed out twice is two subsystems writing over each other's data.  And
+ * `free_bytes` drifts away from the truth, so the heap eventually either refuses to give
+ * out memory it has or hands out memory it has not got.
+ *
+ * That is not hypothetical here: it is what `make WITH_SHELL=1 test` was doing, at a
+ * different place in the run each time.
+ *
+ * Irq-saving, because a frame is allocated from a page fault, which is an exception and
+ * not an interrupt -- and an interrupt that spins on a lock the interrupted code holds
+ * never returns at all. */
+static ticket_lock_t heap_lock;
 
 /* Payloads must stay 16-byte aligned for the atomic FPU/SSE context areas, and
  * a header has to be a whole number of those so that the next block's header
@@ -108,6 +132,8 @@ void kmalloc_attach_region(void *base, size_t size) {
     if (base == NULL || size < KM_HEADER_SIZE * 2)
         return;
 
+    uint64_t lflags = spin_lock_irqsave(&heap_lock);
+
     uint8_t *start = (uint8_t *)base;
     /* Trim the region so it is header-aligned. */
     start += (KM_ALIGN - ((uintptr_t)start & (KM_ALIGN - 1))) & (KM_ALIGN - 1);
@@ -127,6 +153,8 @@ void kmalloc_attach_region(void *base, size_t size) {
     free_list_insert(head);
     total_bytes += size;
     region_count++;
+
+    spin_unlock_irqrestore(&heap_lock, lflags);
 }
 
 void kmalloc_init(void) {
@@ -177,6 +205,8 @@ void *kmalloc(size_t size) {
         return NULL;
 
     size_t need = align_up_km(size);
+    void  *got = NULL;
+    uint64_t lflags = spin_lock_irqsave(&heap_lock);
 
     for (km_block_t *b = free_list; b; b = b->free_next) {
         if (b->size < need)
@@ -209,10 +239,12 @@ void *kmalloc(size_t size) {
 
         used_bytes += b->size;
         memset(payload_of(b), 0, b->size);
-        return payload_of(b);
+        got = payload_of(b);
+        break;
     }
 
-    return NULL;
+    spin_unlock_irqrestore(&heap_lock, lflags);
+    return got;
 }
 
 void *kzalloc(size_t size) {
@@ -251,8 +283,12 @@ void kfree(void *ptr) {
         return;
 
     km_block_t *b = block_of(ptr);
-    if (b->free)
+    uint64_t lflags = spin_lock_irqsave(&heap_lock);
+
+    if (b->free) {
+        spin_unlock_irqrestore(&heap_lock, lflags);
         return;   /* double free: refuse rather than corrupt the list */
+    }
 
     /* Remember what this allocation itself accounted for: coalescing below can
      * grow the block, and used_bytes must track payload handed out, not the
@@ -262,6 +298,8 @@ void kfree(void *ptr) {
     free_list_insert(b);
     coalesce(b);
     used_bytes -= own;
+
+    spin_unlock_irqrestore(&heap_lock, lflags);
 }
 
 char *kstrdup(const char *s) {
@@ -274,15 +312,27 @@ char *kstrdup(const char *s) {
 }
 
 size_t kmalloc_free_bytes(void) {
-    return free_bytes;
+    uint64_t lflags = spin_lock_irqsave(&heap_lock);
+    size_t    n = free_bytes;
+
+    spin_unlock_irqrestore(&heap_lock, lflags);
+    return n;
 }
 
 size_t kmalloc_used_bytes(void) {
-    return used_bytes;
+    uint64_t lflags = spin_lock_irqsave(&heap_lock);
+    size_t    n = used_bytes;
+
+    spin_unlock_irqrestore(&heap_lock, lflags);
+    return n;
 }
 
 size_t kmalloc_total_bytes(void) {
-    return total_bytes;
+    uint64_t lflags = spin_lock_irqsave(&heap_lock);
+    size_t    n = total_bytes;
+
+    spin_unlock_irqrestore(&heap_lock, lflags);
+    return n;
 }
 
 unsigned kmalloc_region_count(void) {
