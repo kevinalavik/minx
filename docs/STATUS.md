@@ -1280,8 +1280,9 @@ freeze, but it was a live hazard and is recorded because it was real.
 ## Test commands
 ```
 make test        # headless boot, in-kernel self tests, framebuffer dump; non-zero on failure
-make WITH_SHELL=1 test   # ...with /bin/sh and shtest in the image: 45 checks, phase9-sh red
-make test-host   # host-compiled allocator fuzz test (fast, no QEMU)
+make WITH_SHELL=1 test   # ...with /bin/sh and shtest in the image: 45 checks, shtest included
+make test-host   # host-compiled allocator fuzz test + the shell's parser against bash -n
+make test-parser # just the parser harness; a second or two, and it names the line
 make run         # graphical console in a QEMU window (SMP=4 MEM=512M by default)
 GUI=0 make run   # headless: serial console only
 make debug       # boot paused for GDB (tools/gdb-run.sh drives it in batch)
@@ -1310,8 +1311,9 @@ keys'                                                 # type at the console head
 `git push origin HEAD` fails in this environment with
 `could not read Username for 'https://github.com'` — no credential helper and no
 token available, and AGENTS.md forbids putting tokens in files or remotes. Retried
-at the end of phase 8, again after the four kernel fixes below, and again at the end
-of this session's nine; same answer every time. Every phase since phase one has
+at the end of phase 8, again after the four kernel fixes below, again after this
+session's nine, and again after the nine commits that finished phase 9; same answer
+every time. Every phase since phase one has
 committed locally for the same reason (see the commit "docs: record phase one push
 limitation").
 
@@ -1430,14 +1432,17 @@ for the length of a null pointer.
 
 ## Next
 
-**Phase 9, first, and only one thing: `fork()` sometimes returns non-zero in the child.**
-Everything else in this list has been fixed, and what is left is a single symptom with a
-single measurement behind it.  The child's frame holds `rax = 0` when it is built *and*
-when the scheduler first switches to it, and the restore path reads `rax` out of that
-frame, so the corruption is inside the window between the two — or the reading of the
-evidence is wrong.  "Phase 9, where it got to" has the ruled-out list, the value the
-child invents (1645, an ordinary task id) and the one place in the window with no
-measurement on it.
+**Phase 9 is done. Phase 10's coreutils are in and `sh` runs the script; the first thing
+on this list is the last flake, and it is a different bug from the one the list used to
+name.**
+
+`ls /tmp/shtest-* | head -n 1` inside a command substitution passes `-n` to `ls` in
+roughly one run in four, so `shtest`'s `glob=` line comes out empty.  "What is still
+broken" has what has been ruled out — the parser, the expander's ownership, `glob()`'s
+return value, and the shell's logic in general, since the same source against glibc runs
+the script 30 times out of 30 — and so is where to start.  The diagnostics tried so far
+change the timing enough that the failure did not come back, so a probe that fires only for
+a pipeline stage and records the words at the point of use is the thing to try next.
 
 **Then: `node_alloc()` bounds-checking its free list.**  It indexes `nodes[ino - 1]`
 before checking that `ino` is a node number, and the kernel redzone reports a node whose
