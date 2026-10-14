@@ -512,7 +512,7 @@ int main(int argc, char **argv, char **envp) {
         glob_t g;
 
         memset(&g, 0, sizeof(g));
-        check(glob("/tmp/globtest/*.c", 0, NULL, &g) == GLOB_NOMATCH && g.gl_pathc == 2,
+        check(glob("/tmp/globtest/*.c", 0, NULL, &g) == 0 && g.gl_pathc == 2,
               "glob finds the two .c files");
         check(g.gl_pathc == 2 && strcmp(g.gl_pathv[0], "/tmp/globtest/one.c") == 0 &&
               strcmp(g.gl_pathv[1], "/tmp/globtest/two.c") == 0,
@@ -522,27 +522,32 @@ int main(int argc, char **argv, char **envp) {
         /* A dotfile is not matched by `*`, which is the difference between `cp *` and
          * `cp .*`. */
         memset(&g, 0, sizeof(g));
-        glob("/tmp/globtest/*", 0, NULL, &g);
-        check(g.gl_pathc == 3, "glob does not hand back a dotfile for *");
+        check(glob("/tmp/globtest/*", 0, NULL, &g) == 0 && g.gl_pathc == 3,
+              "glob does not hand back a dotfile for *");
         globfree(&g);
 
         memset(&g, 0, sizeof(g));
-        glob("/tmp/globtest/.*", 0, NULL, &g);
-        check(g.gl_pathc >= 2, "glob finds a dotfile when the pattern says so");
+        check(glob("/tmp/globtest/.*", 0, NULL, &g) == 0 && g.gl_pathc >= 2,
+              "glob finds a dotfile when the pattern says so");
         globfree(&g);
 
-        /* Nothing matching is not an error.  `sh` has to be able to tell "no files" from
-         * "something went wrong", and GLOB_NOMATCH is 0 so that it can. */
+        /* Nothing matching is not an *error*, and it is still not a success: the answer is
+         * `GLOB_NOMATCH`, which is nonzero, which is the only way a caller can tell "no
+         * files" from "something went wrong".  That is why `GLOB_NOMATCH` is 3 and not 0.
+         */
+        memset(&g, 0, sizeof(g));
+        check(GLOB_NOMATCH != 0, "GLOB_NOMATCH is not the same value as success");
         memset(&g, 0, sizeof(g));
         check(glob("/tmp/globtest/*.zzz", 0, NULL, &g) == GLOB_NOMATCH && g.gl_pathc == 0,
               "glob reports no match without calling it an error");
         globfree(&g);
 
         /* With GLOB_NOCHECK the pattern comes back unchanged, which is what lets `rm *.o`
-         * in a directory with no object files say which name it could not find. */
+         * in a directory with no object files say which name it could not find -- and it is
+         * a *success*, because the caller asked for the pattern back and got it. */
         memset(&g, 0, sizeof(g));
-        glob("/tmp/globtest/*.zzz", GLOB_NOCHECK, NULL, &g);
-        check(g.gl_pathc == 1 && strcmp(g.gl_pathv[0], "/tmp/globtest/*.zzz") == 0,
+        check(glob("/tmp/globtest/*.zzz", GLOB_NOCHECK, NULL, &g) == 0 &&
+              g.gl_pathc == 1 && strcmp(g.gl_pathv[0], "/tmp/globtest/*.zzz") == 0,
               "glob with GLOB_NOCHECK returns the pattern itself");
         globfree(&g);
 

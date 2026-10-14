@@ -223,6 +223,8 @@ int glob(const char *pattern, int flags, int (*errfunc)(const char *, int), glob
 
         if (push(out, name) != 0)
             return GLOB_NOSPACE;
+
+        matched = 1;             /* the pattern stands in for the match */
     }
 
     if (!(flags & GLOB_NOSORT) && out->gl_pathc > 1)
@@ -230,7 +232,19 @@ int glob(const char *pattern, int flags, int (*errfunc)(const char *, int), glob
 
     out->gl_flags = flags;
 
-    return GLOB_NOMATCH;
+    /* Zero for a success, and `GLOB_NOMATCH` only when there is genuinely nothing.
+     *
+     * This used to return `GLOB_NOMATCH` unconditionally at the end, which reported "no
+     * match" for every pattern that *had* matched.  `sh` asks exactly that question --
+     * `expand.c` keeps the names when the return is not `GLOB_NOMATCH` and falls back to
+     * the literal pattern when it is -- so every glob in a script expanded to itself:
+     * `ls /tmp/shtest-*` ran `ls` on the ten-character string `/tmp/shtest-*` and reported
+     * that no such file existed, while the two files it named were both there.
+     *
+     * It is invisible to a test that only looks at `gl_pathc`, because the names *were*
+     * collected; only the return value was wrong.  The libc's own glob tests check the
+     * count and the names, so they passed. */
+    return matched ? 0 : GLOB_NOMATCH;
 }
 
 void globfree(glob_t *g) {

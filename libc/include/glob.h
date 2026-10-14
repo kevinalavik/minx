@@ -20,9 +20,23 @@
 #include <dirent.h>
 #include <stddef.h>
 
-/* Return codes.  Zero is success; the other three are not errno values, because they say
- * what went wrong with the *pattern* rather than with the system. */
-#define GLOB_NOMATCH 0   /* not an error: nothing matched, and that is a valid answer */
+/* Return codes.  Zero is success, and every failure is *nonzero*, which is the whole of the
+ * contract: a caller cannot tell the two apart if one of them is zero.
+ *
+ * They are not errno values, because they say what went wrong with the *pattern* rather
+ * than with the system.
+ *
+ * `GLOB_NOMATCH` used to be zero here, on the reasoning that "nothing matched is a valid
+ * answer, not a failure".  It is a valid answer and it is *not* a success, and with it at
+ * zero the two became the same value: every caller that asked `glob() != GLOB_NOMATCH` --
+ * which is the shape every caller uses, and the shape `sh` uses -- was asking whether the
+ * result was not a success, and so discarded the names of every pattern that *had* matched
+ * and fell back to the pattern itself.  `ls /tmp/shtest-*` then said no such file while the
+ * two files it named were both there.
+ *
+ * The POSIX values are used so that a program written against any other libc's `<glob.h>`
+ * compiles here unchanged. */
+#define GLOB_NOMATCH 3   /* nothing matched, and that is a valid answer */
 #define GLOB_NOSPACE 1   /* out of memory */
 #define GLOB_ABORTED 2   /* an error reading a directory, with errno set */
 
