@@ -93,7 +93,25 @@ void cmd_free(cmd_t *c) {
         return;
 
     /* Recursive, and that is fine: the tree's depth is the nesting depth of the input,
-     * which for anything a person types is under twenty. */
+     * which for anything a person types is under twenty.
+     *
+     * Each pointer is freed exactly once.  `c->stages` and `c->arms` were each released
+     * twice -- once after the loop that frees what they point *at*, and again in the list
+     * at the bottom -- and a block that has already gone back on the allocator's free list
+     * is still a perfectly good-looking address, so the second release was accepted,
+     * merged the wrong neighbour into it, and put a chain through the free list that every
+     * later allocation walked.
+     *
+     * What that looked like from the outside: a shell whose `$( ... )` children ran for a
+     * while and then found a free-list node holding an address in the shell's own text, so
+     * `free()` walked into `.text` and faulted.  Every report pointed at the allocator or
+     * at the kernel, and the two actual symptoms -- the faulting address changing from run
+     * to run, and the kernel's own `memcpy` guard never firing -- were both the free list
+     * being a shape nobody could have written on purpose.
+     *
+     * The allocator now poisons a freed block and checks it when the block is handed out
+     * again, and carries a redzone past the end of every block, so the second release is
+     * reported where it happens instead of surfacing as corruption later. */
     for (int i = 0; i < c->nwords; i++)
         free(c->words[i]);
 
@@ -111,8 +129,6 @@ void cmd_free(cmd_t *c) {
     for (int i = 0; i < c->nstages; i++)
         cmd_free(c->stages[i]);
 
-    free(c->stages);
-
     for (int i = 0; i < c->narms; i++) {
         for (int k = 0; c->arms[i].patterns != NULL && c->arms[i].patterns[k] != NULL; k++)
             free(c->arms[i].patterns[k]);
@@ -121,7 +137,6 @@ void cmd_free(cmd_t *c) {
         cmd_free(c->arms[i].body);
     }
 
-    free(c->arms);
     free(c->name);
     free(c->words);
     free(c->assigns);
