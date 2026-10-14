@@ -271,13 +271,40 @@ static char *run_script(int *status_out) {
         env[n] = NULL;
 
         execve("/bin/sh", argv, env);
+
+        /* A raw `write()` and not a `printf()`, because `_exit()` does not flush a stdio
+         * buffer -- so a `fprintf(stderr, ...)` is exactly the kind of diagnostic that is
+         * lost in the one case it was written for.  Descriptor 2 is still the console: only
+         * 1 was replaced. */
+        fprintf(stderr, "shtest: /bin/sh would not start: %s\n", strerror(errno));
         _exit(127);
     }
 
-    int st = 0;
+    int    st = 0;
+    pid_t  reaped;
 
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+    while ((reaped = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
         ;
+
+    /* A `waitpid` that failed is not a script that passed.
+     *
+     * It used to be folded into the status: a `waitpid` returning -1 left `st` at zero,
+     * `WIFEXITED(0)` is true and `WEXITSTATUS(0)` is zero, so a shell that never ran at all
+     * was reported as a shell that succeeded, and the test compared an empty file against
+     * its list of expected lines and said so -- which is a real failure, but one that reads
+     * as "the script printed the wrong thing" rather than "there was no script". */
+    if (reaped < 0) {
+        printf("shtest: waitpid: %s\n", strerror(errno));
+        close(out);
+        return NULL;
+    }
+
+    if (reaped != pid) {
+        printf("shtest: waitpid returned %ld, not the child %ld\n", (long)reaped,
+               (long)pid);
+        close(out);
+        return NULL;
+    }
 
     *status_out = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 
@@ -338,6 +365,13 @@ int main(int argc, char **argv, char **envp) {
     /* Unbuffered, because a test that dies leaves nothing behind otherwise and the failure
      * report is the whole point of a test. */
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* Which process is talking.
+     *
+     * This program forks and `exec`s, and a pid in the first line settles in one run what a
+     * page of reasoning about `fork` and `exec` does not settle in ten -- in particular
+     * whether a line came from the parent or from a copy of it. */
+    printf("shtest: pid %ld\n", (long)getpid());
 
     int    status = -1;
     char  *out = run_script(&status);
