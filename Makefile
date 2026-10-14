@@ -582,9 +582,21 @@ $(filter-out user/common/start.S,$(COMMON_SRC))
 endef
 
 define USER_PROGRAM_RULE
+# `$(LIBC)` is unconditional, and it has to be: `-lc` is on every one of these link lines
+# (see `USER_PROGRAM_LDFLAGS`), so every program depends on the libc whether or not it
+# declares that it does.  The marker says which *entry point* a program gets -- `main()`
+# through `libc/src/exit.S`, or `minx_main()` through `user/common/start.S` -- and nothing
+# about whether its calls into the libc are answered by the libc that is there now.
+#
+# It used to be `$(if $(wildcard user/$(1)/libc),$(LIBC),)`, and the consequence was silent
+# and total: a fix to anything in `libc.a` reached only the programs that carry a marker.
+# `qsort()` was repaired -- it merged a five-element array's last pass two-and-three instead
+# of four-and-one -- and the programs that use it, `sort` and `ls`, kept running with the
+# broken copy, because nothing said they were built against the library they were linked
+# with.  Fifteen of the nineteen programs in the image had no dependency on it.
 $(BUILD)/bin/$(1): $$(wildcard user/$(1)/*.c) $$(wildcard user/$(1)/*.S) \
                      $$(COMMON_SRC) $$(USER_HDRS) $(SYSCALL_TABLE_H) $(SYSCALL_TABLE_INC) \
-                     $(if $(wildcard user/$(1)/libc),$(LIBC),)
+                     $(LIBC)
 	@mkdir -p $$(dir $$@)
 	$(CC) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS) -Iuser/common -Iuser/$(1) \
 	    -Wno-unused-command-line-argument \
