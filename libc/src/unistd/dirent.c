@@ -111,21 +111,28 @@ int dirfd(DIR *d) {
 static long dir_fill(DIR *d) {
     d->__at = 0;
 
-    for (;;) {
-        long n = __syscall3(SYS_GETDENTS, d->__dir_fd, (long)(uintptr_t)d->__buf,
-                             (long)sizeof(d->__buf));
+    long n = __syscall3(SYS_GETDENTS, d->__dir_fd, (long)(uintptr_t)d->__buf,
+                         (long)sizeof(d->__buf));
 
-        if (n < 0) {
-            /* This is the raw door, so it is a negative errno rather than -1 with `errno`
-             * set, and the difference is the whole reason `__syscall_ret()` exists. */
-            d->__count = 0;
-            return -1;
-        }
-
-        d->__count = (size_t)n;
-
-        return n;
+    if (n < 0) {
+        /* This is the raw door, so a negative return is a negative errno rather than -1
+         * with `errno` already set, and translating it here is the whole reason the
+         * difference exists.
+         *
+         * Before this, `readdir()` reported a failed `getdents()` and the end of a
+         * directory the same way: a NULL return, with `errno` left holding whatever it
+         * happened to hold.  POSIX's test for telling them apart -- NULL *and* `errno` set
+         * -- therefore could not work, and every caller that used it reported a failure on
+         * a directory walk that had succeeded.  `ls` did exactly that: it printed
+         * `out of memory` -- a stale value from an unrelated syscall -- for a directory it
+         * had read to its end, and told nobody what had really happened. */
+        d->__count = 0;
+        errno = (int)-n;
+        return -1;
     }
+
+    d->__count = (size_t)n;
+    return n;
 }
 
 struct dirent *readdir(DIR *d) {
@@ -159,8 +166,19 @@ struct dirent *readdir(DIR *d) {
         return e;
     }
 
-    if (dir_fill(d) <= 0)
+    long n = dir_fill(d);
+
+    if (n <= 0) {
+        /* Zero means `getdents()` had nothing more, which is the end of the directory and
+         * not a failure -- so `errno` is cleared, because the contract callers test is "the
+         * return is NULL *and* `errno` is set", and leaving the last error in place here
+         * makes every successful walk look like a failed one.  This is what `ls` spent its
+         * one failure message on. */
+        if (n == 0)
+            errno = 0;
+
         return NULL;
+    }
 
     return readdir(d);
 }
