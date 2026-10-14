@@ -288,10 +288,37 @@ void *malloc(size_t n) {
      * amount asked for.  Code that asked for exactly what it needed and checked the answer
      * failed on the first allocation of every program -- which is how `libctest` reported
      * "calloc" failing before it had run a single `printf`. */
+    /* The base has to be known before the growth is asked for.
+     *
+     * `sbrk()` returns the *previous* break, and on a process's very first call there is no
+     * previous break, so it returns NULL.  That is not a failure -- it is the documented
+     * answer, and every `sbrk` gives it -- but this code was reading the NULL as one, so the
+     * **first allocation in every process failed** and returned NULL with `errno` unset.
+     *
+     * It was invisible for a long time because most programs allocate something harmless
+     * first -- a stdio buffer, a `printf` -- and the *second* allocation works, because by
+     * then there is a previous break to return.  `ls` on a directory was the thing that
+     * noticed: it allocates the array of names as its first act, with no `printf` before
+     * it, so it failed on the first entry of the first directory and reported "out of
+     * memory" about a heap that was empty and enormous.
+     *
+     * `sbrk(0)` asks where the break is and is not itself a growth, so it both initialises
+     * the base and is safe to call.  After it, the next `sbrk()` has a real previous break
+     * to return and its NULL really does mean what it looks like. */
+    if (sbrk(0) == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
     char *before = heap_break;
 
-    if (sbrk((intptr_t)(BLOCK_HDR + span)) == NULL)
+    if (sbrk((intptr_t)(BLOCK_HDR + span)) == NULL) {
+        /* Said here rather than left to the caller.  A failed `malloc()` with `errno` left
+         * alone is indistinguishable from a successful one that returned NULL because the
+         * caller asked for nothing, which is the same pointer. */
+        errno = ENOMEM;
         return NULL;
+    }
 
     size_t got = (size_t)(heap_break - before);
 
