@@ -36,6 +36,30 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* Comparators for the `qsort()` checks below.  `qsort()` cannot be given a context, so
+ * these read what they need from the record itself and nothing else. */
+static int cmp_int(const void *a, const void *b) {
+    int x = *(const int *)a;
+    int y = *(const int *)b;
+
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* A key and a tag, which is what "stable" is about: two records with equal keys must
+ * come out in the order they went in. */
+typedef struct {
+    int key;
+    int tag;
+} pair_t;
+
+static int cmp_pair(const void *a, const void *b) {
+    const pair_t *x = a;
+    const pair_t *y = b;
+
+    return x->key < y->key ? -1 : x->key > y->key ? 1 : 0;
+}
+
+
 static int failures;
 
 static void check(int ok, const char *what) {
@@ -563,6 +587,89 @@ int main(int argc, char **argv, char **envp) {
             unlink(path);
         }
         check(rmdir("/tmp/globtest") == 0, "the glob test directory is removed");
+    }
+
+    /* --- qsort ------------------------------------------------------------------ */
+
+    {
+        /* Every length from 1 to 20, not a handful of them.
+         *
+         * The bug this was added for was in the *merge*, and it only showed from the third
+         * pass on: a bottom-up merge sort of a five-element array merges a run of four with
+         * a run of one in its last pass, and an implementation that splits the run in half
+         * splits it two-and-three.  So the lengths that matter are the ones that are not a
+         * power of two -- 3, 5, 6, 7, 9, 11, 13, 15, 17, 19 -- and a test of sizes 1, 2 and
+         * 4 alone passes straight through it.
+         *
+         * `sort` of a five-line file came out `b c d e a`, and `ls`, which sorts the names
+         * it prints, listed a five-entry directory in an order no `ls` produces. */
+        static const int lengths[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 15, 16, 17, 20 };
+        int bad_len = 0;
+
+        for (size_t li = 0; li < sizeof(lengths) / sizeof(lengths[0]); li++) {
+            int n = lengths[li];
+
+            for (int seed = 0; seed < 3; seed++) {
+                int v[24];
+
+                /* Three shapes: descending, which is the worst case for a merge sort, an
+                 * interleaving that leaves every pass with something to do, and already
+                 * sorted, which is the case that exposes a sort which is not stable. */
+                for (int i = 0; i < n; i++) {
+                    if (seed == 0)
+                        v[i] = n - i;
+                    else if (seed == 1)
+                        v[i] = (i * 7 + 3) % (n + 1);
+                    else
+                        v[i] = i;
+                }
+
+                qsort(v, (size_t)n, sizeof(int), cmp_int);
+
+                for (int i = 1; i < n; i++) {
+                    if (v[i - 1] > v[i])
+                        bad_len = n;
+                }
+            }
+        }
+
+        check(bad_len == 0, "qsort sorts every length, including the ones that are not a "
+              "power of two");
+
+        /* Stability, which a merge sort gets by taking the left run on a tie and an
+         * unstable sort does not.  Two runs that both start with 0 make the difference
+         * visible in the second element of the result. */
+        {
+            pair_t p[8];
+
+            for (int i = 0; i < 8; i++) {
+                p[i].key = i < 4 ? 0 : 1;
+                p[i].tag = i;
+            }
+
+            qsort(p, 8, sizeof(pair_t), cmp_pair);
+
+            int stable = 1;
+
+            for (int i = 1; i < 8; i++)
+                if (p[i - 1].key == p[i].key && p[i - 1].tag > p[i].tag)
+                    stable = 0;
+
+            check(stable, "qsort is stable: equal keys keep their order");
+        }
+
+        /* A single element and an empty array are both legal and both must leave the
+         * caller's memory alone -- `sort` of an empty file hits one of them every time. */
+        {
+            int  one[1] = { 42 };
+            int  none[1] = { 42 };
+
+            qsort(one, 1, sizeof(int), cmp_int);
+            qsort(none, 0, sizeof(int), cmp_int);
+
+            check(one[0] == 42 && none[0] == 42,
+                  "qsort leaves an array of one and an empty array alone");
+        }
     }
 
     /* --- the standard streams -------------------------------------------------- */

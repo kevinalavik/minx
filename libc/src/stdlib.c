@@ -849,24 +849,41 @@ long labs(long n) {
  * choice is quadratic, which for 4096 entries is 16 million comparisons.  Merge sort is
  * always `n log n`, and its cost is the temporary buffer, which is the only allocation
  * `qsort()` ever does. */
-static void merge_run(char *src, char *dst, size_t n, size_t size,
-                      int (*cmp)(const void *, const void *)) {
-    size_t half = n / 2;
-    size_t i = 0, j = half, k = 0;
+/* Merge two adjacent runs, already in order, into `dst`.
+ *
+ * `left` and `right` are the *run lengths*, not one length to be halved.
+ *
+ * That distinction is the whole of the bug this replaced.  The signature took one `n` and
+ * split it with `n / 2`, which is right for the first two passes of a bottom-up merge sort
+ * and wrong for every pass after them, because from the third pass on the two runs being
+ * merged are of *different* lengths: a five-element array's last pass merges a run of four
+ * with a run of one, and splitting five in half splits it two-and-three.
+ *
+ * Nothing about that is a rare shape.  `sort` of a five-line file produced
+ * `b c d e a` -- four in order and the last one out of place -- and the failure moved with
+ * the input size, so it looked like a data problem rather than a comparison problem.  `ls`
+ * sorts its names with `qsort()`, `glob()` sorts what it finds with it, and a directory with
+ * five entries listed them in an order no `ls` would produce.
+ *
+ * `a` is taken when it is `<=`, which is what makes the sort stable: equal records keep
+ * their relative order, so a sort of data that is already ordered stays that way and does
+ * not shuffle equal keys from run to run. */
+static void merge_runs(char *src, char *dst, size_t left, size_t right, size_t size,
+                       int (*cmp)(const void *, const void *)) {
+    size_t i = 0, j = 0, k = 0;
 
-    while (i < half && j < n) {
-        /* `<=` rather than `<`, so that equal elements keep their relative order: the
-         * comparison is on whole records, so "stable" means what it says here. */
-        if (cmp(src + i * size, src + j * size) <= 0)
+    while (i < left && j < right) {
+        if (cmp(src + i * size, src + (left + j) * size) <= 0)
             memcpy(dst + (k++) * size, src + (i++) * size, size);
         else
-            memcpy(dst + (k++) * size, src + (j++) * size, size);
+            memcpy(dst + (k++) * size, src + (left + j++) * size, size);
     }
 
-    while (i < half)
+    while (i < left)
         memcpy(dst + (k++) * size, src + (i++) * size, size);
-    while (j < n)
-        memcpy(dst + (k++) * size, src + (j++) * size, size);
+
+    while (j < right)
+        memcpy(dst + (k++) * size, src + (left + j++) * size, size);
 }
 
 void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
@@ -880,17 +897,19 @@ void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const voi
     if (tmp == NULL)
         return;             /* the caller's array is unchanged, which is all we can do */
 
+    /* Bottom-up: every run of `width` is merged with the run of `width` after it, and the
+     * source and destination swap at the end of each pass.
+     *
+     * The clamp is on both ends, and both matter.  `mid` past the end would index outside
+     * the source; `hi` past the end would merge elements that are not there.  A last run
+     * shorter than `width` is the normal case, not an edge case: it is what every array
+     * whose length is not a power of two has, at every pass. */
     for (size_t width = 1; width < n; width *= 2) {
         for (size_t lo = 0; lo < n; lo += width * 2) {
-            size_t mid = lo + width;
-            size_t hi  = lo + width * 2;
+            size_t mid = lo + width < n ? lo + width : n;
+            size_t hi  = lo + width * 2 < n ? lo + width * 2 : n;
 
-            if (mid > n)
-                mid = n;
-            if (hi > n)
-                hi = n;
-
-            merge_run(a + lo * size, b + lo * size, hi - lo, size, cmp);
+            merge_runs(a + lo * size, b + lo * size, mid - lo, hi - mid, size, cmp);
         }
 
         char *t = a;
