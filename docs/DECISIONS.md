@@ -1337,3 +1337,40 @@ is why this is a loop over every length rather than three cases.
 
 It had no test at all before, which is the only reason the bug survived: `glob()`, `ls` and
 `sort` all use it, and all three were visibly wrong in ways nobody traced back to it.
+
+## A failed allocation must say so, and a NULL that is not failure must not look like one
+
+**Decision.** Three separate rules, adopted together because they are one rule.
+
+1. `malloc()` primes the heap base with `sbrk(0)` before asking for growth, so a NULL from
+   `sbrk()` means what it looks like.
+2. `malloc()` sets `errno = ENOMEM` when it fails.
+3. `readdir()` sets `errno` on a failed `getdents()` and clears it at the end of a
+   directory.
+
+**Why.** The first is the interesting one. `sbrk()` returns the *previous* break, and on a
+process's first call there is none — so it returns NULL, which is POSIX's documented answer
+and is not a failure. `malloc()` treated it as one, so **the first allocation in every
+process failed**. It survived because almost everything allocates something harmless first,
+and the second allocation works.
+
+**The general shape.** A NULL return is not a failure signal; a NULL return *together with
+`errno`* is. Both halves matter. A caller that tests only the pointer cannot tell a failed
+allocation from a successful one that returned NULL because the request was zero, and an
+allocator that fails without setting `errno` has taken that ability away from every caller
+in the tree at once. There is no way for a caller to recover it, and no diagnostic anyone
+can add downstream, so the obligation sits with the thing returning the NULL.
+
+**Where it bit.** `ls` on a directory — the first thing in the system that depends on the
+*first* allocation — reported "out of memory" about a heap holding 64 MiB. Behind it were
+two more messages able to be wrong: `readdir()` could not distinguish end-of-directory from
+failure, and `ls`'s stale-`errno` check turned that into a message about an unrelated
+syscall. Three messages, none of them pointing at the fault, and the fault was four lines of
+pointer arithmetic.
+
+**Also now:** `kmalloc()` reports once, with the size asked for and how much heap is left.
+Every caller already handles NULL; the report is about *where* the heap went, and the caller
+is somewhere else and no closer. `ls` had one "out of memory" for two different failures and
+now says which — an array that cannot grow and a name that cannot be copied are different
+faults in different places, and a message that cannot tell them apart sends the reader to
+both.

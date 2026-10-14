@@ -119,7 +119,7 @@ Eight consecutive boots now produce zero interleaved lines.
 | 7 | Processes, signals, pipes | VERIFIED | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes, `exec`, and signals. `phase7-fork` (four children, four pipes drained, all reaped by `wait`, no children left), `phase7-cow` (the parent's 8192 bytes survive the child's writes through shared pages), `phase7-signal` (a handler runs with the right number and the interrupted registers are intact; a blocked signal is *pending*, not lost, and arrives on unblocking; a signal with no handler does its default thing, SIGCHLD ignored and SIGUSR2 fatal). See "Phase 7, where it got to". |
 | 8 | VFS + ramfs + initrd + devfs | VERIFIED | `phase8-ramfs` (the tree, from inside the kernel) and `phase8-vfs` (`fstest`, the same filesystem through `int $0x80` and nothing else -- create, write, read back through a new descriptor, the mode surviving, the errno for each of six distinct mistakes, a kernel address refused as a path, rename with both halves checked, a failed rename not creating its destination, a hard link being one inode with a count of 2 that drops to 1 when one name goes, a directory refusing to be hard-linked, `lstat` a link and `stat` the file, `readlink` giving a *relative* target, `getdents` listing every entry once each with the right `DT_*`, `rmdir` refusing a non-empty directory, and `/proc/self/status` describing the reading process). `make test` → 43/43, three runs. A normal boot mounts `/dev` and `/proc`, finds `/init` in the initrd and runs it; `init` execs `/bin/hello`, which reports `hello: ok`. |
 | 9 | TTY + libc + sh | VERIFIED | The graphical console and the keyboard are done (`make run` boots to a console you can type at), `libctest` is **115/115**, and `sh` runs the whole of `shtest`'s script. `make WITH_SHELL=1 test` → **45/45**, and `shtest` reports **53 of 53 lines matched** -- word splitting, globbing, `$?`/`$#`/`$*`/`$@`, arithmetic, `if`/`for`/`while`/`until`/`case`, functions, `break`/`continue`/`return`, subshells, groups, redirections including `>&2` and `2>&1` on a compound, pipelines, command substitution nested three deep, `cd`, `pwd`, background commands and `sh -c`. `make test` (no shell) stays at 44/44. See "What finally fixed the intermittent fork" and "The last flake". |
-| 10 | Coreutils + procfs | IN PROGRESS | Ten programs: `echo`, `cat`, `wc`, `head`, `tail`, `ls`, `rm`, and this session's `tr`, `sort`, `uniq`. **`coretest` is the automated test per tool the spec asks for** -- 43 checks, `phase10-coreutils` in `make test` -- and it found three real bugs that are now fixed: the libc's `qsort()` merged a run in half instead of at the run boundary, so `sort` of a five-line file came out `b c d e a`; the Makefile gave `$(LIBC)` as a prerequisite only to programs with a `libc` marker, so a libc fix reached 4 programs out of 19 and `sort` and `ls` kept running with yesterday's copy; and `vmm_address_space_destroy()` freed only page *tables*, so every `exec` leaked a whole address space. `qsort()` had no test at all, which is why the first of those survived; there is now one covering every length from 1 to 20. `procfs` is done enough for `/proc/self/status` (phase 8). **One check still fails**, and it is in "What is still broken" rather than swept up. |
+| 10 | Coreutils + procfs | VERIFIED | Ten programs: `echo`, `cat`, `wc`, `head`, `tail`, `ls`, `rm`, `tr`, `sort`, `uniq`, each tested on the host against GNU byte for byte (8 cases for `tr`, 18 for `sort`, 20 for `uniq`). **`coretest` is the automated test per tool the spec asks for** -- 43 checks, `phase10-coreutils` -- and it earned its keep by finding five real bugs: the libc's `qsort()` merged a run in half instead of at the run boundary, so `sort` of a five-line file came out `b c d e a`; the Makefile gave `$(LIBC)` as a prerequisite only to programs with a `libc` marker, so a libc fix reached 4 programs out of 19; `vmm_address_space_destroy()` freed only page *tables*, so every `exec` leaked a whole address space; the heap's redzone check read the wrong address and so reported an overflow on every unsplit free; and **`malloc()`'s first call in every process failed**. `qsort()` had no test at all, which is why the first of those survived -- there is now one covering every length from 1 to 20. `procfs` is done enough for `/proc/self/status` (phase 8). **43 of 43, and `make WITH_SHELL=1 test` is 45/45.** |
 | 11 | Hardening / stress | NOT STARTED | |
 | 12 | Polish | NOT STARTED | |
 
@@ -645,37 +645,36 @@ The two things that were *wrong* along the way and are worth not repeating:
   program's memory, and a correct `ls a b` comes out as a duplicated, unsorted list.  It
   looked exactly like the bug being hunted.
 
-### What is still broken: `ls` on a directory
+### Fixed: `ls` on a directory, and the first allocation in every process
 
-**`ls /some/directory` prints nothing and exits 1, with `ls: /some/directory: out of memory`
-on standard error.**  `ls` of a *file* works, and always has.  That is the whole of what
-is wrong, and it is one of the 43 checks in `coretest`.
+`ls /some/directory` printed nothing and exited 1 with `ls: /some/directory: out of memory`
+on standard error.  `ls` of a *file* was fine, and always had been.
 
-**What has been established**, so the next attempt does not repeat it:
+**The cause was not where the message pointed.**  `ls` on a directory allocates its array
+of names as its very first act, with no `printf` before it, and that first allocation
+failed.  `sbrk()` returns the *previous* break, and on a process's first call there is no
+previous break, so it returns NULL -- the documented answer, and not a failure.  `malloc()`
+read that NULL as one and gave up, so **the first allocation in every process failed**.
 
-- **Not the tools.**  All ten are tested on the host against GNU byte for byte -- 8 cases
-  for `tr`, 18 for `sort`, 20 for `uniq`, and `coretest` itself passes 43 of 43 on the host
-  using these implementations.
-- **Not the fixture.**  `ls /tmp` fails the same way, and `/tmp` is certainly not empty.
-- **Not `opendir()` itself.**  It is a static array and two syscalls, and `libctest`'s
-  `glob()` tests use it and pass -- `glob()` calls `opendir()`.
-- **Not the error it reports.**  `readdir()` returns `NULL` without setting `errno` (it
-  returns `-1` from `dir_fill()`), so `ls`'s "`errno != 0` means the walk failed" check is
-  reading a **stale** `errno` from something earlier.  "out of memory" is that stale value
-  and means nothing; the real failure is that `getdents()` returned a negative errno.
-- **Not memory.**  `vmm_address_space_destroy()` leaked every forked child's address space
-  and that is fixed, and the failure survived the fix.
+It had been invisible because most programs allocate something harmless first -- a stdio
+buffer, a `printf` -- and the second allocation works, because by then there is a previous
+break to return.  `ls` on a directory is simply the first thing in the whole system that
+depends on the *first* allocation.
 
-**So: `getdents()` on a descriptor opened with `O_DIRECTORY` fails in this image, and
-`ls`'s error message is a lie about why.**  Two things to do, and the second is worth doing
-regardless of the first: find out what `getdents()` returns for such a descriptor, and make
-`ls` (and every other caller) report what actually happened rather than whatever `errno`
-happened to hold.
+Two messages stood between that and being found:
 
-**One flake seen once and not reproduced**: in a single run, `exec` of `wc`, `uniq`, `ls` and
-`sort` failed part way through `coretest` with `EACCES` -- `ramfs_node_kind()` said the inode
-was not a file -- and every exec after that failed the same way.  It did not come back in
-the runs since.  Worth one run of its own before it is believed or forgotten.
+- **`readdir()` returned NULL for both "end of directory" and "failed"**, setting `errno` in
+  neither case.  POSIX's test for telling them apart therefore could not work, and `ls`'s
+  version of it read a **stale** `errno` -- which is where "out of memory" came from, left
+  over from a syscall in an earlier command.  The message described a fault that had not
+  happened and hid the one that had.
+- **`ls` had one "out of memory" for two different failures**, and never cleared `errno`
+  before the walk.  Both fixed; the array and the name copy now say which they are.
+
+**What this is worth saying:** three messages, each of which pointed somewhere else, and the
+real fault was four lines of pointer arithmetic in the middle of one.  A message that cannot
+be wrong is worth more than a faster reproduction, and two of these three were able to be
+wrong.
 
 ### 0. `phase6-user`, progress this session -- four real bugs found and fixed
 
