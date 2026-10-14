@@ -103,12 +103,48 @@ struct cmd {
     /* The reserved word, or the loop variable, or the function's name. */
     char         *name;
 
+    /* `elif` chains.
+     *
+     * A `CMD_IF` holds *one* condition and one or two branches, so `elif` cannot be a
+     * sibling of the `if` -- there is no second node.  Each `elif`'s condition and body are
+     * one `CMD_LIST` pair named `elif`, and these link them in source order.  The executor
+     * walks the chain and takes the first whose condition holds.
+     *
+     * It was written the other way round: each `elif` overwrote `c->a` and `c->b`, so a
+     * chain kept only its last branch.  `if true; then A; elif true; then B; fi` ran B,
+     * which is wrong in the direction that looks like the shell working: the *first*
+     * matching branch is the one that runs, and a chain whose first branch is unreachable
+     * is a chain with the wrong branch. */
+    struct cmd  *elifs;
+    struct cmd  *next_elif;
+
+    /* The `else` branch, for `CMD_IF`.
+     *
+     * Its own field because `a` is the condition and `b` is the branch that runs when the
+     * condition *holds* -- `if C; then A; else B; fi` runs `A` when `C` is true and `B`
+     * when it is false, and with `a` and `b` both spoken for there is nowhere else for `B`
+     * to go.  Putting it in `b` ran the else-branch whenever the condition was true. */
+    struct cmd  *orelse;
+
     /* `until` rather than `while`. */
     int           negated;
 
     /* `for x in` with no `in`, which iterates over the positional parameters. */
     int           no_in;
 };
+
+/* A parsed command as an indented tree.
+ *
+ * Accept-or-reject is one bit per line, and it cannot tell a right tree from a wrong one --
+ * which is how `if true then A elif true then B fi` came to parse cleanly and run B.  Anything
+ * that tests this parser has to be able to *look* at what it built, and that is all this is.
+ *
+ * `tools/sh-parser-test.sh` uses it to compare the words in the tree against the words on
+ * the line; the guest uses it to print the tree of a line it could not parse, so a script
+ * that does not work shows what the parser made of it and not only what it complained about.
+ * It prints with `printf()` so that the same source serves both: the libc has it in the
+ * guest, and the host test compiles `parse.c` unmodified. */
+void cmd_tree_dump(cmd_t *c, int depth);
 
 /* --- tokens ----------------------------------------------------------------- */
 
@@ -146,6 +182,16 @@ typedef struct {
 
     /* For T_REDIR. */
     redir_kind_t rkind;
+
+    /* For T_WORD: is this the descriptor the lexer prefixed to a redirection, as in the `2`
+     * of `2>file`?
+     *
+     * It has to be a flag rather than something the parser works out, because the token is
+     * a one-digit word either way: the `2` of `2>file` and the `2` of `>&2` are the same
+     * shape, and only the lexer knows which one it produced.  Guessing from the text made
+     * `>&2` into `>&` with no argument, which `collect_redirs()` read as descriptor zero --
+     * so `echo hi >&2` sent its output to the command's *input* and printed nothing. */
+    int       fd_prefixed;
 
     /* For T_SEMI: an `&` rather than a `;`. */
     int       background;
@@ -228,6 +274,29 @@ extern const char *sh_name;
 
 /* `exit` sets these; `exec.c` checks them after every command. */
 void sh_exit(int code);
+
+/* --- loop and function control ------------------------------------------------- */
+
+/* `break [n]`, `continue [n]` and `return [n]`, from `builtins.c`.
+ *
+ * Each counts how many loops or function calls it still has to unwind rather than setting a
+ * flag, because `break 2` and `return 2` exist and a flag cannot say "two".  `exec.c`
+ * decrements the count as each construct it passes unwinds, and checks it before running
+ * every command so that nothing after the `break` in the same list runs.
+ *
+ * `levels` of zero means one, which is what a bare `break` is: a shell that treated
+ * `break 0` as "break nothing" would let `break $n` with an unset `$n` silently do the
+ * wrong thing instead of doing the obvious one. */
+void sh_break(int levels);
+void sh_continue(int levels);
+void sh_return(int levels);
+void sh_return_status(int status);
+
+/* Is any of the three in effect?  The dispatcher asks before every command. */
+int  sh_loop_control_pending(void);
+
+/* Did a `return` just reach the outermost function call?  Consumes one level. */
+int  sh_return_pending(void);
 
 /* Write a diagnostic in the shell's own format.  All of them go to stderr, because a
  * diagnostic on stdout is a line in somebody's pipeline. */

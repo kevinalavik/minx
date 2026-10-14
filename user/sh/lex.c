@@ -174,6 +174,21 @@ static long find_close(const char *s, size_t n, size_t from, char open, char clo
     int    depth = 1;
     char   quote = 0;
 
+    /* A `case` body has parentheses that do not nest.
+     *
+     * `$(case y in a) echo a;; esac)` is legal and the `)` after `a` is a pattern
+     * terminator, not the end of the substitution -- but a depth count reads it as the end,
+     * so the substitution closed after `a` and the rest of the line was left for the parser
+     * as a `;; esac )` it could not use.  bash accepts it, and it is not rare: wrapping a
+     * `case` in `$( )` is how a shell script returns a value from one.
+     *
+     * So a `case` suppresses the count until its `esac`.  The words are matched as whole
+     * words so that `casey` and `esac_count` are not mistaken for the keywords, and a
+     * `case` with no `esac` simply runs to the end and leaves the substitution unterminated,
+     * which the caller reports. */
+    int in_case = 0;
+    int at_word_start = 1;
+
     for (size_t i = from; i < n; i++) {
         char c = s[i];
 
@@ -183,18 +198,40 @@ static long find_close(const char *s, size_t n, size_t from, char open, char clo
             else if (c == quote)
                 quote = 0;
 
+            at_word_start = 0;
             continue;
         }
 
         if (c == '\\') {
             i++;
+            at_word_start = 0;
             continue;
         }
 
         if (c == '\'' || c == '"') {
             quote = c;
+            at_word_start = 0;
             continue;
         }
+
+        if (c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '&' || c == '|' ||
+            c == '(' || c == ')' || c == '<' || c == '>') {
+            at_word_start = 1;
+        } else if (at_word_start) {
+            size_t len = strcspn(s + i, " \t\n;&|()<>");
+
+            if (len == 4 && memcmp(s + i, "case", 4) == 0)
+                in_case = 1;
+            else if (len == 4 && memcmp(s + i, "esac", 4) == 0)
+                in_case = 0;
+
+            at_word_start = 0;
+            i += len - 1;
+            continue;
+        }
+
+        if (in_case)
+            continue;
 
         if (c == open)
             depth++;
@@ -246,6 +283,42 @@ static long lex_word(const char *s, size_t n, size_t i, buf_t *out) {
                     break;
             }
 
+            continue;
+        }
+
+        /* `$(` and `$((` are *not* a metacharacter boundary, and treating them as one is
+         * the whole difference between `echo $(date)` working and `echo $(date)` lexing as
+         * three tokens.
+         *
+         * `(` ends a word -- it is the grouping operator -- but the `(` in `$(` belongs to
+         * the substitution, and the `(` in `$((` is arithmetic.  Both are one piece of the
+         * word as the user typed it, and both are expanded by the *expansion* pass, which
+         * is the pass that owns quoting and knows what `$( )` and `$(( ))` mean.  Splitting
+         * them here handed expansion a word truncated at the `$`: `n=$((n + 1))` became
+         * `n=$`, `(`, `(`, `n`, `+`, `1`, `)`, `)`, and the assignment was left with no
+         * value while the parser tried to make sense of five stray operators.
+         *
+         * So the group is copied through, whole, with the same quote-aware depth counting
+         * `find_close()` uses -- which also gets `$((1 + (2)))` right, because the inner
+         * `(` raises the depth and the first `)` at depth two does not close it. */
+        if (c == '$' && i + 1 < n && s[i + 1] == '(') {
+            /* From `i + 2`, which is *past* the `(`.  `find_close()` counts the opening
+             * parenthesis as a depth of one already, so starting it on the `(` itself
+             * counts that parenthesis twice -- and `$((n + 1))` then never closes, the
+             * scan runs to the end of the line, and the word is truncated at the `$`.
+             */
+            long end = find_close(s, n, i + 2, '(', ')');
+
+            if (end < 0) {
+                /* Unterminated: the word ends here and the parser reports it, which is a
+                 * better answer than a silently truncated substitution. */
+                break;
+            }
+
+            for (size_t k = i; k < (size_t)end; k++)
+                buf_put(out, s[k]);
+
+            i = (size_t)end - 1;
             continue;
         }
 
@@ -304,9 +377,28 @@ int lex_line(const char *line, tokens_t *out) {
             continue;
         }
 
-        /* `$(` and the digit-prefixed redirections, which have to be tried before the bare
-         * operators or `2>` becomes a word "2" followed by a `>`. */
+        /* A `$(` or `$((` at the *start* of a word.  `lex_word()` keeps these inside a
+         * word already, so this only runs for a word that is nothing but a substitution --
+         * `echo $(date)`, where the `$(` follows a blank rather than other word
+         * characters.
+         *
+         * The two forms differ in where their contents start and end, and the difference
+         * is what tells `parse_simple()` which spelling to put back together: `$(ls)` holds
+         * `ls`, `$((n + 1))` holds `(n + 1)` -- the outer pair was taken as the operator
+         * and the inner pair is part of the expression.  Getting that wrong made every
+         * `$(( ... ))` expand as a command substitution of the expression, which is how
+         * `n=$((n + 1))` became a run of a program called `n + 1`. */
         if (line[i] == '$' && i + 1 < n && line[i + 1] == '(') {
+            /* Both forms take their contents from just inside the first `(`, and
+             * `find_close()` is told to start there with a depth of one -- which is the
+             * count for the `(` at `i + 1`.
+             *
+             * The two then differ without any extra code.  For `$(ls)` the contents are
+             * `ls`: the `)` that ends it closes the first paren and `find_close()` stops.
+             * For `$((n + 1))` the contents are `(n + 1)`: the first `)` only brings the
+             * depth back to one and the scan continues to the second, so the token's text
+             * still begins with the `(`.  That leading `(` is the whole of the distinction,
+             * and `parse_simple()` reads it back to choose the spelling. */
             long end = find_close(line, n, i + 2, '(', ')');
 
             if (end < 0) {
@@ -372,9 +464,25 @@ int lex_line(const char *line, tokens_t *out) {
 
                 if (push_token(out, T_WORD, num, 1) != 0)
                     goto oom;
+
+                /* Marked, because a parser cannot tell this from the argument of a `>&`
+                 * on its own -- both are a `T_WORD` of one digit -- and guessing made
+                 * `>&2` into a redirection with no argument.  See
+                 * `token_t.fd_prefixed`. */
+                out->v[out->n - 1].fd_prefixed = 1;
             }
 
-            i = j + 1;
+            /* Past the *whole* operator, which is three characters for `2>&` and two for
+             * everything else.  It was `j + 1` for all of them, which left the `&` of
+             * `2>&1` in the input for the next pass: that pass read it as the background
+             * operator, so `{ ...; } 2>&1` parsed as a background command whose argument was
+             * the word `1`.
+             *
+             * Nothing said so.  `2>&1` is the redirection that appears most often in every
+             * shell script ever written, and it was quietly a different operator -- so the
+             * test script's `>&2` check reported a *missing line* while the descriptor
+             * plumbing it was written to test was never reached at all. */
+            i = (line[j + 1] == '&') ? j + 2 : j + 1;
             continue;
         }
 
@@ -421,29 +529,76 @@ int lex_line(const char *line, tokens_t *out) {
                 i = (size_t)end;
             }
 
-            /* A reserved word only in the leading position.  Anywhere else it is a name,
-             * which is what makes `echo if` print "if" and `if true; then echo > if; fi`
-             * create a file called `if`. */
+            /* A reserved word only where one can begin a command.  Anywhere else it is a
+             * name, which is what makes `echo if` print "if" and `if true; then echo > if;
+             * fi` create a file called `if`.
+             *
+             * "Where one can begin a command" is a question about the token immediately
+             * before this one and nothing else.  It used to be answered by walking the token
+             * list from the beginning and stopping at the first token that was not a
+             * separator -- which answers a different question, "is this the first word on
+             * the line", and made every keyword after the first an ordinary word.  `if true;
+             * then echo; fi` lexed as `if` (a keyword) then `then`, `else` and `fi` (words),
+             * so every compound construct failed to parse with one unhelpful sentence that
+             * named neither the construct nor the token. */
             tok_kind_t kind = T_WORD;
             int        at_start = 1;
 
-            for (int k = 0; k < out->n; k++) {
-                tok_kind_t p = out->v[k].kind;
+            if (out->n > 0) {
+                tok_kind_t prev = out->v[out->n - 1].kind;
 
-                if (p == T_SEMI || p == T_NEWLINE || p == T_AND_IF || p == T_OR_IF ||
-                    p == T_PIPE || p == T_LPAREN || p == T_LBRACE || p == T_REDIR) {
-                    /* A redirection does *not* end the "start of a command" region, so
-                     * `> if true` still sees `if` as a keyword. */
-                    if (p != T_REDIR)
-                        at_start = 0;
-                    continue;
-                }
+                /* Every token after which a *command* may begin, so a reserved word
+                 * there is a keyword.
+                 *
+                 * The separators are the obvious half and the keyword tokens are the half
+                 * that is easy to miss: after `do`, `then`, `else` or `elif` the next word
+                 * starts a command, so `do if C; then A; fi` has to lex that `if` as a
+                 * keyword.  With only the separators listed it came out a `T_WORD`, the
+                 * parser read it as a program called `if`, and the construct was reported as
+                 * "`done' expected" about a line that was correct.
+                 *
+                 * So it is not "a separator" at all: it is "a token that cannot be part of
+                 * the command before it".  A word is, which is why `echo if` prints `if`.
+                 *
+                 * `T_REDIR` is deliberately *not* in the list, which reverses what the
+                 * comment above used to claim, and bash settles it: in `echo hi > if` the
+                 * word after the redirection is a file name, and in `> if true` it is still a
+                 * file name.  The old comment said a redirection does not end the region, so
+                 * that `> if true` would see `if` as a keyword -- and running that in bash
+                 * creates a file called `if`.  A shell that turned a redirection's target
+                 * into a keyword would make `echo hi > if` write to nothing at all. */
+                at_start = prev == T_SEMI || prev == T_NEWLINE || prev == T_AND_IF ||
+                           prev == T_OR_IF || prev == T_PIPE || prev == T_LPAREN ||
+                           prev == T_LBRACE ||
+                           prev == T_IF || prev == T_THEN || prev == T_ELIF ||
+                           prev == T_ELSE || prev == T_FI || prev == T_FOR ||
+                           prev == T_IN || prev == T_DO || prev == T_DONE ||
+                           prev == T_WHILE || prev == T_UNTIL || prev == T_CASE ||
+                           prev == T_ESAC || prev == T_RPAREN || prev == T_RBRACE;
 
-                at_start = 0;
-                break;
+                /* After `;;` a reserved word is a keyword even though nothing separates it
+                 * from the operator, and `case x in a) y;; esac` is the one place that
+                 * happens.  `esac` came out a `T_WORD` and every `case` in the test script
+                 * was reported as "a case arm must be patterns followed by `)'" -- a
+                 * message about the *arm*, for a failure that was the word after it. */
+                if (prev == T_DSEMI)
+                    at_start = 1;
+
+                /* After the `;` that closes a construct -- `if C; then A; fi; echo B` --
+                 * and after `do`, `then` and `else`, a reserved word is back to being a
+                 * name.  This is not new; it is what `at_start` already means, and it is
+                 * why `echo fi` prints "fi".  What is worth saying is that it also means a
+                 * keyword may be a keyword in one position and a word in another *within the
+                 * same line*, and the parser relies on that for `fi` after `; fi`: the `;`
+                 * there ends nothing, and `echo` after it is an ordinary command. */
             }
 
-            if (at_start && b.p != NULL) {
+            /* `in` is the one reserved word that does not begin a command: it follows
+             * the loop variable in a `for` header, which is a word, so the rule above
+             * would leave it a word and `for x in ...` would not parse.  Tagging it
+             * always costs a program named `in` its name, which is a smaller price than
+             * every `for` loop failing. */
+            if (at_start || strcmp(b.p != NULL ? b.p : "", "in") == 0) {
                 for (size_t k = 0; k < sizeof(reserved) / sizeof(reserved[0]); k++) {
                     if (strcmp(b.p, reserved[k].text) == 0) {
                         kind = reserved[k].kind;

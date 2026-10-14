@@ -22,6 +22,7 @@
  */
 #include "sh.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,7 +30,40 @@ typedef struct {
     tokens_t     *t;
     int           at;
     const char   *err;
+
+    /* Which keyword ends the list currently being parsed, or 0 for "the end of the input".
+     *
+     * A single list of closers does not work, and the reason is that the closers belong to
+     * *different* constructs.  A `for` body ends at `done` and must sail straight past a
+     * `fi` belonging to an `if` nested inside it -- `for i in 1 2; do if C; then A; fi; echo
+     * B; done` is one loop with one command in its body.  An `if` body ends at `fi`, `elif`
+     * or `else`, and must sail past a `done` belonging to a loop inside it.
+     *
+     * So each construct says which words close *its* list, while it is parsing it, and
+     * restores the previous answer afterwards.  It is a field on the parser rather than an
+     * argument because `parse_and_or()` recurses through five call paths, and threading it
+     * through every one of them would make the parameter list worse than the state.
+     *
+     * It is a mask rather than one word because `if` needs three and `case` needs two, and
+     * because `}` and `)` close the group forms. */
+    unsigned      closers;
 } parser_t;
+
+/* The words that end each construct's list. */
+#define CLOSE_FI      (1u << 0)   /* `fi`, `elif`, `else`  -- an `if` body          */
+#define CLOSE_DONE    (1u << 1)   /* `done`                 -- a `for`/`while` body */
+#define CLOSE_ESAC    (1u << 2)   /* `esac`                 -- a `case` arm list    */
+#define CLOSE_BRACE   (1u << 3)   /* `}`                    -- a `{ }` group        */
+#define CLOSE_PAREN   (1u << 4)   /* `)`                    -- a `( )` group        */
+
+/* The end of the input, as a closer.
+ *
+ * It is not one of the words above because it is not a word: it is where a list ends when
+ * nothing else closes it, which is the top level and every construct's *condition*.  Carrying
+ * it as a bit rather than testing `at(p, T_EOF)` at each call site keeps the question "what
+ * ends this list?" in one place, and it is what makes `echo a; echo b; echo c` work: every
+ * `;` joins, and only the final end of input ends the list. */
+#define CLOSE_INPUT   (1u << 5)
 
 /* A few words, bounded.  A command line longer than this is refused with a message rather
  * than silently truncated, which is the one thing a parser must not do. */
@@ -38,6 +72,65 @@ typedef struct {
 #define MAX_ARMS   128
 
 static cmd_t *parse_and_or(parser_t *p);
+
+/* Does this token end the list being parsed?
+ *
+ * `fi`, `done`, `esac`, `}` and `)` all end a construct, and a separator in front of one of
+ * them is the end of a list rather than a join to another command.  Asking the question
+ * here rather than at each call site is what keeps the list of closers in one place: when
+ * `elif` was added, the four older closers did not each have to be remembered.
+ *
+ * Which closers count is `p->closers`, not a fixed list -- see the field's comment for why
+ * `for` and `if` cannot share one.  `then` and `do` are the other direction: they *begin*
+ * a construct's tail and follow a separator exactly as `;` between two commands does, so
+ * they are in the same test.  Without `do` in it, `while [ x ]; do` parsed its condition,
+ * hit the `;`, and demanded a command after it -- and found `do`, which is not one.
+ *
+ * `fi`, `done`, `esac`, `}` and `)` all end a construct, and a separator in front of one
+ * of them is the end of a list rather than a join to another command.  Asking the question
+ * here rather than at each call site is what keeps the list of closers in one place: when
+ * `elif` was added, the four older closers did not each have to be remembered.
+ *
+ * `then`, `else`, `elif` and `do` are here too, for the same reason from the other side:
+ * they *begin* the tail of a construct, and they follow a separator exactly as a `;`
+ * between two commands does.  Nothing in the token stream distinguishes the two, so the
+ * word after the separator is what tells them apart -- and a loop body that ends in a
+ * nested `if` (`do if C; then A; fi; echo B; done`) needs the inner `; fi` to close the `if`
+ * without the list inside it also deciding it has reached the end of the loop.
+ *
+ * `elif` *is* here, which looks wrong until the `;` before it is considered: `if C; then
+ * A; elif D; then B; fi` puts `elif` after a separator just as `do` is, and it continues
+ * the construct rather than ending it -- which is why this list is about "a separator
+ * followed by one of these ends the *command list*", not about nesting. */
+static int at_closer(parser_t *p) {
+    tok_kind_t k = p->t->v[p->at].kind;
+
+    /* `then` and `do` are here, and they are not closers of anything.  They *begin* the
+     * tail of a construct and follow a separator exactly as the `;` between two commands
+     * does, so the list stops in front of them and the construct's own parser takes them.
+     * That is why this is a mask rather than a list of names: the caller says which of its
+     * own closers it is inside, and these two always count because they can only follow a
+     * separator if a construct is waiting for one. */
+    if (k == T_THEN || k == T_DO)
+        return 1;
+
+    if (k == T_FI || k == T_ELIF || k == T_ELSE)
+        return (p->closers & CLOSE_FI) != 0;
+
+    if (k == T_DONE)
+        return (p->closers & CLOSE_DONE) != 0;
+
+    if (k == T_ESAC)
+        return (p->closers & CLOSE_ESAC) != 0;
+
+    if (k == T_RBRACE)
+        return (p->closers & CLOSE_BRACE) != 0;
+
+    if (k == T_RPAREN)
+        return (p->closers & CLOSE_PAREN) != 0;
+
+    return k == T_EOF && (p->closers & CLOSE_INPUT) != 0;
+}
 
 static token_t *peek(parser_t *p) {
     return &p->t->v[p->at];
@@ -88,6 +181,94 @@ static cmd_t *node(cmd_kind_t kind) {
     return c;
 }
 
+static const char *kind_name(cmd_kind_t k) {
+    switch (k) {
+    case CMD_SIMPLE: return "simple";
+    case CMD_LIST:   return "list";
+    case CMD_PIPE:   return "pipe";
+    case CMD_SUB:    return "sub";
+    case CMD_GROUP:  return "group";
+    case CMD_IF:     return "if";
+    case CMD_FOR:    return "for";
+    case CMD_WHILE:  return "while";
+    case CMD_CASE:   return "case";
+    case CMD_FUNC:   return "func";
+    }
+
+    return "?";
+}
+
+/* A parsed command as an indented tree.
+ *
+ * Accept-or-reject is one bit per line and it cannot tell a right tree from a wrong one, so
+ * anything that tests this parser needs to be able to *look* at what it built.  That is how
+ * the `elif` defect was pinned down: `if true then A elif true then B fi` parsed cleanly and
+ * still ran B, because the chain had overwritten itself as it was read and the tree held
+ * only the last branch.  No accept/reject test can see that.
+ *
+ * It is in the shell rather than in the test rig because the guest needs it too: a script
+ * that does not work should be able to show the tree the parser built, next to the
+ * complaint about it. */
+void cmd_tree_dump(cmd_t *c, int depth) {
+    if (c == NULL) {
+        printf("%*s(null)\n", depth * 2, "");
+        return;
+    }
+
+    printf("%*s%s", depth * 2, "", kind_name(c->kind));
+
+    if (c->name != NULL)
+        printf(" name=%s", c->name);
+
+    if (c->negated)
+        printf(" negated");
+
+    if (c->no_in)
+        printf(" no_in");
+
+    printf("\n");
+
+    for (int i = 0; i < c->nwords; i++)
+        printf("%*sword: %s\n", (depth + 1) * 2, "", c->words[i]);
+
+    for (int i = 0; i < c->nassigns; i++)
+        printf("%*sassign: %s\n", (depth + 1) * 2, "", c->assigns[i]);
+
+    for (redir_t *r = c->redirs; r != NULL; r = r->next)
+        printf("%*sredir: %s\n", (depth + 1) * 2, "", r->word != NULL ? r->word : "");
+
+    for (int i = 0; i < c->nstages; i++) {
+        printf("%*sstage %d:\n", (depth + 1) * 2, "", i);
+        cmd_tree_dump(c->stages[i], depth + 2);
+    }
+
+    for (int i = 0; i < c->narms; i++) {
+        printf("%*sarm %d:\n", (depth + 1) * 2, "", i);
+
+        for (int k = 0; c->arms[i].patterns != NULL && c->arms[i].patterns[k] != NULL; k++)
+            printf("%*spattern: %s\n", (depth + 2) * 2, "", c->arms[i].patterns[k]);
+
+        cmd_tree_dump(c->arms[i].body, depth + 2);
+    }
+
+    for (cmd_t *e = c->elifs; e != NULL; e = e->next_elif) {
+        printf("%*selif condition:\n", (depth + 1) * 2, "");
+        cmd_tree_dump(e->a, depth + 2);
+        printf("%*selif body:\n", (depth + 1) * 2, "");
+        cmd_tree_dump(e->b, depth + 2);
+    }
+
+    if (c->a != NULL) {
+        printf("%*sa:\n", (depth + 1) * 2, "");
+        cmd_tree_dump(c->a, depth + 2);
+    }
+
+    if (c->b != NULL) {
+        printf("%*sb:\n", (depth + 1) * 2, "");
+        cmd_tree_dump(c->b, depth + 2);
+    }
+}
+
 void cmd_free(cmd_t *c) {
     if (c == NULL)
         return;
@@ -121,6 +302,8 @@ void cmd_free(cmd_t *c) {
     for (redir_t *r = c->redirs; r != NULL;) {
         redir_t *next = r->next;
 
+        /* `r->word` is a `strdup()` of the token's text -- `add_redir()` copies it, because
+         * the file name has to outlive the tokens -- so it is owned here and freed here. */
         free(r->word);
         free(r);
         r = next;
@@ -129,13 +312,29 @@ void cmd_free(cmd_t *c) {
     for (int i = 0; i < c->nstages; i++)
         cmd_free(c->stages[i]);
 
+    /* The arm's pattern strings are *borrowed*, like a redirection's file name: they are the
+     * lexer's tokens' text, and `tokens_free()` releases them after the parse.  They are
+     * matched with `fnmatch()` at run time against the pattern as typed, quotes and all,
+     * which is why they are not copied -- but it does mean this loop must not free them. */
     for (int i = 0; i < c->narms; i++) {
-        for (int k = 0; c->arms[i].patterns != NULL && c->arms[i].patterns[k] != NULL; k++)
-            free(c->arms[i].patterns[k]);
-
         free(c->arms[i].patterns);
         cmd_free(c->arms[i].body);
     }
+
+    /* Each `elif` pair is a tree of its own -- a condition and a body, both of which can
+     * be compound commands -- so they are freed like any other subtree rather than by
+     * walking two extra links here. */
+    for (cmd_t *e = c->elifs; e != NULL; ) {
+        cmd_t *next = e->next_elif;
+
+        cmd_free(e);
+        e = next;
+    }
+
+    /* The `else` branch is an ordinary subtree, so it is freed like one rather than by
+     * walking it here -- which is also why it needed a field of its own: a field is what
+     * makes it findable, and a tree that cannot be found cannot be freed. */
+    cmd_free(c->orelse);
 
     free(c->name);
     free(c->words);
@@ -204,9 +403,22 @@ static int add_redir(cmd_t *c, redir_kind_t kind, const char *word) {
 
 /* One redirection: the operator the lexer saw, then the word.
  *
- * The word is a token in its own right, and the lexer put the descriptor in front of it
+ * The word is a token in its own right, and the lexer puts the descriptor in front of it
  * when the operator was `2>` and friends.  A bare `> file` has no such token, so the
- * descriptor is 1 (or 0 for `<`). */
+ * descriptor is 1 (or 0 for `<`).
+ *
+ * Whether the token in front is *that* descriptor or the redirection's own argument is
+ * something the lexer knows and this cannot work out: both are a `T_WORD` whose text is one
+ * digit.  So the lexer says which, in `token_t.fd_prefixed`, and this asks.
+ *
+ * Guessing from the text -- "if it is a single digit, it must be the prefixed descriptor" --
+ * is what made `echo hi >&2` print nothing at all.  The `2` was taken as a prefix, the
+ * next token was the end of the line, and the redirection was built with *no* argument;
+ * `collect_redirs()` then read `strtol("")` as zero and made it `>&0`.  So the command's
+ * standard output became its standard input, and the output went nowhere.
+ *
+ * `>&2` is how a script sends something to the console, and a script that sent something
+ * there lost it. */
 static int parse_redirects(parser_t *p, cmd_t *c) {
     while (at(p, T_REDIR)) {
         redir_kind_t kind = peek(p)->rkind;
@@ -215,22 +427,29 @@ static int parse_redirects(parser_t *p, cmd_t *c) {
         p->at++;
 
         if (at(p, T_WORD)) {
-            fdtext = next(p)->text;
+            token_t *t = next(p);
 
-            if (fdtext != NULL && fdtext[1] == 0 && fdtext[0] >= '0' && fdtext[0] <= '9') {
-                /* The descriptor the lexer put there for `2>`; the word is the next one. */
-                char *digit = fdtext;
-
+            if (t->fd_prefixed) {
+                /* The descriptor the lexer put there for `2>`; the word is the next one.
+                 *
+                 * The prefixed token is *borrowed*, never freed.  It is a token's text and
+                 * the token still holds it: `tokens_free()` walks the token list after the
+                 * parse and frees every one of those, so freeing it here released the same
+                 * block twice.  The two frees were minutes apart in a guest run -- this one
+                 * during the parse, that one after the line had run -- which is why it looked
+                 * like the heap was being corrupted by something else entirely.
+                 *
+                 * Nothing here needs it afterwards, which is why the omission is safe and not
+                 * a leak: the token owns it and the token is freed. */
                 fdtext = at(p, T_WORD) ? next(p)->text : NULL;
 
-                if (add_redir(c, kind, fdtext) != 0) {
-                    free(digit);
+                if (add_redir(c, kind, fdtext) != 0)
                     return -1;
-                }
 
-                free(digit);
                 continue;
             }
+
+            fdtext = t->text;
         }
 
         if (fdtext == NULL && at(p, T_WORD))
@@ -281,6 +500,14 @@ static cmd_t *parse_simple(parser_t *p) {
              * in nothing else, and having one code path for "run this and take its output"
              * is worth more than the distinction. */
             if (t->kind == T_DPAREN) {
+                /* One wrap serves both spellings, and that is not a coincidence.
+                 *
+                 * The lexer's token holds what was between the first `(` and the `)` that
+                 * matches it: `ls` for `$(ls)`, and `(n + 1)` for `$((n + 1))` -- in the
+                 * arithmetic form the outer pair *is* the operator and the inner pair is
+                 * part of the expression, so the text already carries one set of
+                 * parentheses.  Putting `$(` and `)` around it therefore gives `$(ls)` and
+                 * `$((n + 1))` respectively, from the same two characters and no test. */
                 char *wrapped = malloc(strlen(t->text) + 4);
 
                 if (wrapped == NULL)
@@ -307,7 +534,8 @@ static cmd_t *parse_simple(parser_t *p) {
 
             if (c->nwords > MAX_ARGS) {
                 fail(p, "too many arguments");
-                goto oom;
+                cmd_free(c);
+                return NULL;
             }
 
             continue;
@@ -385,14 +613,37 @@ static cmd_t *parse_group(parser_t *p, tok_kind_t closer, cmd_kind_t kind) {
         return NULL;
 
     skip_separators(p);
+
+    /* Inside the group, so that a `;` followed by `}` or `)` ends it rather than joining to
+     * another command.  A `;` followed by a `done` or a `fi` in the body still closes a
+     * nested construct rather than this one, which is the reason this is a field on the
+     * parser and not a test on the token: see `parser_t.closers`. */
+    unsigned      was = p->closers;
+
+    p->closers = closer == T_RPAREN ? CLOSE_PAREN : CLOSE_BRACE;
+
+    /* An empty body is a group with nothing in it, not a syntax error: `while ...; do done`
+     * is a loop that never runs, and `true && { }` is a group that does nothing.  Both are
+     * legal, both are what a person means, and rejecting them makes the parser stricter
+     * than every shell it is compared with.
+     *
+     * What is *not* legal is a body that failed to parse, and `parse_and_or()` answers
+     * NULL for both cases.  `p->err` is what tells them apart: an empty body leaves it
+     * NULL, and anything it could not parse set it on the way out. */
+    const char *why = p->err;
+
     c->a = parse_and_or(p);
 
     if (c->a == NULL) {
-        cmd_free(c);
-        return NULL;
+        if (p->err != why || !at(p, closer)) {
+            cmd_free(c);
+            return NULL;
+        }
+    } else {
+        skip_separators(p);
     }
 
-    skip_separators(p);
+    p->closers = was;
 
     if (!accept(p, closer)) {
         failf(p, "a closing bracket was expected",
@@ -404,13 +655,23 @@ static cmd_t *parse_group(parser_t *p, tok_kind_t closer, cmd_kind_t kind) {
     return c;
 }
 
+/* The `if` has already been consumed.
+ *
+ * `parse_compound()` reaches here through `accept(p, T_IF)`, which advances past the
+ * keyword.  Advancing again skips the token *after* it -- for `if true; then ...` that is
+ * `true` -- so the condition is parsed from `;`, `then` swallows what should have been the
+ * condition, and the line is reported as "something after the end of the command".
+ *
+ * Every compound construct failed that way, and the report said the same sentence for all
+ * of them, so nothing said which construct or which token.  A line is now quoted with the
+ * error, which is what makes this readable from the outside: the error is about a line, and
+ * the line belongs in the report. */
 static cmd_t *parse_if(parser_t *p) {
     cmd_t *c = node(CMD_IF);
 
     if (c == NULL)
         return NULL;
 
-    p->at++;                               /* `if` */
     skip_separators(p);
     c->a = parse_and_or(p);
 
@@ -424,20 +685,53 @@ static cmd_t *parse_if(parser_t *p) {
         goto oom;
     }
 
-    skip_separators(p);
+    /* Everything from here to `fi` is inside the `if`, so a `;` followed by a `done` or an
+     * `esac` in there closes a nested construct and not this one. */
+    unsigned      was = p->closers;
+
+    p->closers = CLOSE_FI;
+
+    /* `why_then` is how an empty then-branch is told from a branch that failed to parse:
+     * `if C; then; fi` is legal and does nothing, and `parse_and_or()` answers NULL for
+     * both that and a real error.  An empty branch leaves `p->err` alone.
+     *
+     * The then-branch goes in `c->b`, and the *else*-branch replaces it below -- `b` is
+     * "the branch that runs", and there is only one of those.  So a node with no else ends
+     * up with `b` holding the then-branch, and the `elif` chain hangs off `elifs`. */
+    const char *why_then = p->err;
+
     c->b = parse_and_or(p);
 
-    if (c->b == NULL)
+    if (c->b == NULL && (p->err != why_then || !at_closer(p)))
         goto oom;
 
     skip_separators(p);
 
+    /* Each `elif` is a condition, a `then`, and a body, and the branch it introduces runs when
+     * it is the *first* condition that holds -- which is what POSIX says and what a person
+     * means, and neither is what the tree used to do.
+     *
+     * A `CMD_IF` holds one condition and one branch, so an `elif` cannot be a sibling of the
+     * `if`: there is nowhere to put it.  Each pair is a `CMD_LIST` named `elif` whose `a` is
+     * the condition and whose `b` the body, and `c->elifs` chains them in source order.
+     *
+     * The chain used to overwrite `c->a` and `c->b` as it read, so only the *last* branch
+     * survived: `if true; then A; elif true; then B; fi` parsed cleanly and ran B.  A parse
+     * test cannot see that -- the tree is well formed either way -- which is why the host
+     * test compares the words in the tree against the words on the line and not only
+     * accept/reject.
+     *
+     * The executor takes the first condition that holds and stops there, so a condition after
+     * the branch that was taken is never evaluated, which is what POSIX requires and what
+     * makes `elif [ -f x ]` after a matching earlier branch safe. */
     while (at(p, T_ELIF)) {
+        cmd_t *cond;
+
         p->at++;
         skip_separators(p);
-        c->b = parse_and_or(p);            /* the condition of the elif */
+        cond = parse_and_or(p);            /* the condition of the elif */
 
-        if (c->b == NULL)
+        if (cond == NULL)
             goto oom;
 
         skip_separators(p);
@@ -448,25 +742,76 @@ static cmd_t *parse_if(parser_t *p) {
         }
 
         skip_separators(p);
-        c->a = c->b;
-        c->b = parse_and_or(p);
+        cmd_t *body = parse_and_or(p);
 
-        if (c->b == NULL)
+        if (body == NULL) {
+            if (!at_closer(p)) {
+                cmd_free(cond);
+                goto oom;
+            }
+        } else {
+            skip_separators(p);
+        }
+
+        /* Fold the pair into the list hanging off `c->a`'s slot for `else` branches: a
+         * `CMD_IF` whose `b` is a `CMD_LIST` of `{ condition, body }` pairs.  The
+         * executor walks it in order and stops at the first condition that holds. */
+        cmd_t *pair = node(CMD_LIST);
+
+        if (pair == NULL) {
+            cmd_free(cond);
+            cmd_free(body);
             goto oom;
+        }
 
-        skip_separators(p);
+        pair->kind = CMD_LIST;
+        pair->a = cond;
+        pair->b = body;
+        pair->name = strdup("elif");
+
+        if (c->elifs == NULL) {
+            c->elifs = pair;
+        } else {
+            cmd_t *tail = c->elifs;
+
+            while (tail->next_elif != NULL)
+                tail = tail->next_elif;
+
+            tail->next_elif = pair;
+        }
     }
 
+    /* The else-branch gets a field of its own, because `a` and `b` are both taken.
+     *
+     * `a` is the condition and `b` is the branch that runs when it holds, so there is no
+     * slot left for "the branch that runs when it does not" -- and putting the else-branch
+     * in `b` made `if C; then A; else B; fi` run `B` when `C` held, which is the opposite of
+     * what the line says.
+     *
+     * A separate field is also what keeps the three apart: condition, then-branch, and the
+     * `elif` chain, with `orelse` for the alternative.  Before this the tree had two slots
+     * for three things and every arrangement of them was wrong in some case.
+     *
+     * An empty else-branch is legal -- `if C; then A; else; fi` -- and leaves the field
+     * NULL, which the executor treats as "do nothing", the same answer an empty branch
+     * would give. */
     if (accept(p, T_ELSE)) {
-        skip_separators(p);
-        c->a = c->b;
-        c->b = parse_and_or(p);
-
-        if (c->b == NULL)
-            goto oom;
+        const char *why_else = p->err;
 
         skip_separators(p);
+        c->orelse = parse_and_or(p);
+
+        if (c->orelse == NULL) {
+            if (p->err != why_else || !at_closer(p)) {
+                cmd_free(c);
+                return NULL;
+            }
+        } else {
+            skip_separators(p);
+        }
     }
+
+    p->closers = was;
 
     if (!accept(p, T_FI)) {
         fail(p, "`fi' expected");
@@ -486,9 +831,16 @@ static cmd_t *parse_for(parser_t *p) {
     if (c == NULL)
         return NULL;
 
-    p->at++;                               /* `for` */
-
-    if (!at(p, T_WORD)) {
+    /* `for` was consumed by parse_compound()'s accept(); see parse_if().
+     *
+     * The variable name is taken with `next()` rather than by insisting on a `T_WORD`,
+     * because a variable may be called anything a word may be called -- including the name
+     * of a shell keyword.  `for do in a b; do echo $do; done` is legal on bash and on every
+     * other shell, and it worked here only by accident: `do` followed `for`, so it was
+     * lexed as the keyword `T_DO`, and this parser refused the line with "a loop variable
+     * name was expected after `for'".  The keyword's *spelling* is what matters in this
+     * position, not its kind, so the text is taken and the kind is not. */
+    if (peek(p)->kind == T_EOF) {
         fail(p, "a loop variable name was expected after `for'");
         goto oom;
     }
@@ -520,11 +872,25 @@ static cmd_t *parse_for(parser_t *p) {
             if (add_word(c, t->text) != 0)
                 goto oom;
 
-            skip_separators(p);
+            /* Newlines only, and this is the reason the word list is a loop and not a
+             * "scan until the next `do`".
+             *
+             * `for i in\n  1 2 3\ndo` is legal and the words are on their own lines, so a
+             * newline cannot end the list.  A `;` can: `for i in; do` has an empty word
+             * list, which is not the same as `for i in` with no `in` at all, and skipping
+             * the `;` here would leave `accept(T_DO)` looking at the `;` itself. */
+            while (at(p, T_NEWLINE))
+                p->at++;
         }
     } else {
         c->no_in = 1;
     }
+
+    /* The `;` between the word list and the `do` -- or the newline, for a list written on
+     * its own lines.  This is the one place separators are skipped after a word list,
+     * because the list is ended by a *separator* and every other list is ended by a word
+     * (`fi`, `done`, `esac`) that its own parser knows to expect. */
+    skip_separators(p);
 
     if (!accept(p, T_DO)) {
         fail(p, "`do' expected");
@@ -532,10 +898,23 @@ static cmd_t *parse_for(parser_t *p) {
     }
 
     skip_separators(p);
+
+    /* Everything from here to `done` is inside the loop, so a `;` followed by a `fi` in
+     * there closes an inner `if` rather than this loop.  See `parser_t.closers`. */
+    unsigned      was = p->closers;
+
+    p->closers = CLOSE_DONE;
+
+    /* An empty body is legal: `for i in 1 2; do; done` is a loop that does nothing, which is
+     * what a person writes to mean "nothing to do". */
+    const char *why_body = p->err;
+
     c->a = parse_and_or(p);
 
-    if (c->a == NULL)
+    if (c->a == NULL && (p->err != why_body || !at_closer(p)))
         goto oom;
+
+    p->closers = was;
 
     skip_separators(p);
 
@@ -558,7 +937,7 @@ static cmd_t *parse_while(parser_t *p, int negated) {
         return NULL;
 
     c->negated = negated;
-    p->at++;                               /* `while` or `until` */
+    /* `while` or `until` was consumed by parse_compound()'s accept(); see parse_if(). */
     skip_separators(p);
     c->a = parse_and_or(p);
 
@@ -573,10 +952,23 @@ static cmd_t *parse_while(parser_t *p, int negated) {
     }
 
     skip_separators(p);
+
+    /* Everything from here to `done` is inside the loop, so a `;` followed by a `fi` in
+     * there closes an inner `if` rather than this loop.  See `parser_t.closers`. */
+    unsigned      was = p->closers;
+
+    p->closers = CLOSE_DONE;
+
+    /* An empty body is legal: `while read l; do; done` is a loop that reads and does
+     * nothing, and rejecting it makes `while` unusable for draining a file. */
+    const char *why_body = p->err;
+
     c->b = parse_and_or(p);
 
-    if (c->b == NULL)
+    if (c->b == NULL && (p->err != why_body || !at_closer(p)))
         goto oom;
+
+    p->closers = was;
 
     skip_separators(p);
 
@@ -642,8 +1034,31 @@ static int parse_case_arm(parser_t *p, case_arm_t *arm) {
         return -1;
 
     skip_separators(p);
+
+    /* The body is a full command list, and a `;` inside it joins as it does anywhere else.
+     *
+     * This was briefly made to *end* the arm at a bare `;`, on the reasoning that
+     * `case a in a) echo 1; b) echo 2; esac` needs it.  That line is a syntax error on bash,
+     * dash and busybox -- the arm has to be closed with `;;` or `;&` -- so the rule would
+     * have made this shell accept something it should refuse while still refusing what it
+     * should accept: `case $x in a) true && echo hi; esac` is legal on every one of them,
+     * and the `&&` there is a list, not an arm terminator.
+     *
+     * The rule as it stands: inside a `case` arm, `;` behaves exactly as it does
+     * everywhere else, and the arm ends at `;;`, at `;&`, or at a newline.
+     *
+     * An *empty* body is legal and is a no-op, which is what `case $x in a) ;; esac` means:
+     * a pattern that matches and does nothing.  It is how a `case` says "these are the
+     * interesting ones, ignore the rest", and refusing it makes a deliberate no-op arm
+     * unusable.
+     *
+     * `parse_and_or()` answers NULL for that and for a body that failed to parse, and
+     * `p->err` is what tells them apart: an empty body leaves it alone. */
+    const char *why = p->err;
+
     arm->body = parse_and_or(p);
-    return arm->body != NULL ? 0 : -1;
+
+    return (arm->body != NULL || p->err == why) ? 0 : -1;
 }
 
 static cmd_t *parse_case(parser_t *p) {
@@ -652,8 +1067,7 @@ static cmd_t *parse_case(parser_t *p) {
     if (c == NULL)
         return NULL;
 
-    p->at++;                               /* `case` */
-
+    /* `case` was consumed by parse_compound()'s accept(); see parse_if(). */
     if (!at(p, T_WORD)) {
         fail(p, "a word was expected after `case'");
         goto oom;
@@ -670,10 +1084,36 @@ static cmd_t *parse_case(parser_t *p) {
 
     skip_separators(p);
 
+    /* Everything from here to `esac` is inside the `case`. */
+    unsigned      was = p->closers;
+
+    p->closers = CLOSE_ESAC;
+
     /* An empty case body is legal and is a no-op, which is what `case $x in esac` means on
      * every shell; refusing it would make `case` unusable for "is there a default?" */
     while (!at(p, T_ESAC) && !at(p, T_EOF)) {
-        case_arm_t *grown = realloc(c->arms, (size_t)(c->narms + 1) * sizeof(case_arm_t));
+        /* The array is grown by *two* arms' worth, and the extra one is why.
+         *
+         * The arm being filled in has to stay at `c->arms[c->narms]`, because
+         * `parse_case_arm()` writes through a pointer into it -- and if the `realloc()`
+         * below moved the array, that pointer would be into freed memory.  Growing by one
+         * and filling the new last slot works only because the fill happens after the
+         * realloc, with the pointer taken from the *new* array.  What it does not survive
+         * is a second arm: the first arm's `taken` is written at `c->arms[narms - 1]`
+         * after `c->narms++`, which is the slot the *next* arm is about to be zeroed into
+         * by `memset` -- so `taken` was being set on an arm that had already been reset,
+         * and a third arm wrote past the end of the array entirely.
+         *
+         * The visible symptom was the shell's allocator reporting a write one byte past a
+         * block, at a caller in `cmd_free()`: the damage had been done by the parse and
+         * only discovered when the tree was torn down. */
+        if (c->narms + 1 >= MAX_ARMS) {
+            fail(p, "too many case arms");
+            goto oom;
+        }
+
+        size_t want = (size_t)(c->narms + 2) * sizeof(case_arm_t);
+        case_arm_t *grown = realloc(c->arms, want);
 
         if (grown == NULL)
             goto oom;
@@ -691,18 +1131,31 @@ static cmd_t *parse_case(parser_t *p) {
         /* `;;` ends the arm.  `;&` ends it and falls into the next one, which is a
          * different operator and is not implemented; a lone `;` is accepted because every
          * shell accepts it and a script written for one should run here. */
+        /* `;;` ends the arm, and `;&` ends it and falls into the next one -- the second is
+         * accepted and behaves like the first, which is the honest thing to do with an
+         * operator this shell does not implement rather than a syntax error for a script
+         * that used it. */
+        /* `;;` ends the arm.  `;&` ends it and falls into the next one, which is a
+         * different operator and is not implemented; a lone `;` is accepted because every
+         * shell accepts it and a script written for one should run here. */
         if (accept(p, T_DSEMI))
             c->arms[c->narms - 1].taken = 1;
         else if (at(p, T_SEMI))
             p->at++;
 
-        skip_separators(p);
-
-        if (c->narms > MAX_ARMS) {
-            fail(p, "too many case arms");
-            goto oom;
-        }
+        /* Newlines only, and deliberately not `skip_separators()`.
+         *
+         * The `;` that ended the arm's body was consumed by `parse_and_or()`, which is
+         * what joins commands with it, so a `case` written one arm per line still has its
+         * newlines to get past -- and skipping a `;` that is not there would eat the first
+         * pattern of the arm after it.  `case a in a) echo 1; b) echo 2; esac` is a syntax
+         * error on bash, dash and busybox alike; what it needs to be is a *readable* error
+         * about the `case`, and the message it used to get named a pattern instead. */
+        while (at(p, T_NEWLINE))
+            p->at++;
     }
+
+    p->closers = was;
 
     if (!accept(p, T_ESAC)) {
         fail(p, "`esac' expected");
@@ -755,6 +1208,22 @@ static cmd_t *parse_pipeline(parser_t *p) {
     cmd_t *first = NULL;
     cmd_t *pipe  = NULL;
 
+    /* The closers a pipeline's *stage* can be ended by, which is all five of them.
+     *
+     * A stage is one command, and it may be any construct: `do if C; then A; fi | p; done`
+     * is a loop whose body is a pipeline whose first stage is an `if`.  The stage therefore
+     * has to accept a `fi` after a separator whether or not it is inside an `if` of its
+     * own -- the `if` parser is what checks that a `fi` belongs to *it*, not the list
+     * parser's job to withhold it.
+     *
+     * The saved mask is what keeps the loop's own `done` out of it: a stage ending at
+     * `fi` does not mean the loop's body may end at `fi`, and with one mask shared by both
+     * the `for` body read a nested `; fi` as the end of the loop. */
+    unsigned      outer = p->closers;
+
+    p->closers = CLOSE_FI | CLOSE_DONE | CLOSE_ESAC | CLOSE_BRACE | CLOSE_PAREN |
+                 CLOSE_INPUT;
+
     for (;;) {
         cmd_t *stage;
 
@@ -798,13 +1267,49 @@ static cmd_t *parse_pipeline(parser_t *p) {
             pipe->stages[pipe->nstages++] = stage;
         }
 
-        skip_separators(p);
+        /* The separators are skipped *only* when there is a `|` to continue the pipeline
+         * with, and not otherwise.
+         *
+         * They used to be skipped unconditionally, which took the `;` out of `echo a; echo
+         * b` before `parse_and_or()` ever saw it: the separator that joins two commands was
+         * eaten by the parser of the *first* one, so `parse_and_or()` looked at a `T_WORD`
+         * where it expected an operator, returned after one command, and `parse_program()`
+         * reported the rest as trailing garbage.  Every `;`-separated pair in a script
+         * failed, which is to say the most ordinary thing a shell does.
+         *
+         * `skip_separators()` is still what runs before the `|`, because `a ; | b` is not a
+         * pipeline and `a | b` has to get past its blanks. */
+        /* Look *past* any separators for a `|` without consuming them.
+         *
+         * Looking and consuming have to be separated, and that is the whole of this fix.
+         * The separators belong to whoever is joining commands -- `parse_and_or()` reads
+         * the `;` that joins two commands -- and a parser that consumes them on the way
+         * out of the first command takes the operator before its caller can see it.  So
+         * this peeks, and consumes only when the thing it found really is a pipe. */
+        {
+            int look = p->at;
 
-        if (!at(p, T_PIPE))
-            break;
+            while (look < p->t->n &&
+                   (p->t->v[look].kind == T_SEMI || p->t->v[look].kind == T_NEWLINE))
+                look++;
+
+            if (look >= p->t->n || p->t->v[look].kind != T_PIPE)
+                break;
+
+            p->at = look;
+        }
 
         p->at++;
         skip_separators(p);
+
+        /* Past the `|`, so a stage must follow: `a |` is a syntax error on every shell and
+         * parsing it as `a` would run a command the user did not ask for. */
+        if (at_closer(p) || peek(p)->kind == T_EOF) {
+            fail(p, "a command was expected after `|'");
+            cmd_free(first);
+            cmd_free(pipe);
+            return NULL;
+        }
 
         if (pipe == NULL) {
             pipe = node(CMD_PIPE);
@@ -822,6 +1327,8 @@ static cmd_t *parse_pipeline(parser_t *p) {
             return NULL;
         }
     }
+
+    p->closers = outer;
 
     if (pipe != NULL) {
         /* The first stage goes in as `a` rather than as stages[0], so that a two-stage
@@ -865,10 +1372,19 @@ static cmd_t *parse_and_or(parser_t *p) {
         p->at++;
         skip_separators(p);
 
-        /* A trailing `&`, `&&` or `;` at the end of the input is a command with nothing
-         * after it, and that is an error rather than a silent no-op -- except for a bare
-         * `&`, which every shell allows and which means "run this and do not wait". */
-        if (at(p, T_EOF)) {
+        /* A `;` or a newline that ends the list, rather than joining to another command.
+         *
+         * The distinction is the end of the input and a word that closes something: `fi`,
+         * `done`, `esac`, `}`, `)`.  `while ...; do n=$((n+1)); echo "w=$n"; done` ends its
+         * body with `echo "w=$n";` and the `;` there is a separator with nothing after it,
+         * so treating it as a join asks for a command that is not there and the whole line
+         * is reported as unparseable -- which is what it did for every loop, every `if` and
+         * every `case` in the test script.
+         *
+         * A *joined* operator is a different matter and stays an error: `true &&` names an
+         * operator that means "and" and promises a right-hand side, and quietly ignoring
+         * it would run a command the user did not ask for. */
+        if (at_closer(p)) {
             if (op == T_AND_IF || op == T_OR_IF) {
                 fail(p, "a command was expected after this operator");
                 cmd_free(left);
@@ -904,14 +1420,16 @@ static cmd_t *parse_and_or(parser_t *p) {
             c->kind = CMD_LIST, c->negated = 0, c->name = strdup(background ? "&" : ";");
 
         left = c;
-        skip_separators(p);
     }
 
     return left;
 }
 
 cmd_t *parse_program(tokens_t *toks, const char **err) {
-    parser_t p = { toks, 0, NULL };
+    /* `closers` starts as `CLOSE_INPUT`: at the top level the only thing that ends a list
+     * is the end of the input, so a stray `fi` or `done` is trailing garbage and is
+     * reported as such rather than silently ending a command. */
+    parser_t p = { toks, 0, NULL, CLOSE_INPUT };
     cmd_t   *c;
 
     *err = NULL;
@@ -934,8 +1452,24 @@ cmd_t *parse_program(tokens_t *toks, const char **err) {
     skip_separators(&p);
 
     if (!at(&p, T_EOF)) {
+        /* The token that is left, named.
+         *
+         * "Something after the end of the command" says where the parser stopped and not
+         * what it found there, and those are different questions: the first is answered by
+         * every construct that ends in a word, and the second is answered by one line of a
+         * script.  With the word in the message, `if C; then A; fi extra` says `extra`, and
+         * so does `echo a;;`.
+         *
+         * It is built in a static buffer rather than malloc'd because `*err` is a `const
+         * char *` the caller does not own or free -- the same contract every other message
+         * here already has, and `failf()` above has the same reason. */
+        static char buf[192];
+
+        snprintf(buf, sizeof(buf), "something after the end of the command: `%s'",
+                 peek(&p)->text != NULL ? peek(&p)->text : "(end of input)");
+
         cmd_free(c);
-        *err = "something after the end of the command";
+        *err = buf;
         return NULL;
     }
 
