@@ -234,10 +234,19 @@ bool syscall_copy_from_user(void *dst, uint64_t src, size_t bytes);
 bool syscall_copy_to_user(uint64_t dst, const void *src, size_t bytes);
 
 /* Read a NUL-terminated string out of user memory, into a kernel buffer of at most
- * `max` bytes including the terminator.  Returns the length, or -EFAULT if there is no
- * terminator inside that many bytes -- a program that hands over an unterminated block has
- * handed over bytes, not a name, and reading past it to find out would be reading a page
- * it never offered. */
+ * `max` bytes including the terminator.  Returns the length, or -EFAULT if the bytes are
+ * not there and -ENAMETOOLONG if there is no terminator inside `max` -- a program that
+ * hands over an unterminated block has handed over bytes, not a name, and reading past it
+ * to find out would be reading a page it never offered.
+ *
+ * Two rules make this different from copying a fixed-size block, and both of them were
+ * bugs: it stops at the NUL rather than at `max`, so a nine-byte path does not need 256
+ * mapped bytes; and it never reads past the end of the page the cursor is on, so a string
+ * at the top of a program's stack does not need the page above that one either.
+ *
+ * `syscall_copy_cstring()` is that function.  `syscall_copy_string()` is the same thing
+ * under the name the filesystem half uses, and both live in kernel/lib/syscall.c. */
+long syscall_copy_cstring(uint64_t src, char *dst, size_t max);
 long syscall_copy_string(uint64_t src, char *dst, size_t max);
 
 /* --- descriptors --------------------------------------------------------- */

@@ -17,34 +17,12 @@
 
 /* --- reading names out of the boundary ----------------------------------- */
 
+/* A path, an `argv` entry, an `envp` entry -- anything the boundary hands over as a C
+ * string.  The work is in `syscall_copy_cstring()` (kernel/lib/syscall.c), which is where
+ * the rules about page boundaries and about not reading past a NUL live; this is the name
+ * the filesystem half uses. */
 long syscall_copy_string(uint64_t src, char *dst, size_t max) {
-    if (max == 0)
-        return -EFAULT;
-
-    /* Page by page, and the length of a page is whatever is left of the buffer, so a path
-     * that is longer than the buffer is refused rather than truncated: a name cut short is
-     * a different name, and opening one of those is how a program ends up writing to a file
-     * it never mentioned. */
-    size_t got = 0;
-
-    while (got + 1 < max) {
-        size_t chunk = max - 1 - got;
-
-        if (chunk > 256)
-            chunk = 256;
-
-        if (!syscall_copy_from_user(dst + got, src + got, chunk))
-            return -EFAULT;
-
-        for (size_t i = 0; i < chunk; i++) {
-            if (dst[got + i] == 0)
-                return (long)(got + i);
-        }
-
-        got += chunk;
-    }
-
-    return -ENAMETOOLONG;
+    return syscall_copy_cstring(src, dst, max);
 }
 
 /* The path a call names, into `dst`.  0, or -errno. */
@@ -355,39 +333,47 @@ long fs_sys_dup2(regs_t *regs) {
     int old = (int)(int64_t)syscall_arg(regs, 0);
     int neu = (int)(int64_t)syscall_arg(regs, 1);
     fd_entry_t *e = fd_get(old);
+    fd_entry_t *t = fd_table();
 
-    if (e == NULL || neu < 0 || neu >= FD_TABLE_ENTRIES)
+    if (e == NULL || t == NULL || neu < 0 || neu >= FD_TABLE_ENTRIES)
         return -EBADF;
 
-    /* dup2 onto a number that is already open closes it first.  Not closing it is the bug
-     * that leaves a pipe with an end nothing can account for, and the symptom is a reader
-     * that never sees end of file. */
-    if (neu != old) {
-        fd_entry_t *victim = fd_get(neu);
+    /* `dup2(old, old)` is defined to be a no-op that succeeds, and it has to be checked
+     * before anything else: the code below closes the destination first, which for
+     * `dup2(1, 1)` would be closing the very descriptor being duplicated. */
+    if (neu == old)
+        return 0;
 
-        if (victim != NULL && victim->closable) {
-            if (victim->kind == FD_PIPE)
-                pipe_close_end((pipe_t *)victim->obj, victim->pipe_end);
-            else if (victim->kind == FD_FILE)
-                vfs_file_release((file_t *)victim->obj);
+    /* Whatever was at `neu` is closed.  Not closing it is the bug that leaves a pipe with
+     * an end nothing can account for, and the symptom is a reader that never sees end of
+     * file. */
+    fd_entry_t *victim = fd_get(neu);
 
-            memset(victim, 0, sizeof(*victim));
-        }
+    if (victim != NULL) {
+        if (victim->kind == FD_PIPE)
+            pipe_close_end((pipe_t *)victim->obj, victim->pipe_end);
+        else if (victim->kind == FD_FILE)
+            vfs_file_release((file_t *)victim->obj);
     }
 
-    fd_entry_t *slot = fd_get(neu);
-
-    if (slot == NULL) {
-        int fresh = fd_alloc(e->kind, e->obj, e->pipe_end);
-
-        if (fresh != neu)
-            return -EMFILE;
-    } else {
-        slot->kind = e->kind;
-        slot->obj = e->obj;
-        slot->pipe_end = e->pipe_end;
-        slot->closable = true;
-    }
+    /* And then the new name goes *at* `neu`, which is the whole point of `dup2` and is
+     * what this got wrong.
+     *
+     * It used to clear the destination and then call `fd_alloc()`, which hands out the
+     * *lowest free* number.  With `dup2(fd, 1)` where `fd` was 3, that handed back 3 --
+     * the destination had just been vacated and 3 was still taken by the source -- so the
+     * call answered `-EMFILE` and the redirection silently did nothing.  `echo hello >
+     * /tmp/a.sh` printed `hello` on the screen and created no file; `/sbin/init`'s
+     * `dup2(console, 0/1/2)` would have failed the same way on a descriptor table where
+     * the console was not already number 3.
+     *
+     * A descriptor number a caller *named* is not a request for a free one, so the slot is
+     * written directly.  The victim has already been released above, which is the other
+     * half of what POSIX says happens to the number `dup2` writes over. */
+    t[neu].kind      = e->kind;
+    t[neu].obj       = e->obj;
+    t[neu].pipe_end  = e->pipe_end;
+    t[neu].closable  = true;
 
     if (e->kind == FD_PIPE)
         pipe_retain((pipe_t *)e->obj, e->pipe_end);
