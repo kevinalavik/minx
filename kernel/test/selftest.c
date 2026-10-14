@@ -2026,6 +2026,35 @@ static void test_sh_program(void) {
 #endif
 }
 
+/* Phase 10: the coreutils, and the one test per tool the spec asks for.
+ *
+ * `coretest` forks each program, gives it arguments and an input, and compares its output
+ * byte for byte and its exit status exactly.  It is a program rather than a kernel-side
+ * check for the reason `shtest` is: the things being tested are ring-3 programs, and a
+ * kernel-side test of `ls` would be testing the kernel's ability to run `ls`, which
+ * `test_sh_program()` already covers.
+ *
+ * It is a separate test from the others for a second reason: `libctest` failing means the
+ * libc moved, `shtest` failing means the shell moved, and this failing means one of ten
+ * small programs moved.  A report that cannot say which is not worth reading.
+ *
+ * The files it leaves behind are dumped if it hangs, for the reason `hung_dump_paths`
+ * exists: a `coretest` that stops is almost always stopped inside a `waitpid` for a tool
+ * that never exited, and the tool's own output is what says so. */
+static void test_coreutils_program(void) {
+    static const char *paths[] = { "/tmp/coretest", NULL };
+
+    hung_dump_paths = paths;
+
+    bool ok = run_program("coretest", "phase10-coreutils", "coretest would not load");
+
+    hung_dump_paths = NULL;
+
+    if (!ok)
+        return;
+    test_pass("phase10-coreutils");
+}
+
 /* Phase 8's program, and the only filesystem test that goes through `int $0x80`.
  *
  * `test_ramfs()` below tests the same tree from inside the kernel, and both are here on
@@ -3121,6 +3150,7 @@ void test_run_all(void) {
     test_fs_program();
     test_libc_program();
     test_sh_program();
+    test_coreutils_program();
     test_sched_queues();
     test_sched_parallel();
     test_sched_preempt();
