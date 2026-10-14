@@ -220,9 +220,10 @@ static char *run_script(int *status_out) {
 
     size_t len = strlen(script);
     size_t at = 0;
+    ssize_t n = 0;
 
     while (at < len) {
-        ssize_t n = write(fd, script + at, len - at);
+        n = write(fd, script + at, len - at);
 
         if (n <= 0)
             break;
@@ -231,6 +232,15 @@ static char *run_script(int *status_out) {
     }
 
     close(fd);
+
+    /* A script that was not written whole is not a script, and testing it anyway produces a
+     * failure report about the *shell* when the fault is here: the shell runs an empty file,
+     * prints nothing, exits 0, and every expected line is missing.  Say so instead. */
+    if (at != len) {
+        printf("shtest: wrote %zu of %zu bytes of the script: %s\n", at, len,
+               n <= 0 ? strerror(errno) : "a short write");
+        return NULL;
+    }
 
     unlink("/tmp/shtest.out");
 
@@ -283,8 +293,15 @@ static char *run_script(int *status_out) {
     int    st = 0;
     pid_t  reaped;
 
+    printf("shtest: fork returned %ld, my own pid is %ld\n", (long)pid, (long)getpid());
+
     while ((reaped = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
         ;
+
+    printf("shtest: waitpid returned %ld for the pid %ld I asked about\n", (long)reaped,
+           (long)pid);
+    printf("shtest: my own pid is now %ld, and the status word is %ld\n",
+           (long)getpid(), (long)st);
 
     /* A `waitpid` that failed is not a script that passed.
      *

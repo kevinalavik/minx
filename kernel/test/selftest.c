@@ -1712,6 +1712,13 @@ static void test_user_program(void) {
  * the answer is.  These are the paths `shtest` writes. */
 static const char **hung_dump_paths;
 
+/* The files a test asked to have reported on the way out, however it left.
+ *
+ * On a hang, what a program left behind says how far it got; on a failure of its own, it
+ * says the same thing and also whether the program managed to write the input at all.  A
+ * program that reports "0 of 52 lines matched" is asking the reader to work out whether
+ * its script was empty, its output file was missing, or its shell printed nothing, and
+ * those are three different bugs. */
 /* Every task, one line each: number, name, state, parent, and whether it ever ran.
  *
  * A hang is a relationship between tasks -- this one is waiting for that one, which is
@@ -1778,6 +1785,16 @@ static void dump_kernel_stack(const task_t *t) {
             shown++;
         }
     }
+}
+
+static void dump_ramfs_file(const char *path);
+
+static void dump_test_files(void) {
+    if (hung_dump_paths == NULL)
+        return;
+
+    for (const char **p = hung_dump_paths; *p != NULL; p++)
+        dump_ramfs_file(*p);
 }
 
 /* Print a file from the ramfs, up to `limit` bytes.
@@ -1921,6 +1938,7 @@ static bool run_program(const char *name, const char *test, const char *what) {
     if (code != 0) {
         kprintf("%s: %s exited %d, which is its own report that a check failed\n",
                 test, name, code);
+        dump_test_files();
         test_fail(test, "the program's own checks failed");
         return false;
     }
