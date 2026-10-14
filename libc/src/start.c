@@ -14,6 +14,7 @@
  * output is written by a buffer that was never flushed has lost exactly the line a user
  * would have read first.
  */
+#include <stdbool.h>
 #include <internal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,11 +79,16 @@ int __libc_start_main(long *stack) {
     long    argc = stack[0];
     char   **argv = (char **)&stack[1];
 
+    /* Whether `argv` was replaced below.  It has to be known *before* the environment is
+     * looked for, and remembering it is the whole of the fix. */
+    bool substituted = false;
+
     if (argc < 1) {
         static char *fallback[] = { (char *)"minx", NULL };
 
         argv = fallback;
         argc = 1;
+        substituted = true;
     }
 
     if (argv[0] == NULL) {
@@ -90,14 +96,43 @@ int __libc_start_main(long *stack) {
 
         argv = fallback0;
         argc = 1;
+        substituted = true;
     }
 
-    char **envp = argv + argc + 1;
+    /* The loader's environment, found from the loader's *stack*.
+     *
+     * It used to be found from `argv`, which is wrong the moment `argv` is one of the two
+     * two-element arrays above: `argv + argc + 1` is then **one past the end of that array**,
+     * and the word read there is whatever the linker happened to place after it in `.bss`.
+     * Zero there gives the libc's own environment, which is right.  Anything else is adopted
+     * as an environment -- a pointer to a number, read as a list of strings -- and every
+     * `getenv()` in the program then returns NULL for everything.
+     *
+     * **That is the intermittent "PATH is set before main()" failure**: it depends on what
+     * follows a `static` array in `.bss`, which changes with every edit to this file, and it
+     * has been in and out of `make test` for a long time without ever being a real
+     * difference between the machines it failed on and the machines it passed.
+     *
+     * A substituted `argv` is not the loader's, so there is no loader's environment to find
+     * from it, and `NULL` is the honest answer: the libc's own three variables are then used,
+     * which is what a program the kernel started should see anyway. */
+    char **envp = substituted ? NULL : argv + argc + 1;
 
     /* The loader's envp, if it supplied one, replaces the libc's.  A program started by a
      * shell has the shell's environment, which is what it should see; a program started by
      * the kernel has none, and gets the three variables above. */
-    __libc_set_startup_env(*envp != NULL ? envp : NULL);
+    /* Both tests, and the second one is not redundant.  `envp` can be a perfectly good
+     * pointer to an array whose *first element* is NULL -- that is exactly what the loader
+     * writes for a program it starts with no environment -- and `__libc_adopt_env()` reads
+     * those two as different things: a NULL pointer means "use the libc's defaults", an
+     * empty array means "this program has no variables".
+     *
+     * Passing the empty array through drops every `getenv()` in the program to NULL, which
+     * is what happened here: every check in `coretest` failed with `execvp()` reporting it
+     * had tried to run `.`, because PATH had gone.  The loader *does* write the `envp[0]`
+     * slot -- `sp+24`, and it is NULL for exactly this case -- so the pointer is good and
+     * what it holds is not. */
+    __libc_set_startup_env(envp != NULL && envp[0] != NULL ? envp : NULL);
 
     libc_startup();
 

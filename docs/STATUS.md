@@ -1041,8 +1041,32 @@ line defines.
 With that fixed the gate runs and is green: 20000 fuzz rounds clean, every byte accounted
 for, and the shell parser still agrees with `bash -n` on all 139 lines.
 
-**One documented flake, still open:** `libctest`'s "PATH is set before main()" fails
-intermittently -- seen in this session in three runs out of about ten, and never twice in a
-row. It is `__libc_start_main()` adopting an environment that is not there, which points at
-the loader's stack layout rather than at the libc. Unreproduced since the last run.
+**One documented flake, partly fixed, still open:** `libctest`'s "PATH is set before main()"
+fails intermittently -- most recently in one run of three.
+
+**One cause is found and fixed.** `__libc_start_main()` looked for the environment with
+`envp = argv + argc + 1`, *after* it may have replaced `argv` with one of two **two-element
+static arrays**. `argv + 1 + 1` is then one past the end of that array, and the word read
+there is whatever the linker placed after it in `.bss`. Zero there gave the libc's own three
+variables, which is right; anything else was adopted as an environment -- a pointer to a
+number, read as a list of strings -- and every `getenv()` in the program then returned NULL.
+It changed with every edit to the file, which is why it had been in and out of `make test`
+for a long time without ever being a difference between the machines it failed on.
+
+**A second cause is the one that remains.** The loader's layout is `sp+24  envp[0] = NULL`,
+so a program the kernel starts with no environment has a *good pointer* to an array whose
+first element is NULL -- and `__libc_adopt_env()` reads those two as different things, a
+NULL pointer meaning "use the defaults" and an empty array meaning "no variables". Both tests
+are applied now. The flake that is left is `envp[0]` being non-NULL when it should be NULL,
+which means `argc` is not always 1 for these programs and `argv + argc + 1` is landing one
+word further into the stack than the `envp` slot. **The next thing to check is what `argc`
+the loader writes**, since every other explanation has been ruled out.
+
+**Three of the things tried against it made it worse and are recorded because of it**: adding
+the `substituted` flag without keeping the `envp[0] != NULL` test broke every check in
+`coretest` at once (`execvp` reporting it had tried to run `.`, because PATH had gone), and
+chasing it produced a second failing test that had nothing to do with the first. The lesson
+is the one the redzone check taught two bugs ago: **a message that names a cause is worth
+more than a faster reproduction, and a fix that changes every check in a test at once is
+probably not a fix.**
 
