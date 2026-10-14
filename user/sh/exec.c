@@ -455,41 +455,23 @@ static char **expand_command(const cmd_t *c, int *status) {
         free_fields(one);
     }
 
-    /* A command with no words but with assignments still runs something: a shell.  This is
-     * what makes `PATH=/bin ls` work when `ls` is not on the path it had, and what makes a
-     * typo'd assignment run a second shell instead of doing nothing. */
+    /* Nothing to run: the assignments are the whole command, and they have been made above.
+     *
+     * `x=42` on its own sets `x` in *this* shell and succeeds, which is what every other
+     * shell does and what a script that counts with `n=0` depends on.  It used to fork and
+     * exec `/bin/sh` with no arguments here instead, on the theory that a command with
+     * assignments and no words "still runs something".  Two things are wrong with that, and
+     * the first one is visible in any run: `sh script.sh` reached the first bare assignment,
+     * started an interactive shell whose standard input was the console, and the script, its
+     * parent and the program's `waitpid` all waited for ever on a shell that was waiting for
+     * a person to type at it.  The second is that it was never what anyone wanted even when
+     * it did not hang: `PATH=/bin ls` is a command with *words*, so it takes the path below
+     * and sets `PATH` for that one command, with no second shell involved.
+     *
+     * `run_simple()` still does something with a command like this when it has
+     * redirections -- `> file` on a line of its own truncates the file, and it has to
+     * happen in a child so the shell's own descriptor 1 survives. */
     if (args.n == 0) {
-        if (c->nassigns > 0) {
-            char  *argv[2];
-            char  *env[1];
-            char **e = var_environ();
-
-            (void)env;
-            argv[0] = (char *)sh_name;
-            argv[1] = NULL;
-
-            pid_t pid = fork();
-
-            if (pid == 0) {
-                execve("/bin/sh", argv, e);
-                _exit(127);
-            }
-
-            if (pid < 0) {
-                sh_perror("fork");
-                *status = 1;
-                return NULL;
-            }
-
-            int st = 0;
-
-            while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
-                ;
-
-            *status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-            return NULL;
-        }
-
         *status = 0;
         return NULL;
     }
