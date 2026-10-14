@@ -38,6 +38,23 @@ static volatile uint64_t pit_ticks;
 static uint64_t pit_start_tsc;
 
 uint64_t monotonic_ns(void) {
+    /* Before the TSC has been calibrated there is no rate to divide by, and zero is the
+     * honest answer rather than a guess: a reading made now would be a number with no
+     * meaning behind it, and every caller of this wants an interval, not a timestamp.
+     *
+     * This check is the whole difference between a clock and a fault.  `tsc / tsc_hz`
+     * with `tsc_hz == 0` is a #DE, which on this machine is a panic -- and a panic raised
+     * inside `kprintf()` deadlocks rather than printing, because the panic report needs
+     * the console lock that the interrupted `kprintf()` is still holding.  So a caller that
+     * asked for the time before the timer was armed did not get a wrong answer and a
+     * report; it got silence, right up to the first frame the framebuffer console draws.
+     *
+     * Nothing that measures an interval runs this early: the scheduler and the timers are
+     * armed after `timer_init()`, and `timer_uptime_ms()` falls back to this only while the
+     * 8253 has not started counting. */
+    if (tsc_hz == 0)
+        return 0;
+
     /* Keep the sub-second remainder instead of dividing to whole seconds first:
      * rdtsc/tsc_hz is a second count, so rounding it away first throws away
      * every microsecond and leaves a clock that only ticks once a second and
@@ -48,8 +65,7 @@ uint64_t monotonic_ns(void) {
     uint64_t seconds = tsc / tsc_hz;
     uint64_t remainder = tsc % tsc_hz;
 
-    return seconds * NSEC_PER_SEC +
-           remainder * NSEC_PER_SEC / (tsc_hz ? tsc_hz : 1);
+    return seconds * NSEC_PER_SEC + remainder * NSEC_PER_SEC / tsc_hz;
 }
 
 uint64_t monotonic_ms(void) {
