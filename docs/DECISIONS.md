@@ -1298,3 +1298,42 @@ completion.
 `syscall_dispatch()` holds interrupts off for the whole of a handler, so a CPU never has two
 `exec`s in flight. That is the same argument that makes the static arena safe per task, moved
 up one level to where the sharing actually was.
+
+## Every program depends on the library it links, marker or not
+
+**Decision.** `$(LIBC)` is a prerequisite of every user program's rule in the Makefile.
+The `libc` marker still chooses the entry point and nothing else.
+
+**Why.** `-lc` is on every one of those link lines, so every program is linked against the
+libc whether or not it says so — and the marker says which *entry point* a program gets
+(`main()` through `libc/src/exit.S`, or `minx_main()` through `user/common/start.S`), not
+whether its calls are answered by the library that happens to be on disk now.
+
+The consequence was that a fix to anything in `libc.a` reached only the marked programs.
+`qsort()` was repaired — it merged a five-element array's last pass two-and-three instead of
+four-and-one — and `sort` and `ls`, which call it, carried on running the broken copy,
+because nothing in the build said they had been built against the library they were linked
+with. Nothing complained. The programs simply ran yesterday's library.
+
+**This is the kind of bug that costs a day and is found in a minute by a tool that did not
+exist yet.** `coretest` found it the first time it ran a `sort` after the `qsort` fix and
+found it *unchanged*.
+
+**Left as it is.** A program with no marker still gets `minx_main()` and `start.S`. That is
+the right default for a test of the syscall door or the loader, which wants nothing in
+between it and the kernel — `forktest`, `cowtest` and `sigtest` all rely on it. The
+dependency is now unconditional; the entry point is still per program.
+
+## A libc function with no test is a libc function that is broken
+
+**Decision.** `qsort()` gets a test in `libctest` covering every length from 1 to 20, three
+input shapes per length, stability, and the empty and single-element cases.
+
+**Why it was written the way it is.** The bug was in the *merge*, and it only appeared from
+the third pass of a bottom-up merge sort, where the two runs being merged are of different
+lengths. The lengths that matter are exactly the ones that are not powers of two — 3, 5, 6,
+7, 9, 11, 13, 15, 17, 19 — so a test of sizes 1, 2 and 4 passes straight through it. That
+is why this is a loop over every length rather than three cases.
+
+It had no test at all before, which is the only reason the bug survived: `glob()`, `ls` and
+`sort` all use it, and all three were visibly wrong in ways nobody traced back to it.
