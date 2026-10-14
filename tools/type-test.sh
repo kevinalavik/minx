@@ -111,11 +111,28 @@ print("type-test: banner seen, typing")
 # `sendkey` takes a QKeyCode plus optional modifiers.  qemu-c64 and
 # keya-to-z cover the text; enter is ret, and space is spc.
 KEYMAP = {" ": "spc"}
+# `sendkey` takes a QKeyCode and optional modifiers, so the punctuation a shell
+# line is full of needs both the key's *name* and, for the shifted characters, a
+# shift modifier.  These are QEMU's names, which are the X keysym names lowercased.
+KEYMAP.update({
+    "-": "minus", "=": "equal", "[": "bracket_left", "]": "bracket_right",
+    ";": "semicolon", "'": "apostrophe", "`": "grave_accent",
+    "\\": "backslash", ",": "comma", ".": "dot", "/": "slash",
+})
+SHIFTED = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+    "*": "8", "(": "9", ")": "0", "_": "minus", "+": "equal",
+    "{": "bracket_left", "}": "bracket_right", ":": "semicolon",
+    '"': "apostrophe", "~": "grave_accent", "|": "backslash",
+    "<": "comma", ">": "dot", "?": "slash",
+}
 for ch in text:
     if ch == "\n":
         send(s, "sendkey ret")
-    elif ch.lower() in KEYMAP:
+    elif ch in KEYMAP:
         send(s, "sendkey " + KEYMAP[ch])
+    elif ch in SHIFTED:
+        send(s, "sendkey shift-" + SHIFTED[ch])
     elif ch.isalnum():
         send(s, "sendkey " + ch.lower())
     else:
