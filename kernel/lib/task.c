@@ -85,6 +85,7 @@ typedef struct {
     volatile uint32_t in_schedule;   /* re-entrancy guard, per processor */
     uint64_t      slice_start_ns;
     uint64_t      ticks;
+    uint64_t      last_hang_report_ns;   /* silence already reported, so it is not repeated */
     uint32_t      switches;
     uint32_t      steals;
     uint32_t      migrations;
@@ -352,8 +353,26 @@ static void unblock(task_t *t) {
                                                    TASK_RUNNABLE, false,
                                                    __ATOMIC_ACQ_REL,
                                                    __ATOMIC_ACQUIRE);
-    if (was_waiting)
+    if (was_waiting) {
         blocked_remove(t);
+    } else {
+        /* A wake for a task that is not waiting *yet*.
+         *
+         * Every "test a condition, then block on it" has this window, and the window here
+         * is not closed by interrupts being off: the wake comes from *another processor*.
+         * A parent scans its children, sees none exited, and blocks; a child that exits in
+         * the gap calls `unblock()`, finds a task that is still TASK_RUNNING, and does
+         * nothing at all.  The parent then sleeps for ever with its child already dead and
+         * its `wait` never returning -- which is `shtest` hanging in `waitpid`, `init`
+         * spawning shells nobody is waiting for, and a machine that has quietly stopped
+         * making progress.
+         *
+         * So the wake is *recorded*, and the next `task_block_register()` consumes it and
+         * declines to block.  The caller re-tests its condition, finds it satisfied, and
+         * carries on -- which is exactly what a spurious wake-up is for, except that this
+         * one is a real event that happened at the one moment it would otherwise be lost. */
+        __atomic_store_n(&t->woken, 1, __ATOMIC_RELEASE);
+    }
 
     spin_unlock_irqrestore(&blocked.lock, flags);
 
@@ -1118,6 +1137,28 @@ static void charge_current(sched_cpu_t *c) {
  * right and the CPU still reads something else. */
 uint64_t task_iret_frame[7];
 
+/* Every task, one line each: number, name, state, parent, and whether it has ever run.
+ *
+ * A hang is a relationship between tasks -- this one is waiting for that one, which is
+ * waiting for a third -- and only the whole list shows the relationship.  `task_state_name()`
+ * is what makes it readable: "waiting" says what to look for and the number 5 does not.
+ *
+ * Two callers, and neither of them is decoration.  The self tests use it when a program
+ * they are waiting for never exits, because "task 53 never exited" sends the reader to the
+ * scheduler and the list says which task it is waiting *for*.  The boot task uses it when
+ * the kernel has printed nothing for long enough to be stuck, which is the only report a
+ * silent machine can make about itself. */
+void tasks_report(void) {
+    task_t *t;
+
+    for (t = task_first(); t != NULL; t = task_next(t)) {
+        kprintf("  task %lu %-10s %-9s parent %lu exit %d started %d switches %lu\n",
+                (unsigned long)t->id, t->name, task_state_name(t->state),
+                t->parent ? (unsigned long)t->parent->id : 0, t->exit_code,
+                t->started ? 1 : 0, (unsigned long)t->switch_count);
+    }
+}
+
 void sched_publish_outgoing(uint64_t *save_rsp, task_t *prev, sched_cpu_t *c) {
     (void)save_rsp;
 
@@ -1478,6 +1519,29 @@ void sched_tick(void) {
     sched_check_stack();
     wake_sleepers();
 
+    /* Has the machine stopped saying anything?
+     *
+     * A hang is silent, and a log that stops in the middle of a line says what the machine
+     * was about to do rather than where it stopped -- so the one place that runs whatever
+     * else is happening asks, and prints the task list when the answer is yes.
+     *
+     * Here rather than in the boot task's idle loop because the boot task is usually *not*
+     * idle: during the self tests it is the one polling for a program to exit, and a hang
+     * while it polls is exactly the hang this is for.  On the boot processor only, so four
+     * processors do not print four copies of the same list, and at most once every ten
+     * seconds, so a machine that stays stuck keeps saying so instead of saying it once. */
+    if (index == 0) {
+        uint64_t silence = kprintf_silence_ns();
+
+        if (silence > 10ull * 1000000000ull &&
+            silence - cpu[0].last_hang_report_ns > 10ull * 1000000000ull) {
+            cpu[0].last_hang_report_ns = silence;
+            kprintf("\n[hang] nothing has been printed for %lu s; every task:\n",
+                    (unsigned long)(silence / 1000000000ull));
+            tasks_report();
+        }
+    }
+
     /* Preempt when the slice is used up or when something asked for it.  The
      * idle task is the exception: it has no slice to lose, and switching it out
      * and straight back in on every tick would be pure overhead. */
@@ -1594,9 +1658,37 @@ static void adopt_orphans(task_t *dying) {
     }
 }
 
+/* Close every descriptor this task owns, because it is about to stop existing.
+ *
+ * POSIX says a process's descriptors are closed when it exits, and the kernel has to do it
+ * for the same reason a program does when it calls `exit()`: a pipe's end of file is "no
+ * writer is left", and that is a count in the pipe object, not a fact about the writer.
+ *
+ * A child that exits without its ends being counted leaves the count wrong for ever.  The
+ * reader does not hang on the pipe -- it hangs on a *later* read, after the buffer is empty,
+ * because there is still a writer and so still something to wait for.  What that looked like
+ * here was `$( )` in the shell: the child wrote its line and exited, and the shell sat in
+ * `read()` on the capture pipe for ever, so the script, `shtest`'s `waitpid` and the whole
+ * test suite waited on a pipe whose only writer had been dead for forty seconds.
+ *
+ * `fd_close()` skips 0, 1 and 2 when they are still the console, which is what makes this
+ * safe to call on a task that never opened anything: a kernel thread has no descriptors and
+ * a user one has three.  A number that a `dup2()` has put a pipe in *is* closable, so the
+ * child's `dup2(write_end, 1)` is closed here along with the rest. */
+static void task_close_fds(void) {
+    for (int i = 0; i < FD_TABLE_ENTRIES; i++)
+        (void)fd_close(i);
+}
+
 void task_exit(void) {
     unsigned index = percpu_self_index();
     task_t *t = sched_current();
+
+    /* Before anything else, and while `current` is still this task: `fd_close()` closes
+     * through the running task's own table, and a pipe end released here wakes whoever is
+     * blocked on the other end of it -- with the counts already right, which is what lets
+     * that reader take the end-of-file path instead of going back to sleep. */
+    task_close_fds();
 
     if (t != NULL) {
         __atomic_store_n(&t->state, TASK_DEAD, __ATOMIC_RELEASE);
@@ -1684,20 +1776,31 @@ void task_sleep_ms(uint64_t ms) {
 /* Put the running task on the blocked list without yet switching away.
  *
  * Split out of task_wait() so a caller that has to decide *and* register atomically can:
- * see wait_queue_block_locked(), where the window between the two is a lost wake. */
-void task_block_register(void) {
+ * see wait_queue_block_locked(), where the window between the two is a lost wake.
+ *
+ * Returns false, having left the task runnable, when a wake arrived between the caller's
+ * test and this registration.  See `unblock()`: the wake is recorded rather than dropped,
+ * and this is where it is taken.  A caller that has just tested its condition must treat
+ * false as "do not block" and go round again. */
+bool task_block_register(void) {
     task_t *t = sched_current();
 
     if (t == NULL)
-        return;
+        return false;
 
     uint64_t lflags = spin_lock_irqsave(&blocked.lock);
+
+    if (__atomic_exchange_n(&t->woken, 0, __ATOMIC_ACQ_REL) != 0) {
+        spin_unlock_irqrestore(&blocked.lock, lflags);
+        return false;          /* a wake landed in the window: do not sleep through it */
+    }
 
     __atomic_store_n(&t->state, TASK_WAITING, __ATOMIC_RELEASE);
     t->wake_at_ns = 0;          /* nothing but a named wake will end this */
     blocked_add(t);
 
     spin_unlock_irqrestore(&blocked.lock, lflags);
+    return true;
 }
 
 /* Wait for a named wake, with no condition of its own to re-check. */
@@ -1706,12 +1809,17 @@ void task_wait(void) {
         return;
 
     /* Interrupts off for the same reason as in task_sleep_ms(): the window
-     * between blocking and switching away must not be interruptible. */
+     * between blocking and switching away must not be interruptible.  It does *not* close
+     * the window a wake from another processor can land in, which is why
+     * `task_block_register()` can decline to block. */
     uint64_t flags = irq_save();
 
-    task_block_register();
-    self_from_user_clear();
-    schedule();
+    bool blocked = task_block_register();
+
+    if (blocked) {
+        self_from_user_clear();
+        schedule();
+    }
 
     irq_restore(flags);
 }
@@ -2179,6 +2287,30 @@ task_t *task_create_forked(const char *name, const regs_t *regs, uint32_t weight
         t->uid = parent->uid;
         t->gid = parent->gid;
         t->umask = parent->umask;
+
+        /* And the top of its heap, which is the same kind of thing and was missing.
+         *
+         * `brk` is not a number the child recomputes: it is the boundary of memory the
+         * *parent* already mapped, and the child's address space starts as a copy of the
+         * parent's, heap and all.  Left at the zero this function's `memset` left it in,
+         * the first `brk()` a child made asked the kernel for every page from address zero
+         * up to the break the program had already been using -- so the kernel mapped fresh
+         * pages *over the child's own text, its own heap and the free list that lives in
+         * its `.bss`*.  The child did not crash on the spot, because the mappings that
+         * failed were the ones it was not standing on at the time; it carried on with a
+         * free list whose links pointed into memory that had just been replaced.
+         *
+         * What that looked like: `$( )` in the shell forks a child, the child runs one
+         * `echo`, and spins for ever inside the allocator's free-list walk.  `shtest` hung
+         * there with its own `waitpid` never returning, and the report said the *shell*
+         * had hung -- which is why it took the task list, the script the shell had been
+         * given, the allocator's disassembly and the loader to arrive here.
+         *
+         * `mmap_next` is inherited for the same reason: it is the top of this address
+         * space's anonymous mappings, which the child has just been given a copy of. */
+        t->brk = parent->brk;
+        t->brk_start = parent->brk_start;
+        t->mmap_next = parent->mmap_next;
     }
 
     /* Registered rather than given an identifier here: `task_register()` is what puts a
@@ -2242,6 +2374,45 @@ int task_attach_cow_twin(task_t *child) {
     if (cow == NULL)
         return -1;
 
+    /* The child's list starts as the pages this address space has *already* given up.
+     *
+     * This is the whole of a bug that took a long walk to find, and the walk is worth
+     * writing down.  A task's copy-on-write list is every page its address space has
+     * surrendered write permission on -- not just the ones the most recent `fork` took, and
+     * `vmm_fork_aspace()` on its own records only the second kind, because that is all it
+     * is asked to do: it walks for entries that are *writable* and makes them read-only.
+     *
+     * So a program that forks twice loses the record of the first fork's pages.  The shell
+     * forks a child for `$( )`; the pages it gave up are read-only in both of them; the
+     * shell writes to some of them and takes its own copies, which is all well and good;
+     * the shell forks *again*, and this time `vmm_fork_aspace()` finds those pages already
+     * read-only, has nothing to take away, and records nothing.  The child inherits a
+     * read-only page with no record of why, writes to it, and the kernel -- correctly, since
+     * the address is not in the list -- reports a page fault.
+     *
+     * What it looked like was `$( $( ) )` in the shell: the outer capture forked, the inner
+     * one wrote its word, and the machine stopped with a protection violation on a heap
+     * page in the middle of a line that had already worked once.  The fork that produced
+     * that child reported four copy-on-write pages where the fork before it had reported
+     * fifty-four, which is the whole of it: the count was going *down*.
+     *
+     * The parent's own entries go in first and `vmm_fork_aspace()` adds to them, so the
+     * overflow check it does still sees the true total -- and so that the copy handed to
+     * the parent below has to add only what this fork took, which is what `already` is for. */
+    unsigned already = 0;
+
+    memset(cow, 0, sizeof(*cow));
+
+    if (parent->cow != NULL) {
+        already = parent->cow->count;
+
+        if (already > COW_MAX_PAGES)
+            return -1;                  /* not reachable: nothing adds past the limit */
+
+        memcpy(cow->page, parent->cow->page, already * sizeof(cow_page_t));
+        cow->count = already;
+    }
+
     page_table_t *tables = (page_table_t *)kmalloc(sizeof(*tables));
 
     if (tables == NULL || vmm_fork_aspace(tables, parent->tables, cow) != 0) {
@@ -2250,6 +2421,16 @@ int task_attach_cow_twin(task_t *child) {
                     "refusing rather than sharing a page it should have copied\\n",
                     COW_MAX_PAGES);
         }
+        return -1;
+    }
+
+    /* `vmm_fork_aspace()` adds to the list, so this can only be wrong if something also
+     * cleared it -- and the arithmetic below is a subtraction of unsigned numbers, which
+     * turns that mistake into a sixteen-gibibyte `memcpy` over the page tables instead of
+     * into an error.  Checked here because this is the one place the two halves meet. */
+    if (cow->count < already) {
+        kprintf("[warn] task: fork recorded %u copy-on-write pages where it had already "
+                "been given %u; refusing rather than trusting it\n", cow->count, already);
         return -1;
     }
 
@@ -2282,15 +2463,19 @@ int task_attach_cow_twin(task_t *child) {
 
         memcpy(own, cow, sizeof(*own));
         parent->cow = own;
-    } else if (parent->cow->count + cow->count <= COW_MAX_PAGES) {
-        memcpy(&parent->cow->page[parent->cow->count], &cow->page[0],
-               cow->count * sizeof(cow_page_t));
-        parent->cow->count += cow->count;
+    } else if (parent->cow->count + (cow->count - already) <= COW_MAX_PAGES) {
+        /* Only what *this* fork took away.  The child list now begins with the parent's own
+         * entries, which the parent already has: copying all of it would double them, and a
+         * list with every page in it twice is a list that resolves a copy-on-write fault to
+         * the same page over and over. */
+        memcpy(&parent->cow->page[parent->cow->count], &cow->page[already],
+               (cow->count - already) * sizeof(cow_page_t));
+        parent->cow->count += cow->count - already;
     } else {
         kprintf("[warn] task: the parent already owes copy-on-write copies of %u "
                 "pages and cannot owe %u more; refusing the fork rather than "
                 "sharing pages it should have copied\n",
-                parent->cow->count, cow->count);
+                parent->cow->count, cow->count - already);
         return -1;
     }
 

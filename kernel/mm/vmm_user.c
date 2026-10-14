@@ -179,7 +179,14 @@ static bool cow_copy_pt(uint64_t *slot, uint64_t *src_v, uint64_t base,
     for (unsigned i = 0; i < PML4_ENTRY_COUNT; i++) {
         uint64_t e = dst[i];
 
-        if (!pte_present(e) || !pte_writable(e) || pte_huge(e))
+        if (!pte_present(e) || pte_huge(e))
+            continue;
+
+        /* Writable, or already given up: both mean this page is one the twin may have to
+         * copy, and both are recorded.  The second case is the one that used to be missed --
+         * see `task_attach_cow_twin()` -- and missing it is what leaves a child with a
+         * read-only page and no record of why. */
+        if (!pte_writable(e) && !pte_cow(e))
             continue;
 
         if (cow->count >= COW_MAX_PAGES) {
@@ -189,8 +196,14 @@ static bool cow_copy_pt(uint64_t *slot, uint64_t *src_v, uint64_t base,
         cow->page[cow->count].virt = base + (uint64_t)i * page_size;
         cow->page[cow->count].entry = e;
         cow->count++;
-        dst[i] = e & ~PTE_WRITE;
-        src_v[i] = e & ~PTE_WRITE;
+
+        /* Read-only, and *marked* read-only.  The bit is what tells a later `fork` that this
+         * page needs a page table of its own rather than one shared with the twin; see
+         * `PTE_COW`.  It goes on both sides, and the entry recorded above is the one the
+         * twin had before either of them gave anything up, which is what
+         * `vmm_cow_fault()` restores. */
+        dst[i] = (e & ~PTE_WRITE) | PTE_COW;
+        src_v[i] = (e & ~PTE_WRITE) | PTE_COW;
     }
 
     /* With flags.  A bare frame number in a directory entry reads as *not present* --
@@ -202,6 +215,29 @@ static bool cow_copy_pt(uint64_t *slot, uint64_t *src_v, uint64_t base,
      * symptom was a forked child dying on the first instruction it tried to fetch, at the
      * address of `test %rax,%rax` after its `fork` returned.  Nothing else in the address
      * space was wrong, and nothing said so. */
+    *slot = pte_make(frame, PTE_PRESENT | PTE_WRITE | PTE_USER);
+    return true;
+}
+
+/* Duplicate a directory or leaf table for the twin without touching what is in it.
+ *
+ * For the tables that hold nothing a copy-on-write fault can happen on -- a program's text,
+ * a shared read-only mapping -- but that still *can be added to*.  `brk()` adds a mapping
+ * from ring 3, so a leaf the twin might map into must not be the one the parent also uses:
+ * the new entry lands in the shared table, both processes see it, and the parent's next
+ * `brk` replaces the twin's page with its own.  That is not a copy-on-write bug; it is two
+ * address spaces sharing one mapping because a table was shared when it should not have
+ * been, and the symptom is a child whose heap is silently the parent's.
+ *
+ * The cost is one page per table that has something in it, which for a small program is
+ * under ten pages for the whole `fork`. */
+static bool pt_copy_table(uint64_t *slot, const uint64_t *src_v) {
+    uint64_t frame = pmm_alloc_phys_page();
+
+    if (frame == 0)
+        return false;
+
+    memcpy((uint64_t *)phys_to_virt(frame), src_v, page_size);
     *slot = pte_make(frame, PTE_PRESENT | PTE_WRITE | PTE_USER);
     return true;
 }
@@ -228,9 +264,17 @@ static bool cow_copy_pt(uint64_t *slot, uint64_t *src_v, uint64_t base,
  * duplicating every table, would make `fork` cost megabytes. */
 
 /* TEMP diagnostic. */
+/* `dst` becomes a copy-on-write twin of `src`, and everything this takes away from `src` is
+ * appended to `cow`.
+ *
+ * Appended, not filled: the list belongs to the caller and may already hold the pages this
+ * address space gave up for an *earlier* twin -- see `task_attach_cow_twin()`, which is
+ * where that reasoning is written down.  This used to `memset` the list on entry, which
+ * discarded exactly those entries and made the caller compute its share of the list as a
+ * subtraction of a bigger number from a smaller one; the result was a `memcpy` of sixteen
+ * gibibytes that walked over the page tables and stopped the machine with no message and no
+ * fault.  The caller zeroes it. */
 int vmm_fork_aspace(page_table_t *dst, page_table_t *src, cow_list_t *cow) {
-    memset(cow, 0, sizeof(*cow));
-
     uint64_t pml4_phys = alloc_zeroed_phys();
 
     if (pml4_phys == 0)
@@ -275,41 +319,31 @@ int vmm_fork_aspace(page_table_t *dst, page_table_t *src, cow_list_t *cow) {
 
             src_mid = (uint64_t *)phys_to_virt(pte_phys(mid));
 
-            /* Is there anything writable anywhere under this directory?  If not, the whole
-             * directory can be shared with the parent untouched: nothing in it can ever
-             * change, so there is nothing for the two processes to disagree about. */
+            /* Is there anything at all under this directory?  If not, there is nothing to
+             * copy and nothing to disagree about, and it stays shared. */
             for (unsigned b = 0; b < PML4_ENTRY_COUNT && !any_writable; b++) {
-                uint64_t leaf = src_mid[b];
-                const uint64_t *pt;
-
-                if (!pte_present(leaf) || pte_huge(leaf))
-                    continue;
-
-                pt = (const uint64_t *)phys_to_virt(pte_phys(leaf));
-
-                for (unsigned c = 0; c < PML4_ENTRY_COUNT; c++) {
-                    uint64_t l = pt[c];
-
-                    if (pte_present(l) && !pte_huge(l) && pte_writable(l)) {
-                        any_writable = true;
-                        break;
-                    }
-                }
+                if (pte_present(src_mid[b]))
+                    any_writable = true;
             }
 
             if (!any_writable)
-                continue;               /* every leaf under it is read-only: share it */
+                continue;               /* nothing under it: share it, and nothing can add */
 
-            /* It does hold something writable, so the entries below are about to be
-             * rewritten -- which means this directory cannot be shared either.
+            /* It holds something, so the entries below are about to be rewritten -- which
+             * means this directory cannot be shared either.
              *
-             * Rewriting it in the parent's copy is the mistake this replaces: the PD entry
-             * is one word, and the two processes share the *page directory pointer table*
-             * only because nothing had needed to differ yet.  Point the parent's entry at
-             * the child's new leaf table and the parent loses its own writable one, adopts
-             * the child's read-only copy, has no copy-on-write list to consult, and faults
-             * on the first thing it writes -- with no way for the kernel to tell that fault
-             * from any other.  That is exactly how this was found. */
+             * "Can be shared" used to mean "nothing under it is writable, so nothing in it
+             * can ever change".  That is true of the *entries* and false of the *table*:
+             * `brk()` adds an entry to whichever table covers the address it is handing out,
+             * from ring 3, in whichever address space asked.  A shared table therefore gains
+             * the twin's mapping, the parent sees it, and the parent's own `brk` replaces the
+             * frame under it -- at which point the child's heap and the parent's heap are the
+             * same page and neither of them faults, because both are entitled to write it.
+             *
+             * A directory the twin may add to has to be one of its own, whatever is in it.
+             * This was found by a shell whose two nested `$( )` children corrupted its
+             * allocator's free list, which is a long way from "two processes sharing a page
+             * directory" and was read as a memory bug in the shell for several days. */
             uint64_t pd_phys = pmm_alloc_phys_page();
 
             if (pd_phys == 0)
@@ -332,14 +366,21 @@ int vmm_fork_aspace(page_table_t *dst, page_table_t *src, cow_list_t *cow) {
                 for (unsigned c = 0; c < PML4_ENTRY_COUNT; c++) {
                     uint64_t l = pt[c];
 
-                    if (pte_present(l) && !pte_huge(l) && pte_writable(l)) {
+                    if (pte_present(l) && !pte_huge(l) && (pte_writable(l) || pte_cow(l))) {
                         writable_here = true;
                         break;
                     }
                 }
 
-                if (!writable_here)
-                    continue;           /* nothing writable under this one: share it */
+                if (!writable_here) {
+                    /* Nothing here can be written by either process -- but the twin's
+                     * `brk()` can still add an entry, so the table is copied rather than
+                     * shared.  See the directory above for why that is not optional. */
+                    if (!pt_copy_table(&mid_v[b], pt))
+                        return -1;
+
+                    continue;
+                }
 
                 uint64_t base = ((uint64_t)i << 39) | ((uint64_t)a << 30) |
                                 ((uint64_t)b << 21);
@@ -396,7 +437,12 @@ bool vmm_cow_fault(page_table_t *tables, cow_list_t *cow, uint64_t virt) {
                    page_size);
         }
 
-        if (!pt_replace_user_leaf(tables, virt, new_phys, cow->page[i].entry))
+        /* The leaf is this task's alone now, and writable, so the page is no longer one that was
+         * given up -- and saying so is what lets a *later* fork share its table again, which
+         * is the other half of why the bit exists.  The twin keeps the bit on its own side,
+         * which is right: the twin has still given the page up. */
+        if (!pt_replace_user_leaf(tables, virt, new_phys,
+                                  (cow->page[i].entry & ~PTE_COW) | PTE_WRITE))
             return false;
 
         return true;
