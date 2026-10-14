@@ -375,6 +375,34 @@ static inline long minx_nanosleep(unsigned long sec, unsigned long nsec) {
     return minx_syscall2(SYS_NANOSLEEP, (long)(uintptr_t)ts, 0);
 }
 
+/* Which processor this task is running on.
+ *
+ * Read from the APIC's own identification register by the kernel, so it is the processor
+ * that executed the `int $0x80` and not the one the scheduler last recorded.  Those two are
+ * not supposed to differ, and `smptest` is the check that they do not.
+ *
+ * Returns a processor id, not an index: on this machine they are the same number, and a
+ * program that treated them as interchangeable would be the first thing to break if they
+ * ever were not. */
+static inline long minx_getcpu(void) {
+    return minx_syscall1(SYS_GETCPU, 0);
+}
+
+/* Milliseconds since boot.
+ *
+ * `times()`' fourth clock, which is `timer_uptime_ms()`: monotonic, in milliseconds, and the
+ * only clock on this system that does not go backwards.  `times()`' own first field is CPU
+ * time, which is zero for a task that has not been scheduled, and a program measuring how
+ * long its children took with that is measuring nothing. */
+static inline long minx_uptime_ms(void) {
+    unsigned long ticks[4] = { 0, 0, 0, 0 };
+
+    if (minx_syscall1(SYS_TIMES, (long)(uintptr_t)ticks) < 0)
+        return -1;
+
+    return (long)ticks[3];
+}
+
 static inline long minx_sched_yield(void) {
     return minx_syscall1(SYS_SCHED_YIELD, 0);
 }

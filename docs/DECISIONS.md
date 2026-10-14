@@ -1374,3 +1374,34 @@ is somewhere else and no closer. `ls` had one "out of memory" for two different 
 now says which — an array that cannot grow and a name that cannot be copied are different
 faults in different places, and a message that cannot tell them apart sends the reader to
 both.
+
+## A test has to check what a wrong answer would look like
+
+**Decision.** `smptest` checks two things a serial scheduler cannot fake: the children were on
+more than one processor, and their lifetimes overlapped.
+
+**Why not just "every child finished".** A scheduler that runs one task to completion before
+starting the next passes that on every machine. Every program runs, every program exits with
+the right status, and four processors spend the run taking turns. Nothing in the system's
+behaviour distinguishes it from a parallel one, so a test that only checks completion cannot
+either.
+
+**Why `getcpu()` reads the APIC.** The obvious implementation reads the scheduler's record of
+which CPU it last ran a task on. That answers "where did the scheduler think it put this",
+which is the thing under test. Reading the APIC's identification register answers "where is
+this executing", from the hardware, and the two agreeing is the actual claim.
+
+**Why the clock matters.** The finest clock here is a millisecond, so "did they overlap" needs
+each child to run for longer than one. The first run reported that its children had *not*
+overlapped, on a machine where they had: every child started and finished inside the same
+millisecond, which is indistinguishable from having run in sequence. The work is repeated 24
+times rather than the sieve made 24 times larger, because a bigger sieve is a bigger static
+array and a test wanting a hundred times the work should not want a hundred times the memory.
+
+**Four bugs the first run of this test found in itself**, which is the argument for writing it:
+it counted "processor" as a substring and reported five CPUs on a four-CPU machine
+(`model name: minx virtual processor` contains the word); it compared `wait()`'s returns
+against the fork order, which fails for every child after the first on any machine where they
+finish in a different order; it passed `minx_report()`'s return value as its exit status,
+which is a character count; and it passed the failure *count* where the API wants "did it
+pass". Each of those produced a red run with nothing in the log to explain it.

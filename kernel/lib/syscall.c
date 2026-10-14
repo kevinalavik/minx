@@ -44,6 +44,7 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "string.h"
+#include "apic.h"
 #include "task.h"
 #include "vectors.h"
 #include "vmm.h"
@@ -109,6 +110,7 @@ const char *syscall_name(unsigned nr) {
         [SYS_GETGID]     = "getgid",
         [SYS_NANOSLEEP]  = "nanosleep",
         [SYS_SCHED_YIELD]= "sched_yield",
+        [SYS_GETCPU]     = "getcpu",
         [SYS_TIMES]      = "times",
         [SYS_GETRUSAGE]  = "getrusage",
         [SYS_REBOOT]     = "reboot",
@@ -1722,6 +1724,7 @@ int syscall_init(void) {
     handlers[SYS_GETGID]  = sys_getgid;
     handlers[SYS_NANOSLEEP] = sys_nanosleep;
     handlers[SYS_SCHED_YIELD] = sys_sched_yield;
+    handlers[SYS_GETCPU]      = sys_getcpu;
     handlers[SYS_TIMES]   = sys_times;
     handlers[SYS_GETRUSAGE] = sys_getrusage;
     handlers[SYS_REBOOT]  = sys_reboot;

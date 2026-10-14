@@ -2055,6 +2055,29 @@ static void test_coreutils_program(void) {
     test_pass("phase10-coreutils");
 }
 
+/* Phase 11: does user code run on more than one processor at a time?
+ *
+ * The question is not "did every program finish" -- a scheduler that runs one task to
+ * completion before starting the next passes that on every machine. `smptest` asks each of
+ * its children which processor it is on, *and* when it started and finished, so it can be
+ * told that four children on four processors overlapped in time rather than having been
+ * taken in turns.
+ *
+ * The kernel answers `getcpu()` from the APIC rather than from its own task bookkeeping, so
+ * the two are checked against different sources and a scheduler that believed it had
+ * migrated a task would be caught.
+ *
+ * It is a program rather than a kernel-side check for the reason the others are: the thing
+ * being tested is that *user* code is placed, and a kernel test that called the scheduler
+ * directly would be testing the scheduler's opinion rather than the machine's. */
+static void test_smp_program(void) {
+    bool ok = run_program("smptest", "phase11-smp", "smptest would not load");
+
+    if (!ok)
+        return;
+    test_pass("phase11-smp");
+}
+
 /* Phase 8's program, and the only filesystem test that goes through `int $0x80`.
  *
  * `test_ramfs()` below tests the same tree from inside the kernel, and both are here on
@@ -3151,6 +3174,7 @@ void test_run_all(void) {
     test_libc_program();
     test_sh_program();
     test_coreutils_program();
+    test_smp_program();
     test_sched_queues();
     test_sched_parallel();
     test_sched_preempt();

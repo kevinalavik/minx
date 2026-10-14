@@ -20,6 +20,7 @@ long sys_getpgid(regs_t *regs);
 long sys_uname(regs_t *regs);
 long sys_nanosleep(regs_t *regs);
 long sys_sched_yield(regs_t *regs);
+long sys_getcpu(regs_t *regs);
 long sys_times(regs_t *regs);
 long sys_getrusage(regs_t *regs);
 long sys_reboot(regs_t *regs);

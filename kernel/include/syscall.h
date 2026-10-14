@@ -112,6 +112,19 @@ enum {
     SYS_MUNMAP   = 73,
     SYS_MPROTECT = 74,
 
+    /* Which processor this task is running on right now.
+     *
+     * 75, which Linux also leaves open at this point in the table.  It is here because
+     * "the scheduler really does run things in parallel" is a claim, and a claim about
+     * placement cannot be checked without asking where a task is -- `smptest` asks exactly
+     * that, once per child, and there was no way to ask before.
+     *
+     * `percpu_cpu_id()` rather than the kernel's own idea of a "current CPU": the answer has
+     * to come from the processor the reading instruction executed on, because that is the
+     * only one that can be certain, and a cached per-task copy would be exactly the thing
+     * this is meant to disprove. */
+    SYS_GETCPU   = 75,
+
     SYS_MAX = 96,
 };
 

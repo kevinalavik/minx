@@ -6,6 +6,7 @@
  * have to agree with each other -- `getppid` and `wait` and `/proc/<pid>/status` all read
  * the same two fields, and three files reading them is three places for them to disagree.
  */
+#include "apic.h"
 #include "procsys.h"
 
 #include "console.h"
@@ -210,6 +211,22 @@ long sys_nanosleep(regs_t *regs) {
     }
 
     return 0;
+}
+
+/* Which processor is this task running on?
+ *
+ * `lapic_id()` reads the APIC's own identification register, so the answer comes from the
+ * processor that executed the `int $0x80` -- not from a cached per-task copy and not from
+ * whatever the scheduler last recorded.  Those would all answer "where did the scheduler
+ * last put this task", which is not the question; `smptest` exists to check that the
+ * scheduler's idea and the hardware's agree.
+ *
+ * A task that has never run cannot be on a processor, but a user program cannot ask before
+ * it has run, so there is no case here that needs an answer of "none". */
+long sys_getcpu(regs_t *regs) {
+    (void)syscall_arg(regs, 0);
+
+    return (long)lapic_id();
 }
 
 long sys_sched_yield(regs_t *regs) {
