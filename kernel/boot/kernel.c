@@ -813,6 +813,10 @@ static void interactive_console(void) {
     uint64_t last = timer_uptime_ms();
 
     for (;;) {
+        /* A machine that has stopped says nothing, and the log simply stops in the middle
+         * of whatever it was doing.  `sched_tick()` is what notices that and prints the
+         * task list; it lives there rather than here because the boot task is usually busy
+         * rather than idle, and a hang while it is busy is the one worth catching. */
         /* The pump is *not* inside `#if MINX_KERNEL_SHELL`.
          *
          * It used to be, and that made a machine with no keyboard: `conio_pump()` is what

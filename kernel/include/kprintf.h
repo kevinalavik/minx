@@ -9,6 +9,7 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -33,6 +34,14 @@ int  ksnprintf(char *buf, size_t size, const char *fmt, ...)
 
 /* Print without a trailing newline. */
 void kputs(const char *s);
+
+/* Nanoseconds since the kernel last printed anything, or 0 if it never has.
+ *
+ * The boot task uses this to notice that the machine has stopped: a hang is silent, the
+ * log simply stops in the middle of a line, and the line before the silence says what the
+ * machine was about to do rather than where it stopped.  With a number, "nothing has been
+ * printed for twenty seconds" is something to act on. */
+uint64_t kprintf_silence_ns(void);
 
 /* Progress-style output used while probing hardware. */
 #define kinfo(fmt, ...)  kprintf("[ ok ] " fmt, ##__VA_ARGS__)

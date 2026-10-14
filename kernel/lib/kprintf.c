@@ -1,6 +1,7 @@
 #include "kprintf.h"
 #include "console.h"
 #include "spinlock.h"
+#include "timer.h"
 #include "spinlock.h"
 
 #include "console.h"
@@ -359,6 +360,10 @@ void kvprintf(const char *fmt, va_list ap) {
  * IRQ-saving, because `kprintf` is called from interrupt paths -- an unexpected vector, a
  * fault report -- and a plain spinlock there would deadlock against a `kprintf` that was
  * interrupted. */
+/* When the last thing printed was printed, so that a kernel that has stopped can say so.
+ * Written by `kprintf()` only, and read by one processor in the boot task's idle loop. */
+static volatile uint64_t last_print_ns;
+
 void kprintf(const char *fmt, ...) {
     va_list ap;
 
@@ -371,7 +376,24 @@ void kprintf(const char *fmt, ...) {
     kvprintf(fmt, ap);
     va_end(ap);
 
+    last_print_ns = timer_uptime_ms() * 1000000ull;
+
     console_unlock();
+}
+
+/* How long the kernel has said nothing, in nanoseconds.
+ *
+ * This exists because a hang is otherwise silent.  A machine that has stopped prints
+ * nothing, the log ends in the middle of whatever it was doing, and everything after that
+ * is inference: the last line says what the program was *about* to do, not where it
+ * stopped.  With a number behind it, "the last thing printed was twenty seconds ago" is a
+ * fact the boot task can act on -- which is what `tasks_report()` behind the hang check in
+ * `kernel.c` does. */
+uint64_t kprintf_silence_ns(void) {
+    uint64_t last = last_print_ns;
+    uint64_t now  = timer_uptime_ms() * 1000000ull;
+
+    return (last == 0 || now < last) ? 0 : now - last;
 }
 
 /* Bring the print lock up.  Called once, from kmain(), after the serial port and before
