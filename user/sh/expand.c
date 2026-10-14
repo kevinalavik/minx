@@ -287,12 +287,26 @@ static long arith_atom(arith_t *a) {
         char   name[64];
         size_t n = 0;
 
+        /* `$n` and `n` name the same variable in arithmetic -- `$` is allowed but not
+         * required -- so the `$` is consumed here rather than in the name. */
+        if (*a->s == '$')
+            a->s++;
+
         while ((isalnum((unsigned char)*a->s) || *a->s == '_') && n + 1 < sizeof(name))
             name[n++] = *a->s++;
 
         name[n] = 0;
-        a->s += n;
 
+        /* No `a->s += n` here: the loop's `*a->s++` has already moved the pointer by
+         * exactly `n`, and adding another `n` moved it twice as far again.
+         *
+         * It went unnoticed because the script spells arithmetic with blanks --
+         * `$((n + 1))` -- and a blank is there for the pointer to land on, so the second
+         * step landed on the operator and the answer came out right.  `$((n+1))` has no
+         * blank, so the pointer landed past the `1` and the `+1` was silently dropped:
+         * `n=$((n+1))` evaluated to `n` and every loop that counted with it ran for ever.
+         *
+         * A test with blanks in the arithmetic is a test of the blank. */
         const char *v = var_get(name);
 
         return v != NULL ? strtol(v, NULL, 0) : 0;
@@ -412,8 +426,20 @@ static const char *special_param(char c) {
         if (c >= '1' && c <= '9') {
             int n = c - '0';
 
+            /* `sh.argv[0]` is the *first* parameter, not `$0`.  Every place that builds it
+             * agrees on that -- `main.c` for `sh -c text name args...` and for a script,
+             * `bi_set()` for `set -- a b`, and the function call in `exec.c` -- and `$*` and
+             * `$@` read it from index 0.  So `$n` is `sh.argv[n - 1]` and reading it as
+             * `sh.argv[n]` is off by one.
+             *
+             * The symptom is invisible until a script sets parameters and then asks for one
+             * by number: `set -- p q; echo "$1$2"` printed `q`, and `$2` was empty -- the
+             * first parameter read as the second and the second as the one past the end.
+             * `echo "$*"` was right throughout, because it joins from index 0, which is why
+             * the two disagreed with each other rather than both being wrong in the same
+             * direction. */
             if (n <= sh.argc)
-                return sh.argv[n];
+                return sh.argv[n - 1];
 
             return NULL;
         }
@@ -889,39 +915,92 @@ static void walk(walk_t *w, int quoted) {
                 if (s[j] == '$' || s[j] == '`') {
                     /* Expanded inside the quotes, with everything it produces marked as
                      * protected -- which is what makes `"$(ls)"` one long string rather
-                     * than a list of names. */
+                     * than a list of names.
+                     *
+                     * The piece that is copied out and re-walked has to be the *whole*
+                     * substitution, both delimiters included, because the re-walk is what
+                     * runs the command and the closing `)` is what tells it to stop.  It was
+                     * cut one byte short -- the closing delimiter was left out -- so the
+                     * re-walk saw an unterminated `$(`, ran the command against text that
+                     * ran to the end of the word, and then the *outer* walk carried on from
+                     * the closing `)` and copied it into the output.
+                     *
+                     * The visible result was `echo "$(echo x)"` printing `x)`: the right
+                     * answer with a stray `)` after it, on every quoted substitution in a
+                     * script.  It looked like a formatting problem in `echo` and was in the
+                     * expander, and it only showed up in the one place a substitution is
+                     * *supposed* to be a single word -- which is why the unquoted form
+                     * (`echo $(echo x)`) was always right.
+                     *
+                     * `end` is the index of the closing delimiter, kept separately because
+                     * `j` has to end up *past* it for the copy while the scan has to resume
+                     * *at* it.  Conflating the two is what the bug was. */
                     size_t start = j;
+                    size_t end  = j;
 
                     if (s[j] == '`' || (s[j] == '$' && s[j + 1] == '(')) {
-                        char open = s[j] == '`' ? '`' : '(';
                         char close = s[j] == '`' ? '`' : ')';
 
-                        if (open == '(')
-                            j = find_paren(s, j + 1);
+                        if (close == ')')
+                            end = find_paren(s, j + 1);
                         else
-                            while (s[j + 1] != 0 && s[j + 1] != close)
-                                j++;
+                            while (s[end + 1] != 0 && s[end + 1] != close)
+                                end++;
+
+                        /* Past the closing delimiter, which is what the copy wants.  A
+                         * substitution that is never closed leaves `end` at the end of the
+                         * word, and the copy then takes what there is -- which is a
+                         * truncated substitution rather than a wrong one, and the parser
+                         * has already rejected an unterminated `$(` anyway. */
+                        j = (s[end] == 0) ? end : end + 1;
                     } else if (s[j] == '$' && s[j + 1] == '{') {
                         int depth = 1;
 
-                        j += 2;
+                        end = j + 2;
 
-                        while (s[j] != 0 && depth > 0) {
-                            if (s[j] == '{')
+                        while (s[end] != 0 && depth > 0) {
+                            if (s[end] == '{')
                                 depth++;
-                            else if (s[j] == '}')
+                            else if (s[end] == '}')
                                 depth--;
 
-                            j++;
+                            end++;
                         }
-                    } else {
-                        while (s[j + 1] != 0 &&
-                               (isalnum((unsigned char)s[j + 1]) || s[j + 1] == '_'))
-                            j++;
-                    }
 
-                    if (j == start)
-                        j++;
+                        j = end;
+                    } else {
+                        /* `$name`, `$1`..`$9`, or one of the single-character parameters
+                         * `?` `#` `$` `!` `-` `*` `@` `0`.
+                         *
+                         * The single-character ones are the ones that were missing: the scan
+                         * only ever collected alphanumerics and `_`, so `"$?"` took just the
+                         * `$`, the re-walk saw a `$` at the end of its own string and emitted
+                         * it literally, and the script printed `st=$?` where it meant to
+                         * print the previous command's status.  `echo "after=$?"` is the
+                         * shape of line that appears after every command whose status
+                         * matters, so this was not a corner.
+                         *
+                         * `$` followed by anything else is a literal `$`, which is what lets a
+                         * `printf` format or a dollar sign in a message survive. */
+                        char c1 = s[j + 1];
+
+                        if (c1 == '?' || c1 == '#' || c1 == '$' || c1 == '!' ||
+                            c1 == '-' || c1 == '*' || c1 == '@' || isdigit((unsigned char)c1)) {
+                            end = j + 2;
+                        } else if (isalnum((unsigned char)c1) || c1 == '_') {
+                            end = j + 1;
+
+                            while (s[end] != 0 &&
+                                   (isalnum((unsigned char)s[end]) || s[end] == '_'))
+                                end++;
+                        } else {
+                            /* `$` on its own: one character, and `do_dollar()` decides
+                             * whether it expands to something or stays a dollar sign. */
+                            end = j + 1;
+                        }
+
+                        j = end;
+                    }
 
                     char *piece = malloc(j - start + 1);
 
@@ -1105,26 +1184,44 @@ int expand_assign(const char *word, char **out) {
     return 0;
 }
 
+/* A whole word as one string: expand it, split and glob it, then join the fields back
+ * together with single blanks.
+ *
+ * The joining goes into a *second* buffer, because the first one still holds the expanded
+ * text.  Appending the fields to it is how the word came out twice: `/tmp/x` expanded to
+ * `/tmp/x`, split into one field `/tmp/x`, and then had `/tmp/x` appended to the `/tmp/x`
+ * already in the buffer -- so `expand_to_string("/tmp/x")` returned `/tmp/x/tmp/x`, and
+ * `echo hi > /tmp/x` failed to open a path that does not exist and cannot.
+ *
+ * That is why redirection appeared to do nothing at all rather than writing to the wrong
+ * place: the name was wrong, the `open()` failed, and the failure was reported against the
+ * name the user had typed, which sent the reading in the direction of the filesystem.
+ *
+ * The two buffers are separate so that the code says what it does: `text` is what the word
+ * expanded to, `joined` is the one string that comes out of it. */
 char *expand_to_string(const char *word) {
     fields_t f;
-    sbuf_t   b;
+    sbuf_t   text;
+    sbuf_t   joined;
 
     memset(&f, 0, sizeof(f));
-    sb_init(&b);
+    sb_init(&text);
+    sb_init(&joined);
 
-    walk_t w = { word, 0, &b };
+    walk_t w = { word, 0, &text };
 
     walk(&w, 0);
-    split_and_glob(&b, &f, 1);
+    split_and_glob(&text, &f, 1);
 
     for (int i = 0; i < f.n; i++) {
         if (i > 0)
-            sb_putc(&b, ' ', 0);
+            sb_putc(&joined, ' ', 0);
 
-        sb_puts(&b, f.v[i], 0);
+        sb_puts(&joined, f.v[i], 0);
     }
 
     fields_free(&f);
+    sb_free(&text);
 
-    return b.p != NULL ? b.p : strdup("");
+    return joined.p != NULL ? joined.p : strdup("");
 }

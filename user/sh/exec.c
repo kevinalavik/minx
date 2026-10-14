@@ -84,6 +84,78 @@ static void vec_add(vec_t *f, const char *s) {
 static int   exiting;
 static int   exit_code;
 
+/* How many loops `break` and `continue` still have to unwind, or 0 for neither.
+ *
+ * A count rather than a flag, because `break 2` means "leave the loop two levels out" and
+ * `continue 3` means "skip to the next iteration of the loop three levels out" -- and
+ * because both nest: a `break` inside a `switch` inside a `for` still refers to the `for`.
+ *
+ * The count is *decremented by each loop it passes through on the way out*, which is what
+ * makes the common case work without the executor having to know how deep it is: the
+ * innermost loop takes one off, and if that leaves zero it stops, so a `break` with no
+ * number breaks exactly one loop and a `break` with a number breaks exactly that many.
+ *
+ * Both were missing, which is not visible from a script that never says them and is
+ * catastrophic for one that does: `while true; do echo x; break; done` reported
+ * `break: not found` and then looped forever, printing until the machine filled up.  A
+ * loop with no way out is the one construct a shell cannot do without.
+ *
+ * `return` shares the same mechanism, because it is the same question -- "how many frames
+ * out" -- answered by the same unwind.  `ret_frames` counts *functions*, not loops, so the
+ * two are separate: a `return` must not be able to break a loop and a `break` must not be
+ * able to return from a function. */
+static int   break_frames;
+static int   continue_frames;
+static int   ret_frames;
+static int   ret_status;
+
+void sh_break(int levels) {
+    if (levels < 1)
+        levels = 1;
+
+    break_frames = levels;
+}
+
+void sh_continue(int levels) {
+    if (levels < 1)
+        levels = 1;
+
+    continue_frames = levels;
+}
+
+void sh_return(int levels) {
+    if (levels < 1)
+        levels = 1;
+
+    ret_frames = levels;
+}
+
+/* `return n`: the status the function should end with.  0 means "no argument given", which
+ * is why the call site treats it as "keep the body's status" rather than as "zero" -- a
+ * function that ends `return` after a failed command has to report the failure, and a
+ * `ret_status` of 0 with `return 0` explicit would be indistinguishable from it. */
+void sh_return_status(int status) {
+    ret_status = status;
+}
+
+int sh_loop_control_pending(void) {
+    return break_frames > 0 || continue_frames > 0 || ret_frames > 0;
+}
+
+/* `return`, from anywhere inside a function's body.
+ *
+ * The function call in `run_simple()` is the only place a function's tree is on the stack,
+ * so this unwinds to there: the status is the function's, the parameters are restored, and
+ * the caller carries on.  A `return` at the top level of a script is an error on every
+ * shell, and is reported as one rather than silently ending the script. */
+int sh_return_pending(void) {
+    if (ret_frames <= 0)
+        return 0;
+
+    ret_frames--;
+    return ret_frames == 0;
+}
+
 /* Whether the command being run is a background one, which the `wait` and `jobs` builtins
  * and the terminal's SIGINT handling all need to know and none of which can be told by
  * looking at the tree from outside. */
@@ -276,7 +348,10 @@ typedef struct {
 static int collect_redirs(const redir_t *r, open_redir_t *out, int max) {
     int n = 0;
 
-    for (; r != NULL && n < max; r = r->next) {
+    /* `n < max - 1` rather than `n < max`, because `&>` fills *two* slots and must not be
+     * able to write one past the end of the array.  One spare slot is enough: the widest
+     * case here adds two to one that is already counted. */
+    for (; r != NULL && n + 2 <= max; r = r->next) {
         open_redir_t *o = &out[n];
 
         switch (r->kind) {
@@ -343,9 +418,35 @@ static int collect_redirs(const redir_t *r, open_redir_t *out, int max) {
             o->flags = O_WRONLY | O_CREAT | O_TRUNC;
             out[n + 1] = *o;
             out[n + 1].to = 2;
-            n++;
-            break;
+            n += 2;
+            continue;               /* the count below would add a third */
+
+        default:
+            /* A redirection the parser produced that this executor does not know.  Said
+             * plainly rather than ignored: a redirection that is silently dropped is a
+             * command writing to the console when the user asked for a file, and nothing
+             * about the result points at the shell. */
+            sh_error("%s: that redirection is not implemented", r->word != NULL ? r->word
+                                                                                  : "");
+            return -1;
         }
+
+        /* One redirection, counted.
+         *
+         * This is the line the whole function was missing, and its absence is why the
+         * shell ignored every `>`, `>>`, `<` and `2>` it had ever parsed: each case filled
+         * in `out[n]` and only the `&>` case counted itself, so the function returned 0 for
+         * a command with redirections, `apply_redirs()` was called with an empty list, and
+         * the command ran with the shell's own descriptors.
+         *
+         * It is not visible as a crash and not visible as an error -- the file is simply not
+         * created, `cat` then reports that it is missing, and every one of those is a
+         * different symptom with the same cause.  `wc -l < f` with the redirection dropped
+         * reads the *terminal* and blocks for ever, which is how the whole thing was found.
+         *
+         * Counting here rather than in each case is what keeps the two paths in step: a new
+         * redirection kind gets the right count by existing. */
+        n++;
     }
 
     return n;
@@ -568,11 +669,22 @@ static int run_simple(cmd_t *c, int want_status) {
         int    fstatus = 0;
 
         /* The function's parameters are its arguments, and they come back afterwards
-         * untouched -- `set --` inside a function must not change the caller's. */
-        sh.argc = args_n(args);
+         * untouched -- `set --` inside a function must not change the caller's.
+         *
+         * `sh.argv` points past the function's own name, so `sh.argv[0]` is `$1` -- which is
+         * the shape `main.c`, `bi_set()` and `special_param()` all use.  `$0` does not
+         * change when a function is called, and it is `sh.argv0` rather than `sh.argv[0]`,
+         * which is how that stays true. */
+        sh.argc = args_n(args) - 1;
         sh.argv = args + 1;
 
         exec_cmd(body, &fstatus);
+
+        /* A `return` from inside the function stops here.  `return n` makes `n` the
+         * function's status, which is what `$?` says afterwards; a bare `return` leaves the
+         * status of the last command that ran, which is the `fstatus` the body produced. */
+        if (sh_return_pending() && ret_status != 0)
+            fstatus = ret_status;
 
         sh.argc = saved_argc;
         sh.argv = saved_argv;
@@ -639,6 +751,8 @@ static int run_simple(cmd_t *c, int want_status) {
         free_fields(args);
         return 1;
     }
+
+
 
     if (!want_status) {
         /* Background: no fork needed if the command is a builtin, and no `reap` if it is
@@ -807,13 +921,145 @@ char *sh_run_capture(const char *text) {
  * at: the left of `&&` when the right is going to run anyway, a background command, and the
  * body of a loop.  Skipping the wait there is the difference between a shell that responds
  * immediately and one that does not. */
+/* Is this a construct that a redirection can be hung on?
+ *
+ * `{ ...; } > f`, `( ... ) > f`, `if ...; fi > f`, `while ...; done > f`, `case ...; esac
+ * > f` and `for ...; done > f` are all legal, and in each of them the redirections belong
+ * to the *whole construct* rather than to the command inside it.
+ *
+ * A list is not one of them and must not become one: in `a > f; b` the `>` binds to `a`
+ * alone, which is the single most load-bearing thing about where a redirection goes.  A
+ * pipeline is not one either -- its own redirections are applied inside `run_pipeline()`,
+ * where the pipe is already set up.  A simple command applies its own in `run_simple()`,
+ * which is the path that has always worked.
+ *
+ * `CMD_FUNC` is excluded for a different reason: its body is moved into the function table
+ * rather than run, so there is nothing for a redirection to wrap. */
+static int redir_bindable(cmd_kind_t k) {
+    switch (k) {
+    case CMD_SUB:
+    case CMD_GROUP:
+    case CMD_IF:
+    case CMD_FOR:
+    case CMD_WHILE:
+    case CMD_CASE:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+/* Run a construct that carries redirections, in a child.
+ *
+ * A child, and not this process, because applying the redirections here would leave *this
+ * shell's* descriptor 1 pointing at the file for the rest of the session: `{ echo a; } > f;
+ * echo b` would send `b` into `f` as well, and the damage would outlast the statement.
+ *
+ * This is the same shape as the three cases in `run_simple()` -- collect, fork, apply in the
+ * child, run, exit -- and it is factored out rather than written four times because it is
+ * four times the same delicate step: the redirections must be applied in the child, after
+ * the fork, or the shell loses its own descriptors.
+ */
+static int exec_compound_redirs(cmd_t *c, int *status) {
+    open_redir_t r[16];
+    int          n = collect_redirs(c->redirs, r, 15);
+
+    if (n < 0) {
+        if (status != NULL)
+            *status = 1;
+
+        return 1;
+    }
+
+    if (n == 0) {
+        /* The list had redirections but none of them were usable -- or, more usefully, the
+         * case where they cancel out.  Running the body here is the right answer either
+         * way, and cheaper than a fork that does nothing. */
+        exec_cmd(c->a, status);
+        return 0;
+    }
+
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        sh_perror("fork");
+
+        if (status != NULL)
+            *status = 1;
+
+        return 1;
+    }
+
+    if (pid == 0) {
+        int st = 0;
+        int bad = apply_redirs(r, n) < 0;
+
+        exec_cmd(c->a, &st);
+
+        fflush(stdout);
+        _exit(bad ? 1 : st);
+    }
+
+    if (status != NULL)
+        *status = reap(pid);
+
+    return 0;
+}
+
 void exec_cmd(cmd_t *c, int *status) {
     int status_here = 0;
+
+    /* Remember the status of the last *top-level* command, which is what `$?` reads.
+     *
+     * `sh.status` was never written by anything.  Every `$?` in a script therefore read the
+     * zero it was initialised to: `false && echo unreached; echo "status=$?"` printed
+     * `status=0`, and `sh -c 'exit 3'; echo "exit=$?"` printed `exit=0`.
+     *
+     * It is set here, at the one place that knows a command has finished and what it
+     * returned, and only for a caller that *asked* for the status -- which is what makes
+     * it the status of the last command rather than of the last command in some inner list.
+     * The executor asks for the status of everything in a `;` list, of both sides of `&&`
+     * and `||`, and of a loop's body, so those all count; the conditions of `if` and `while`
+     * do not, because a caller passes NULL for them and a condition's value is the
+     * question being asked rather than a result.
+     */
+    int  is_top_level = (status != NULL);
+    int *where = status;
 
     if (c == NULL) {
         if (status != NULL)
             *status = 0;
 
+        if (is_top_level)
+            sh.status = 0;
+
+        return;
+    }
+
+    /* A `break`, a `continue` or a `return` reached, and whatever came after it in the same
+     * list must not run.
+     *
+     * This is the check that makes those three words mean anything, and it has to be at the
+     * *top* of the dispatcher rather than at the bottom of every case: `break` inside a
+     * `for` inside an `if` inside a `&&` has to stop all four of them, and a check in the
+     * list case alone would let the `&&` go on to its right-hand side.  The loops consume
+     * the count themselves; this is what stops the statements in between.
+     *
+     * `exit` is checked for the same reason and in the same place -- it is the same
+     * question, "is this shell still running anything", and `exit` was already checked
+     * everywhere except here. */
+    if (exiting || sh_loop_control_pending()) {
+        if (status != NULL)
+            *status = status_here;
+
+        return;
+    }
+
+    /* A construct carrying redirections is run in a child, so that the redirections belong
+     * to it and not to the rest of this shell's life.  See `redir_bindable()`. */
+    if (c->redirs != NULL && redir_bindable(c->kind)) {
+        exec_compound_redirs(c, status);
         return;
     }
 
@@ -1008,14 +1254,34 @@ void exec_cmd(cmd_t *c, int *status) {
         break;
 
     case CMD_IF: {
-        /* `c->a` is the most recent condition and `c->b` its body.  The parser folded the
-         * elif chain into pairs so that this is a loop with no state. */
+        /* The condition, its body, and then each `elif` in order -- the *first* whose
+         * condition holds is the branch that runs, and nothing after it is even evaluated.
+         * That last part is what makes `elif` a chain rather than a fallback: a condition
+         * after the branch that was taken may have effects, and POSIX says it is not run. */
         int cond = 0;
 
         exec_cmd(c->a, &cond);
 
-        if (cond == 0)
+        if (cond == 0) {
             exec_cmd(c->b, status);
+            break;
+        }
+
+        for (cmd_t *e = c->elifs; e != NULL; e = e->next_elif) {
+            cond = 0;
+            exec_cmd(e->a, &cond);
+
+            if (cond == 0) {
+                exec_cmd(e->b, status);
+                break;
+            }
+        }
+
+        /* Nothing matched: the `else` branch if there is one, and otherwise a success --
+         * which is what `$?` says after an `if` whose condition was false and which had no
+         * `else` for it. */
+        if (c->orelse != NULL)
+            exec_cmd(c->orelse, status);
         else if (status != NULL)
             *status = 0;
 
@@ -1059,10 +1325,37 @@ void exec_cmd(cmd_t *c, int *status) {
          * what `for f in *` in a loop that creates files has to avoid. */
         for (int i = 0; i < items.n; i++) {
             var_set(c->name, items.v[i], 0);
+
+            /* `continue` skips the rest of the body and goes round again.  It is checked
+             * *before* the body because the `continue` was set by a command the body
+             * already ran -- its last one -- and running the rest of the body would undo
+             * what it was for.
+             *
+             * It is checked here and not after the body for the same reason: a check after
+             * the body cannot tell a `continue` from a `break`, and treating both as "stop"
+             * makes `for i in 1 2 3; do [ $i = 2 ] && continue; echo $i; done` print
+             * nothing at all -- the `continue` on the first iteration ended the loop. */
+            if (continue_frames > 0) {
+                continue_frames--;
+
+                if (continue_frames == 0)
+                    continue;       /* the innermost loop is the target */
+
+                break;              /* `continue 2`: this loop is not the target */
+            }
+
             exec_cmd(c->a, &st);
 
-            if (exiting)
+            /* Only `exit` and `return` stop the loop here.  A `break` is handled below
+             * because it has to come off the count; a `continue` is handled at the top. */
+            if (exiting || ret_frames > 0)
                 break;
+
+            if (break_frames > 0) {
+                break_frames--;
+
+                break;              /* zero left means it was for this loop */
+            }
         }
 
         for (int i = 0; i < items.n; i++)
@@ -1082,10 +1375,31 @@ void exec_cmd(cmd_t *c, int *status) {
         for (;;) {
             int cond = 0;
 
+            /* `continue` goes to the next iteration *without* re-running the condition, which
+             * is what every shell does, and is why `while [ -n "$line" ]; do continue; done`
+             * hangs rather than finishes.  That is a reason to be careful with `continue`,
+             * not a reason for the loop to behave differently from every other shell. */
+            if (continue_frames > 0) {
+                continue_frames--;
+
+                if (continue_frames == 0)
+                    continue;       /* the innermost loop is the target */
+
+                break;              /* `continue 2`: this loop is not the target */
+            }
+
             exec_cmd(c->a, &cond);
 
-            if (exiting)
+            if (exiting || ret_frames > 0)
                 break;
+
+            /* A `break` or a `continue` in the *condition* is as good as one in the body:
+             * `while break; do ...` has to leave the loop, and it has to leave it before
+             * the condition's result is even looked at. */
+            if (break_frames > 0) {
+                break_frames--;
+                break;
+            }
 
             int go = c->negated ? (cond != 0) : (cond == 0);
 
@@ -1094,8 +1408,13 @@ void exec_cmd(cmd_t *c, int *status) {
 
             exec_cmd(c->b, &st);
 
-            if (exiting)
+            if (exiting || ret_frames > 0)
                 break;
+
+            if (break_frames > 0) {
+                break_frames--;
+                break;
+            }
         }
 
         if (status != NULL)
@@ -1170,7 +1489,28 @@ void exec_cmd(cmd_t *c, int *status) {
     }
 
     case CMD_FUNC:
-        /* The body was taken when the function was defined; there is nothing to run. */
+        /* Register the function.  The definition has no other effect -- `sh name() { }`
+         * is a command whose work is to make the name mean something from here on -- so
+         * this is the whole of what running one does.
+         *
+         * The body is *moved* out of this node and given to the function table, and the
+         * node's pointer cleared so that `cmd_free()` does not free a tree the table now
+         * owns.  Moving rather than copying is what `func_set()`'s own comment says, and it
+         * has to be undone here as well: registering without clearing leaves the tree with
+         * two owners, and the shell frees it at the end of the line and then runs whatever
+         * the next call to the function finds.
+         *
+         * It did, for as long as this case did nothing at all -- which is every function
+         * definition ever parsed.  `greet() { echo hi; }; greet world` reported
+         * `greet: not found`, and the reason was neither the parser (which builds the
+         * tree correctly) nor the lookup (which works) but the one step between them. */
+        if (c->name != NULL && c->a != NULL) {
+            cmd_t *body = c->a;
+
+            c->a = NULL;            /* the table owns it now */
+            func_set(c->name, body);
+        }
+
         if (status != NULL)
             *status = 0;
 
@@ -1181,6 +1521,21 @@ void exec_cmd(cmd_t *c, int *status) {
             *status = 0;
 
         break;
+    }
+
+    (void)where;
+
+    /* `$?` for the next command.  Only for a caller that asked, so that a condition's value
+     * -- which is a question, not a result -- does not overwrite the answer to the last one.
+     *
+     * The list case wrote `*status` itself, so `status_here` is read back rather than
+     * reused: `a; b` has to report `b`'s status, not the status of the `a` the switch
+     * started with. */
+    if (is_top_level) {
+        if (status != NULL)
+            sh.status = *status;
+        else
+            sh.status = 0;
     }
 }
 
@@ -1213,8 +1568,15 @@ void exec_run_string(const char *text, int *status) {
             cmd_t *c = parse_program(&toks, &err);
 
             if (c == NULL) {
+                /* The line, because "something after the end of the command" with no line
+                 * attached is the same sentence for every construct in a script, and the
+                 * reader's first question is always which line it was.
+                 *
+                 * The parser's own message names the *token* it stopped at as well; see
+                 * `parse_program()`.  Between the two, a script that does not work says
+                 * which line and which word. */
                 if (err != NULL)
-                    sh_error("%s", err);
+                    sh_error("%s: %s", line, err);
                 else
                     last = 0;
             } else {

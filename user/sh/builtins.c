@@ -226,6 +226,61 @@ static int bi_exit(int argc, char **argv) {
     return code;
 }
 
+/* How many loops a `break n` or `continue n` means.
+ *
+ * A word that is not a number is an error rather than a silent one level: `break $level`
+ * with `$level` unset is a common idiom, and an unset variable expands to nothing so the
+ * argument is absent; but `break two` is a typo, and answering it as `break` would hide the
+ * typo behind a loop that stops one level too soon. */
+static int levels_of(int argc, char **argv) {
+    if (argc < 2)
+        return 1;
+
+    char *end;
+    long  v = strtol(argv[1], &end, 10);
+
+    if (*end != 0 || v < 1) {
+        sh_error("%s: %s: a count of loops, not %s", argv[0], argv[1], argv[1]);
+        return 1;
+    }
+
+    return (int)v;
+}
+
+static int bi_break(int argc, char **argv) {
+    sh_break(levels_of(argc, argv));
+    return 0;
+}
+
+static int bi_continue(int argc, char **argv) {
+    sh_continue(levels_of(argc, argv));
+    return 0;
+}
+
+/* `return [n]`.
+ *
+ * The argument is a *status*, not a count of frames -- which is the one place the three
+ * loop-control words differ from each other, and the difference has to be spelled out here
+ * because `levels_of()` is right for the other two and would be wrong for this one.
+ * `break 3` and `continue 3` mean "three levels out"; `return 3` means "stop, with status
+ * 3".  Reading it as a count made `return 3` leave three function frames, which on a call
+ * from the top level never happened: `f() { return 3; }; f; echo "st=$?"` printed nothing
+ * at all, because the pending `return` was still set when the `echo` ran.
+ *
+ * The status is recorded separately from the frame count because they answer different
+ * questions: the count says how far out to go, and the status says what the function should
+ * report.  A bare `return` leaves the status alone, so a function that ends `return` after a
+ * failing command reports the failure -- which is what `return` with no argument means. */
+static int bi_return(int argc, char **argv) {
+    if (argc > 1)
+        sh_return_status((int)to_number(argv[1]));
+
+    /* Always exactly one function: there is no such thing as returning from two function
+     * calls at once, and a number after `return` is never a count. */
+    sh_return(1);
+    return 0;
+}
+
 static int bi_export(int argc, char **argv) {
     if (argc == 1) {
         var_print(1);
@@ -827,22 +882,22 @@ static int bi_test(int argc, char **argv) {
         const char *op = argv[lo];
         char       *v = expand_to_string(argv[lo + 1]);
 
-        int result;
+        int holds;
 
         if (strcmp(op, "-n") == 0)
-            result = v[0] != 0;
+            holds = v[0] != 0;
         else if (strcmp(op, "-z") == 0)
-            result = v[0] == 0;
+            holds = v[0] == 0;
         else if (op[0] == '-' && op[1] != 0) {
             int r = test_file(op, v);
 
-            result = (r < 0) ? 0 : r;
+            holds = (r < 0) ? 0 : r;
         } else {
-            result = 0;
+            holds = 0;
         }
 
         free(v);
-        return result;
+        return holds ? 0 : 1;
     }
 
     /* Three arguments: the `!` form, `a = b`, or `-n a -o b` collapsed by the recursion
@@ -870,27 +925,39 @@ static int bi_test(int argc, char **argv) {
             char *a = expand_to_string(argv[lo]);
             char *b = expand_to_string(argv[lo + 2]);
             const char *op = argv[lo + 1];
-            int result;
+            int holds;
 
             if (op[1] == 0) {
                 int c = strcmp(a, b);
 
-                result = (op[0] == '=') ? (c == 0) : (c != 0);
+                holds = (op[0] == '=') ? (c == 0) : (c != 0);
             } else {
                 long x = to_number(a);
                 long y = to_number(b);
 
-                if (strcmp(op, "-eq") == 0)      result = (x == y);
-                else if (strcmp(op, "-ne") == 0) result = (x != y);
-                else if (strcmp(op, "-lt") == 0) result = (x < y);
-                else if (strcmp(op, "-le") == 0) result = (x <= y);
-                else if (strcmp(op, "-gt") == 0) result = (x > y);
-                else                            result = (x >= y);
+                if (strcmp(op, "-eq") == 0)      holds = (x == y);
+                else if (strcmp(op, "-ne") == 0) holds = (x != y);
+                else if (strcmp(op, "-lt") == 0) holds = (x < y);
+                else if (strcmp(op, "-le") == 0) holds = (x <= y);
+                else if (strcmp(op, "-gt") == 0) holds = (x > y);
+                else                            holds = (x >= y);
             }
 
             free(a);
             free(b);
-            return result;
+
+            /* A shell status, not the boolean that was computed: `test`'s callers all
+             * agree that zero means true, and the `-a` and `-o` forms and the recursion
+             * below already read it that way.
+             *
+             * Returning the boolean made every two- and three-argument form mean the
+             * opposite of what it says -- `[ 1 = 1 ] && echo yes` printed nothing and
+             * `[ 1 = 2 ] && echo yes` printed `yes`.  The one-argument form returned
+             * `empty ? 1 : 0`, which is the same rule written the other way round, so the
+             * function was right for one argument and wrong for two and three, and a test
+             * that passed `if [ -n "$x" ]` while failing `if [ "$x" = y ]` is exactly the
+             * kind of thing that is never noticed until a loop stops iterating. */
+            return holds ? 0 : 1;
         }
 
         /* `-a` and `-o`, left to right and without precedence, because that is what POSIX
@@ -975,6 +1042,9 @@ static const builtin_t builtins[] = {
     { "true",    bi_true,      0 },
     { ":",       bi_colon,     0 },
     { "false",   bi_false,     0 },
+    { "break",   bi_break,     0 },
+    { "continue", bi_continue, 0 },
+    { "return",  bi_return,    0 },
     { "echo",    bi_echo,      0 },
     { "pwd",     bi_pwd,       0 },
     { "cd",      bi_cd,        0 },

@@ -468,9 +468,14 @@ int main(int argc, char **argv, char **envp) {
         sh.argc = argc - i - 1;
         sh.argv = malloc((size_t)(sh.argc + 1) * sizeof(char *));
 
+        /* Copied, not pointed at.  `bi_set()` frees the old parameters before installing new
+         * ones, so every set of parameters has to be one the shell owns -- and this one used
+         * to be the C runtime's `argv`, which made the first `set --` in a script release
+         * memory it never allocated.  A `sh -c 'set -- a b'` freed the string "sh -c" out
+         * from under the loader, and nothing about that failure points at `set`. */
         if (sh.argv != NULL) {
             for (int k = 0; k < sh.argc; k++)
-                sh.argv[k] = argv[i + 1 + k];
+                sh.argv[k] = strdup(argv[i + 1 + k]);
 
             sh.argv[sh.argc] = NULL;
         }
@@ -508,9 +513,11 @@ int main(int argc, char **argv, char **envp) {
         sh.argc = argc - i;
         sh.argv = malloc((size_t)(sh.argc + 1) * sizeof(char *));
 
+        /* Copied for the same reason as above: the script's own parameters are released by
+         * `bi_set()` and by `bi_shift()`, and they come from the C runtime. */
         if (sh.argv != NULL) {
             for (int k = 0; k < sh.argc; k++)
-                sh.argv[k] = argv[i + k];
+                sh.argv[k] = strdup(argv[i + k]);
 
             sh.argv[sh.argc] = NULL;
         }
