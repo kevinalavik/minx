@@ -1703,6 +1703,156 @@ static void test_user_program(void) {
     test_pass("phase6-user");
 }
 
+/* Files to print when a program has to be reported as hung.
+ *
+ * NULL unless a test asked for it.  `shtest` redirects the shell's output into a file and
+ * compares it when it is done, so a shell that hangs leaves the only evidence of how far it
+ * got in a file that nothing else ever looks at -- and a timeout report that says "task 53
+ * never exited" sends the reader to the scheduler instead of to the shell, which is where
+ * the answer is.  These are the paths `shtest` writes. */
+static const char **hung_dump_paths;
+
+/* Every task, one line each: number, name, state, parent, and whether it ever ran.
+ *
+ * A hang is a relationship between tasks -- this one is waiting for that one, which is
+ * waiting for a third -- and only the whole list shows the relationship.  `task_state_name()`
+ * is what makes it readable: "waiting" says what to look for and "5" does not. */
+static void dump_tasks(void) {
+    task_t *t;
+
+    for (t = task_first(); t != NULL; t = task_next(t)) {
+        kprintf("  task %lu %-10s %-9s parent %lu exit %d started %d switches %lu",
+                (unsigned long)t->id, t->name, task_state_name(t->state),
+                t->parent ? (unsigned long)t->parent->id : 0, t->exit_code,
+                t->started ? 1 : 0, (unsigned long)t->switch_count);
+
+        /* Where it is, for a task that never finished.
+         *
+         * A task saved from ring 3 has the interrupt frame as its context, the same 22
+         * words `sys_fork()` reads to make a child's, so the instruction pointer is in the
+         * same place in both.  A task saved from kernel code has a kernel frame there
+         * instead and the word is meaningless, so it is only printed for a task that was in
+         * ring 3 when it was last saved. */
+        if (t->is_user && t->saved_in_user && t->saved_rsp != 0) {
+            const uint64_t *f = (const uint64_t *)(uintptr_t)t->saved_rsp;
+
+            kprintf(" rip %#lx", (unsigned long)f[17]);
+        }
+
+        kprintf("\n");
+    }
+}
+
+extern char __kernel_start[];
+extern char __kernel_end[];
+
+/* Walk a task's kernel stack and print what is on it.
+ *
+ * Only words that look like return addresses into the kernel image are printed, and only as
+ * raw addresses: turning them into names needs a symbol table this kernel does not carry at
+ * run time.  What a reader gets is a list of addresses, which is enough to be turned into
+ * names afterwards with `addr2line`, and which is what makes the difference between "task 41
+ * is blocked" -- which says nothing -- and where inside the kernel it is blocked.
+ *
+ * The frames are skipped rather than trusted: a stack holding kernel addresses has kernel
+ * addresses' *values* on it too (a struct field that happens to look like one), so this
+ * prints candidates and not a call graph. */
+static void dump_kernel_stack(const task_t *t) {
+    if (t == NULL || t->stack == NULL || t->stack_top == 0)
+        return;
+
+    const uint64_t start = t->stack_top & ~15ull;
+    unsigned      shown = 0;
+
+    kprintf("  kernel stack of task %lu (%s), %lu bytes at %p:\n",
+            (unsigned long)t->id, t->name,
+            (unsigned long)(t->stack_top - (uint64_t)(uintptr_t)t->stack),
+            (void *)t->stack);
+
+    for (uint64_t a = start; a >= (uint64_t)(uintptr_t)t->stack && shown < 24; a -= 8) {
+        uint64_t w = *(const volatile uint64_t *)(uintptr_t)a;
+
+        if (w >= (uint64_t)(uintptr_t)__kernel_start &&
+            w < (uint64_t)(uintptr_t)__kernel_end) {
+            kprintf("    %p: %p\n", (void *)(uintptr_t)a, (void *)(uintptr_t)w);
+            shown++;
+        }
+    }
+}
+
+/* Print a file from the ramfs, up to `limit` bytes.
+ *
+ * The kernel reading a node directly rather than through `vfs_*()`: this is a failure
+ * report, and a report that can fail because of the thing it is reporting on is not a
+ * report. */
+static void dump_ramfs_file(const char *path) {
+    uint64_t parent = ramfs_root();
+    const char *at = path;
+    uint64_t ino = 0;
+
+    while (*at == '/')
+        at++;
+
+    while (*at != 0 && parent != 0) {
+        const char *slash = at;
+        char       name[64];
+        size_t     n = 0;
+
+        while (*slash != 0 && *slash != '/')
+            slash++;
+
+        n = (size_t)(slash - at);
+        if (n >= sizeof(name))
+            n = sizeof(name) - 1;
+        memcpy(name, at, n);
+        name[n] = 0;
+
+        ino = ramfs_lookup(parent, name);
+        if (ino == 0) {
+            kprintf("  %s: not there\n", path);
+            return;
+        }
+
+        parent = ino;
+        at     = *slash == 0 ? slash : slash + 1;
+    }
+
+    uint64_t size = ramfs_node_size(ino);
+    char     line[128];
+
+    if (ino == 0) {
+        kprintf("  %s: no such node\n", path);
+        return;
+    }
+
+    kprintf("  %s: %lu bytes\n", path, (unsigned long)size);
+
+    if (size > 4096)
+        size = 4096;
+
+    uint64_t at_byte = 0;
+
+    while (at_byte < size) {
+        size_t want = sizeof(line) - 1;
+
+        if (size - at_byte < want)
+            want = (size_t)(size - at_byte);
+
+        if (ramfs_read(ino, at_byte, line, want) < 0)
+            break;
+
+        for (size_t i = 0; i < want; i++) {
+            if (line[i] == 0)
+                line[i] = '.';
+            else if (line[i] == '\n')
+                line[i] = '|';
+        }
+        line[want] = 0;
+        kprintf("    |%s|\n", line);
+        at_byte += want;
+    }
+}
+
 /* Run one registered ring-3 program to completion and report whether it exited 0.
  *
  * The helper rather than four copies of the wait loop: the wait is the delicate part --
@@ -1723,15 +1873,30 @@ static bool run_program(const char *name, const char *test, const char *what) {
      * separate reads can describe two different programs.  `forktest` has four children
      * whose exits are deliberately 1, 2, 3 and 4, so a torn read here is not a rare race
      * to shrug at -- it is the common case, and it is how this helper once reported
-     * "forktest exited 4" for a program that had printed "forktest: ok". */
+     * "forktest exited 4" for a program that had printed "forktest: ok".
+     *
+     * `seen` is what says the exit was *this program's*.  Without it a poll that ran out
+     * of time reports whatever exit it last happened to read, which on a machine where a
+     * shell's own children are exiting is almost always somebody else's success: the loop
+     * below gave up after 40 s, the last record on it was a `$( )` child exiting 0, and
+     * `phase9-sh` was reported PASS for a `shtest` that was still sitting in `waitpid`
+     * with its script half-run.  A check that cannot fail when the thing it checks hangs
+     * is worse than no check, because it is a green line in a log. */
     int      code = -1;
     uint64_t who  = 0;
+    bool     seen = false;
 
     for (unsigned waited = 0; waited < 40000; waited++) {
         syscall_exit_record(&code, &who);
-        if (code >= 0 && who == t->id)
+        if (code >= 0 && who == t->id) {
+            seen = true;
             break;
+        }
         task_sleep_ms(1);
+    }
+
+    if (!seen) {
+        code = -1;
     }
 
     if (code < 0) {
@@ -1739,6 +1904,15 @@ static bool run_program(const char *name, const char *test, const char *what) {
                 "switches, %lu on cpu %u\n", test, (unsigned long)t->id, t->name,
                 t->state, t->started ? 1 : 0, (unsigned long)t->switch_count,
                 (unsigned long)t->ran_on_cpu, t->last_cpu);
+
+        if (hung_dump_paths != NULL) {
+            for (const char **p = hung_dump_paths; *p != NULL; p++)
+                dump_ramfs_file(*p);
+        }
+
+        kprintf("%s: tasks at the time of the report:\n", test);
+        dump_tasks();
+        dump_kernel_stack(t);
         test_fail(test, "the program never exited: it hung or was never scheduled "
                   "after 40 s");
         return false;
@@ -1809,7 +1983,18 @@ static void test_libc_program(void) {
  * top of it moved". */
 static void test_sh_program(void) {
 #if MINX_SHELL_PROGRAM
-    if (!run_program("shtest", "phase9-sh", "shtest would not load"))
+    /* What `shtest` leaves behind, in the order that tells the story: the script it wrote,
+     * so the reader can see what it was asked to do, and the output it collected, so the
+     * reader can see how far it got. */
+    static const char *paths[] = { "/tmp/shtest.sh", "/tmp/shtest.out", NULL };
+
+    hung_dump_paths = paths;
+
+    bool ok = run_program("shtest", "phase9-sh", "shtest would not load");
+
+    hung_dump_paths = NULL;
+
+    if (!ok)
         return;
     test_pass("phase9-sh");
 #else
