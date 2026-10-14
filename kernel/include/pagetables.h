@@ -105,21 +105,32 @@ void     pt_enable_nx(void);
 #define CR4_PAE       (1ull << 5)
 #define CR4_SMEP      (1ull << 7)
 
-/* CR4.WP, bit 16: "supervisor-mode writes are not allowed to write to read-only user
- * pages".  Architecturally it is exactly what this kernel's copy-on-write needs -- with
- * it clear, a ring-0 store to a page a `fork` gave up goes straight through into the frame
- * the twin shares, which is how a child used to return from `fork()` holding the *parent's*
- * pid.
+/* CR4.WP, bit 16: "writes are not allowed to write to read-only user pages".
  *
- * It is deliberately NOT set, because QEMU refuses the write with #GP: the accelerator
- * models PAE and SMEP but not WP, so `mov cr4` with bit 16 raises a general protection
- * fault and takes the machine down during `vmm_init()`.  Measured on QEMU 11.1.2 with both
- * `-accel kvm` and `-accel tcg,thread=multi`, on this project's test image.
+ * Architecturally it is what a copy-on-write `fork` runs on.  Mark a shared page read-only
+ * and the first write from either process traps; the handler copies the page privately and
+ * re-runs the instruction, and neither process ever observes the other.
  *
- * So the property is established the other way instead: every write the *kernel* makes
- * into a user page is preceded by `syscall_prepare_write()` (see kernel/lib/syscall.c),
- * which gives the page its own copy first.  `CR4_WP` is kept here so the bit is named
- * rather than rediscovered. */
+ * It is deliberately NOT set, because QEMU refuses the write with #GP: bit 16 is in the
+ * accelerator's reserved CR4 mask, so `mov %cr4` with it set raises a general protection
+ * fault and takes the machine down during `vmm_init()`.  Measured on QEMU 11.1.2 on this
+ * project's test image, with `-accel kvm`, with `-accel tcg,thread=multi`, and again with
+ * `-cpu max`; and on the *register* form `mov %rdi, %cr4`, so it is not the immediate form's
+ * restricted bit set that is refusing it.  `pt_write_cr4()` is the instruction that faults.
+ *
+ * So `fork` copies instead of marking, and does it in the fork rather than at the first
+ * write: see `fork_copy_page()` in kernel/mm/vmm_user.c, which gives the child its own frame
+ * for every user page so that after a fork the two address spaces share none at all.
+ *
+ * That is the only correct arrangement without this bit.  A read-only page that is not
+ * enforced is not protection, it is a comment: with WP clear a store to one goes straight
+ * through to the frame and nothing traps.  What that cost is written up at the function --
+ * in short, a forked child resumed correctly, read a word of its own stack that the parent
+ * had already reused for something else, and ran the parent's code from the wrong address.
+ *
+ * `CR4_WP` is kept here so the bit is named rather than rediscovered, and so that the day a
+ * target that has it arrives, the copy in `fork_copy_page()` is the only thing that has to
+ * change. */
 #define CR4_WP        (1ull << 16)
 
 #define CR4_SMAP      (1ull << 20)

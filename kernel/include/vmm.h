@@ -201,21 +201,39 @@ typedef struct {
     cow_page_t page[COW_MAX_PAGES];
     unsigned   count;
     bool       full;
+
+    /* How many pages this `fork` copied for the child.
+     *
+     * Counted here rather than in `count` because `count` is the *record* list -- the pages
+     * this address space has given up -- and a fork that copies at the fork gives nothing
+     * up, so the record list stays as it was and the two numbers are different questions.
+     * They used to be the same question, when marking a page copy-on-write was how a child
+     * got one of its own; see `fork_copy_page()` in vmm_user.c for why it now copies. */
+    unsigned   copied;
 } cow_list_t;
 
-/* Build `dst` as a copy-on-write twin of `src`.
+/* Build `dst` as a twin of `src` that shares no user page with it.
  *
- * Read-only pages are shared outright -- nothing can write them, so nothing can notice.
- * A writable page has its leaf page table duplicated and write permission taken away from
- * both sides: the parent's leaf lives in a table the two now share, so there is only one
- * bit to clear, and clearing it in the twin clears it for the parent too.  That is the
- * point.  Whichever of the two writes first takes a fault and gets a private copy, and
- * the other finds the fault waiting for it.
+ * Every user page is copied: a fresh frame with the parent's contents, and the parent's own
+ * flags, so data stays writable and text stays read-only.  After this the two address spaces
+ * have nothing in common below the kernel half, so there is no page a write can go
+ * straight into and nothing to detect late.
  *
- * Duplication is at the level of the leaf page table: a *leaf* must be private, because
- * the two processes have to be able to point it at different frames, while a directory or
- * a directory pointer table can be shared when every leaf under it is already read-only.
- * For a small program that is one table per 4 MiB that holds anything writable. */
+ * That is a deliberate departure from the textbook version, which shares every page and
+ * takes write permission away from both sides so that the first write faults and gets a
+ * private copy.  It needs `CR4.WP`, and this kernel cannot have it -- see `CR4_WP` in
+ * kernel/include/pagetables.h for the measurement -- so the write never faults and the page
+ * is shared for the rest of both processes' lives.  `fork_copy_page()` in vmm_user.c is where
+ * that is worked out in full, with the symptoms it produced; the summary is that a child
+ * resumed perfectly and then read a stack word its parent had already reused.
+ *
+ * Duplication is at the level of the leaf page table and above: a *leaf* must be private,
+ * because the two processes have to be able to point it at different frames, and a
+ * directory must be private because `brk()` adds an entry to whichever table covers the
+ * address it hands out.  A directory pointer table is shared when there is nothing at all
+ * under it.  Supervisor-only mappings in the user half -- the TSS, which has to stay at its
+ * own physical address for the processor to find it -- are shared deliberately; see
+ * `fork_copy_page()`. */
 int  vmm_fork_aspace(page_table_t *dst, page_table_t *src, cow_list_t *cow);
 
 /* Resolve a write fault on a page this address space shares with its twin.

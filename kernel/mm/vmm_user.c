@@ -154,19 +154,64 @@ void vmm_user_page_free(uint64_t phys) {
 
 /* --- copy-on-write twins ------------------------------------------------ */
 
-/* Copy one leaf page table, dropping write permission on the writable leaves.
+/* Give the child its own copy of every page under one leaf page table.
  *
- * And dropping it from the *source* as well, which is the half that makes this copy-on-
- * write rather than copy-on-write-for-the-child-only.  The two page tables are separate
- * frames, but they name the same physical pages, so the only bit that stands between the
- * processes writing over each other is in one of them -- and if only the twin's bit is
- * cleared then the parent writes straight through to the shared frame and the child's copy
- * is never made.  A copy-on-write scheme that protects only the child is not a scheme.
+ * This used to *mark* the writable leaves copy-on-write and record them, so that the first
+ * write from either process would fault and be answered with a private copy.  That is the
+ * textbook design and it is what the rest of this file is still built around -- `PTE_COW`,
+ * `vmm_cow_fault()`, and the syscall door's `syscall_prepare_write()` all exist for it.
  *
- * Both leaves end up read-only and *both* processes fault on the first write, which is
- * also what makes the recorded entries worth having: each side restores its own. */
-static bool cow_copy_pt(uint64_t *slot, uint64_t *src_v, uint64_t base,
-                        cow_list_t *cow) {
+ * It cannot work here.  The fault it depends on is a *write* fault on a page marked
+ * read-only, and a write fault only happens if `CR4.WP` is set: with it clear the processor
+ * lets a store to a read-only user page go straight through to the frame, silently, with no
+ * trap at all.  And `CR4.WP` cannot be set on the emulator this kernel is built to run on --
+ * QEMU treats bit 16 of CR4 as reserved and raises #GP for `mov %cr4` with it set, so
+ * `vmm_init()` would panic before printing a line.  Measured on QEMU 11.1.2, on this
+ * project's test image, with both `-accel kvm` and `-accel tcg,thread=multi`, and again
+ * with `-cpu max`; the register form `mov %rdi, %cr4` is what faults, so it is not the
+ * immediate form's restricted bit set.  `CR4_WP` is kept in `pagetables.h` with the
+ * measurement, so the bit stays named rather than rediscovered.
+ *
+ * So the copying happens *here*, at the fork, instead of lazily at the first write.  That
+ * costs a copy of every page of a process that forks even if it never writes to one, which
+ * is the whole of the cost: memory proportional to the parent's address space times the
+ * number of live children, all of it freed when they exit.
+ *
+ * What it buys is that after a fork the two address spaces share *no* user page at all, so
+ * there is nothing for a write to go straight into and nothing to be detected late.  That
+ * is not a tidier way to do copy-on-write; it is the only way to do it where a write to a
+ * read-only page does not trap, and the difference is worth a day's worth of symptoms:
+ *
+ *   With marking, `shtest` forked, and the child resumed correctly -- `fork` returned zero,
+ *   the frame said the right thing, the child branched on `pid == 0`.  But the child's next
+ *   instruction was a `ret`, which reads the *return address* out of a stack page the
+ *   parent still held.  The parent had already returned from its own `fork`, called
+ *   `getpid`, called `trace`, and pushed two return addresses over the slot the child was
+ *   about to read.  So the child popped the parent's live return address, landed past the
+ *   `if (pid == 0)`, took the parent's branch, and called `waitpid()` on a `pid` read out
+ *   of an argument slot.  `fork` returned non-zero in the child, intermittently, and no
+ *   report anywhere said a page was shared.
+ *
+ *   Every one of those steps is something COW would have caught on the parent's first
+ *   write to that page -- if a write to it trapped.
+ *
+ * Read-only pages are copied too, rather than shared on the grounds that "nothing can write
+ * them, so nothing can notice".  Nothing stops a program writing to its own text, and a
+ * write that went into the twin's would be the same class of bug as this one: silent
+ * corruption of a process by its own sibling.  Copying them is the difference between "the
+ * two share nothing" and "the two share nothing that anybody has tried to write yet".
+ *
+ * The budget is `COW_MAX_PAGES`, counted in `cow->copied` rather than in `cow->count`: the
+ * list itself is now empty, because nothing is given up, and the accounting in
+ * `task_attach_cow_twin()` -- which seeds the child with the parent's list and adds back
+ * only what this fork took -- stays correct with nothing to add.
+ *
+ * `src_v` is the parent's table and is never written to.  That is the other half of why the
+ * marking version had to clear both sides: there was one physical frame under two leaves
+ * and one of the two bits had to change somewhere.  Here there is one frame per leaf and
+ * nothing to change. */
+static bool fork_copy_page(uint64_t *slot, uint64_t *src_v, uint64_t base,
+                           cow_list_t *cow) {
     uint64_t frame = pmm_alloc_phys_page();
 
     if (frame == 0)
@@ -182,29 +227,52 @@ static bool cow_copy_pt(uint64_t *slot, uint64_t *src_v, uint64_t base,
         if (!pte_present(e) || pte_huge(e))
             continue;
 
-        /* Writable, or already given up: both mean this page is one the twin may have to
-         * copy, and both are recorded.  The second case is the one that used to be missed --
-         * see `task_attach_cow_twin()` -- and missing it is what leaves a child with a
-         * read-only page and no record of why. */
-        if (!pte_writable(e) && !pte_cow(e))
+        /* Not the program's.  A supervisor-only mapping in the user half of the address
+         * space is the kernel's own, and there is exactly one of them: the TSS, identity
+         * mapped at the linear address equal to its physical address so that QEMU can
+         * resolve the fetch through the page tables.  "Its own physical address" is the
+         * whole of what it is for -- a copy at a different frame is not a copy the processor
+         * will ever reach, and `vmm_map_identity_for_new_space()`, which runs just after
+         * this and puts the identity mapping into every new address space, then finds a
+         * different mapping already there and refuses.
+         *
+         * The refusal was reported as "could not map <the TSS's address> at its own
+         * physical address", which names the innocent party: the address is the TSS's and
+         * the fault is that the fork moved it.  Sharing it is not a compromise, it is the
+         * requirement -- it is one page, it is the same page in every address space by
+         * design, and there is nothing a process can do with it.
+         *
+         * A leaf the *kernel* maps at a low address with user access is a different thing
+         * entirely and is copied like any other; this test is on the user bit, not on where
+         * the address is. */
+        if (!pte_user(e))
             continue;
 
-        if (cow->count >= COW_MAX_PAGES) {
+        if (cow->copied >= COW_MAX_PAGES) {
             cow->full = true;
             return false;
         }
-        cow->page[cow->count].virt = base + (uint64_t)i * page_size;
-        cow->page[cow->count].entry = e;
-        cow->count++;
 
-        /* Read-only, and *marked* read-only.  The bit is what tells a later `fork` that this
-         * page needs a page table of its own rather than one shared with the twin; see
-         * `PTE_COW`.  It goes on both sides, and the entry recorded above is the one the
-         * twin had before either of them gave anything up, which is what
-         * `vmm_cow_fault()` restores. */
-        dst[i] = (e & ~PTE_WRITE) | PTE_COW;
-        src_v[i] = (e & ~PTE_WRITE) | PTE_COW;
+        /* A fresh frame with the parent's contents, and the parent's own flags kept exactly
+         * as they are: data stays writable and text stays read-only, because a `fork` is
+         * not a licence to make the program's text writable. */
+        uint64_t copy = pmm_alloc_phys_page();
+
+        if (copy == 0)
+            return false;
+
+        memcpy((void *)phys_to_virt(copy), (const void *)phys_to_virt(pte_phys(e)),
+               page_size);
+
+        /* A page marked copy-on-write belongs to an address space that has given it up; the
+         * child has not been given it by this fork and must not inherit the mark, which
+         * would claim a record of a give-up that never happened and make a later
+         * `vmm_cow_fault()` copy a page that is already private. */
+        dst[i] = pte_make(copy, e & ~PTE_COW);
+        cow->copied++;
     }
+
+    (void)base;                        /* only ever used for the recording above */
 
     /* With flags.  A bare frame number in a directory entry reads as *not present* --
      * bit 0 is the present bit and a physical address never has it set -- so the twin would
@@ -242,38 +310,37 @@ static bool pt_copy_table(uint64_t *slot, const uint64_t *src_v) {
     return true;
 }
 
-/* Build `dst` as a copy-on-write twin of `src`.
+/* Build `dst` as a twin of `src` that shares no user page with it.
  *
- * Read-only pages are shared outright: nothing can ever write them, so nothing can ever
- * notice.  A writable page has its leaf duplicated instead, and write permission taken
- * away from *both* sides -- the parent's leaf is in a page table the two now share, so
- * there is only one bit to clear, and clearing it in the twin clears it for the parent
- * too.  That is the point: the first of the two to write takes a fault and gets a private
- * copy, and the other one finds the fault waiting for it as well.
+ * A twin that shares nothing is what `fork_copy_page()` below does, and why; this is the
+ * walk that gets there.  The textbook version shares every page and takes write permission
+ * away from both sides, so that the first write faults and is answered with a private copy.
+ * That needs `CR4.WP`, this kernel cannot have it, and the write never faults -- so the
+ * page is shared for the rest of both processes' lives instead.  `fork_copy_page()` has the
+ * full account and the symptoms it produced.
  *
- * The duplication is at the level of the *leaf* page table, not the leaf, and not the page
- * directory.  A leaf has to be private, because the two processes must be able to point
- * it at different frames.  A page directory and a page directory pointer table can be
- * shared whenever every leaf under them is already read-only, and for a small program that
- * is nearly all of them -- so the tables a `fork` duplicates are one per 4 MiB of address
- * space that actually contains something writable, which for `hello` is one.
+ * Duplication is at the level of the leaf page table and above, never above the leaf.
  *
- * Sharing a page table has a cost worth naming: a fault that *adds* a mapping would edit
- * the twin's tables and so the parent's.  Nothing in this kernel does that from ring 3 --
- * mmap arrives in phase 11 and will need this revisited -- and the alternative,
- * duplicating every table, would make `fork` cost megabytes. */
-
-/* TEMP diagnostic. */
-/* `dst` becomes a copy-on-write twin of `src`, and everything this takes away from `src` is
- * appended to `cow`.
+ *   A leaf has to be private: the two processes must be able to point it at different
+ *   frames, which is the whole purpose.
  *
- * Appended, not filled: the list belongs to the caller and may already hold the pages this
- * address space gave up for an *earlier* twin -- see `task_attach_cow_twin()`, which is
- * where that reasoning is written down.  This used to `memset` the list on entry, which
- * discarded exactly those entries and made the caller compute its share of the list as a
- * subtraction of a bigger number from a smaller one; the result was a `memcpy` of sixteen
- * gibibytes that walked over the page tables and stopped the machine with no message and no
- * fault.  The caller zeroes it. */
+ *   A page directory has to be private for a different reason, and it is the one that is
+ *   easy to miss.  `brk()` adds an entry to whichever table covers the address it is
+ *   handing out, from ring 3, in whichever address space asked.  A shared directory gains
+ *   the twin's mapping, the parent sees it, and the parent's own `brk` replaces the frame
+ *   under it -- at which point the child's heap and the parent's heap are the same page and
+ *   neither of them faults, because both are entitled to write it.  "Can be shared" used to
+ *   mean "nothing under it is writable, so nothing in it can ever change", which is true of
+ *   the *entries* and false of the *table*.  What that looked like was `$( $( ) )` in the
+ *   shell: the outer capture forked, the inner one wrote its word, and the machine stopped
+ *   with a protection violation on a heap page in the middle of a line that had already
+ *   worked once.
+ *
+ *   A page directory pointer table can be shared when there is nothing at all under it.
+ *
+ * The copy budget is `cow->copied`, against `COW_MAX_PAGES`.  It is a budget and not a
+ * record: nothing is given up -- the child has its own pages and the parent keeps its own
+ * -- so `cow->count` is left exactly as `task_attach_cow_twin()` seeded it. */
 int vmm_fork_aspace(page_table_t *dst, page_table_t *src, cow_list_t *cow) {
     uint64_t pml4_phys = alloc_zeroed_phys();
 
@@ -385,7 +452,7 @@ int vmm_fork_aspace(page_table_t *dst, page_table_t *src, cow_list_t *cow) {
                 uint64_t base = ((uint64_t)i << 39) | ((uint64_t)a << 30) |
                                 ((uint64_t)b << 21);
 
-                if (!cow_copy_pt(&mid_v[b], pt, base, cow))
+                if (!fork_copy_page(&mid_v[b], pt, base, cow))
                     return -1;
             }
         }
