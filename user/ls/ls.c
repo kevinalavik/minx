@@ -49,22 +49,36 @@ typedef struct {
     size_t cap;
 } names_t;
 
+/* Two allocations, so two failures, and they mean different things.
+ *
+ * `a->v` is the array of pointers and `strdup()` is the copy of one name.  Reporting both as
+ * "out of memory" -- which is what this did -- is not a small imprecision: "the array could
+ * not grow" and "one name could not be copied" point at entirely different places, and a
+ * message that cannot tell them apart sends the reader to both. */
 static int names_add(names_t *a, const char *name) {
     if (a->n + 1 > a->cap) {
         size_t want = a->cap ? a->cap * 2 : 32;
+
+        errno = 0;
         char **grown = realloc(a->v, want * sizeof(char *));
 
-        if (grown == NULL)
+        if (grown == NULL) {
+            fprintf(stderr, "ls: cannot hold %lu names: %s\n",
+                    (unsigned long)want, strerror(errno));
             return -1;
+        }
 
         a->v = grown;
         a->cap = want;
     }
 
+    errno = 0;
     a->v[a->n] = strdup(name);
 
-    if (a->v[a->n] == NULL)
+    if (a->v[a->n] == NULL) {
+        fprintf(stderr, "ls: cannot copy the name \"%s\": %s\n", name, strerror(errno));
         return -1;
+    }
 
     a->n++;
     return 0;
@@ -91,12 +105,19 @@ static int list_dir(const char *path, int show_hidden) {
 
     struct dirent *e;
 
+    /* Cleared before the walk, not after.  The test below is POSIX's: a NULL return with
+     * `errno` set is a failure and a NULL return with `errno` clear is the end of the
+     * directory.  That only means anything if nothing before the loop has already failed,
+     * and `ls` has just done an `opendir()`, which on some paths leaves `errno` set from
+     * something else entirely.  Without this the check reported the *last* thing that went
+     * wrong rather than the thing that went wrong here. */
+    errno = 0;
+
     while ((e = readdir(d)) != NULL) {
         if (!listed(e->d_name, show_hidden))
             continue;
 
         if (names_add(&names, e->d_name) != 0) {
-            fprintf(stderr, "ls: %s: out of memory\n", path);
             status = 1;
             break;
         }
