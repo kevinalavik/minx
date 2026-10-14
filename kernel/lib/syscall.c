@@ -275,8 +275,43 @@ bool syscall_user_range_ok_in(page_table_t *tables, uint64_t addr, size_t bytes,
     if (tables == NULL)
         return false;
 
-    for (uint64_t off = 0; off < bytes; off += page_size) {
-        pte_t leaf = pt_get(tables, addr + off);
+    /* Every page the range touches, *including the last one*.
+     *
+     * `off < bytes` steps by a page from the start, so it checks the pages at the start of
+     * each page-sized step -- and a range that does not end on a boundary is never checked
+     * at its far end.  `read(fd, buf, 4096)` with `buf` one byte before a page boundary
+     * passes a check that looked at one page and copied across two.
+     *
+     * That is the difference between EFAULT and a kernel page fault, and it is worth being
+     * exact about which is which: the check is the only thing standing between a program's
+     * pointer and a `memcpy` in supervisor mode, so every byte it does not look at is a
+     * byte the CPU will fault on. */
+    /* Every page the range touches.
+     *
+     * The page at the *start* of each 4096-byte step is not the page at the end of the
+     * range, and a range that starts near the end of a page runs into the next one.  So
+     * this walks *page starts*: the first byte of the range, then the start of the next
+     * page, until the start is at or past the end.
+     *
+     * Getting this wrong is not a small thing: the check is the only thing between a
+     * program's pointer and a `memcpy` in supervisor mode.  A version that tested
+     * `off < bytes` with `off += page_size` accepted `read(fd, buf, 256)` with `buf` 176
+     * bytes below the top of a page, and the copy then ran off the end of the program's
+     * stack into a page that is not there -- which is a kernel panic in a shell that had
+     * done nothing wrong.
+     *
+     * An empty range is a range with no pages in it, and is legal wherever its address is
+     * a legal user address.  `phase6-pointers` checks exactly that, because a kernel that
+     * answered "no" for an empty range cannot distinguish "you passed nothing" from "you
+     * passed a bad pointer" -- and neither can a program. */
+    if (bytes == 0)
+        return true;
+
+    uint64_t end = addr + bytes;
+
+    for (uint64_t a = addr; a < end;
+         a = (a & ~(uint64_t)(page_size - 1)) + page_size) {
+        pte_t leaf = pt_get(tables, a);
 
         if (!pte_present(leaf) || !pte_user(leaf))
             return false;
@@ -291,8 +326,18 @@ bool syscall_copy_from_user(void *dst, uint64_t src, size_t bytes) {
     if (bytes == 0)
         return true;
 
-    if (!syscall_user_range_ok(src, bytes, false))
+    if (!syscall_user_range_ok(src, bytes, false)) {
+        /* Named, because "EFAULT" is a statement about a pointer and this is the only place
+         * that knows which pointer.  A program that hands over a bad one gets an error; the
+         * next person reading the log gets the address and the length, which is the whole
+         * difference between "something was wrong with a pointer" and "this is where". */
+        task_t *self = sched_current();
+
+        kprintf("[warn] read of %#lx+%zu from task %lu refused: not mapped\n",
+                (unsigned long)src, bytes,
+                self != NULL ? (unsigned long)self->id : 0);
         return false;
+    }
 
     __builtin_memcpy(dst, (const void *)(uintptr_t)src, bytes);
     return true;
@@ -346,17 +391,78 @@ void syscall_prepare_write(uint64_t addr, size_t bytes) {
     }
 }
 
+/* The write side, and it says the same thing for the same reason.
+ *
+ * `syscall_prepare_write()` first, because a page a `fork` left read-only is a page this
+ * program is allowed to write and the walk cannot tell that apart from one it is not. */
 bool syscall_copy_to_user(uint64_t dst, const void *src, size_t bytes) {
     if (bytes == 0)
         return true;
 
     syscall_prepare_write(dst, bytes);
 
-    if (!syscall_user_range_ok(dst, bytes, true))
+    if (!syscall_user_range_ok(dst, bytes, true)) {
+        kprintf("[warn] write of %#lx+%zu to user space refused: not mapped\n",
+                (unsigned long)dst, bytes);
         return false;
+    }
 
     __builtin_memcpy((void *)(uintptr_t)dst, src, bytes);
     return true;
+}
+
+/* Copy a NUL-terminated string out of user space.
+ *
+ * The three rules, and each of them is a bug that happened here:
+ *
+ *  - **Stop at the NUL, not at the buffer.**  A path is nine bytes and asking for 256
+ *    mapped bytes of it is asking the program to have 256 mapped bytes.  A string that
+ *    ends within the same page as its start must never require the page after it.
+ *
+ *  - **Never step past the end of the page the cursor is on.**  Even the bounded version
+ *    reads in chunks, and a chunk that crosses a page boundary reads the next page whether
+ *    the string needs it or not.  The chunk is capped at the page boundary, so a string
+ *    anywhere on a mapped page is readable without its page's neighbour.
+ *
+ *  - **Check the range for the chunk, not for `max`.**  `syscall_copy_from_user` already
+ *    checks every page the *chunk* touches, which is what makes the second rule work.
+ *
+ * This is what every path, and every `argv` and `envp` entry, is copied with.  A `sh` that
+ * `exec`s something it was handed near the top of its own stack used to be refused by the
+ * kernel, because the kernel insisted on 256 readable bytes.
+ *
+ * Returns the length, or -errno. */
+long syscall_copy_cstring(uint64_t src, char *dst, size_t max) {
+    if (max == 0)
+        return -EFAULT;
+
+    size_t got = 0;
+
+    while (got + 1 < max) {
+        /* The rest of the page the cursor is on, which is as much as can be read
+         * without asking for a page the string may not need. */
+        size_t page_left = page_size - (size_t)((src + got) & (uint64_t)(page_size - 1));
+        size_t chunk = max - 1 - got;
+
+        if (chunk > 64)
+            chunk = 64;
+        if (chunk > page_left)
+            chunk = page_left;
+        if (chunk == 0)
+            break;
+
+        if (!syscall_copy_from_user(dst + got, src + got, chunk))
+            return -EFAULT;
+
+        for (size_t i = 0; i < chunk; i++) {
+            if (dst[got + i] == 0)
+                return (long)(got + i);
+        }
+
+        got += chunk;
+    }
+
+    return -ENAMETOOLONG;
 }
 
 /* --- descriptors --------------------------------------------------------- */
@@ -806,25 +912,24 @@ long sys_exec(regs_t *regs) {
 
     char name[VFS_NAME_MAX];
 
-    if (!syscall_copy_from_user(name, path, sizeof(name))) {
-        /* The whole block, or nothing.  A half-read name is a name that does not exist. */
-        errno_return(EFAULT);
+    /* A string, not a block.
+     *
+     * This used to copy `VFS_NAME_MAX` bytes -- 256 of them -- and require all 256 to be
+     * readable, on the grounds that "the whole block, or nothing".  That is a rule about
+     * the *buffer* being all-or-nothing, which is true, and a rule about the *program's*
+     * memory being all-or-nothing, which is not: a program whose path string ends 30 bytes
+     * from the top of its own stack has a perfectly good path and no page above it.  Every
+     * `sh` that `exec`s something it was handed near the end of its stack was refused.
+     *
+     * `syscall_copy_cstring()` stops at the NUL and never reads past the end of the page
+     * the cursor is on, which is what a path is allowed to assume. */
+    long nlen = syscall_copy_cstring(path, name, sizeof(name));
+
+    if (nlen < 0) {
+        /* -ENAMETOOLONG is the one answer here that is not about the pointer, and it keeps
+         * its own number; the rest are the program's pointer being unusable. */
+        errno_return(nlen == -ENAMETOOLONG ? ENAMETOOLONG : EFAULT);
     }
-
-    name[sizeof(name) - 1] = 0;
-
-    /* ...and it still has to be a string.  A program reading its own unterminated memory
-     * hands over bytes with no NUL anywhere in the block, and those bytes are not a name. */
-    bool terminated = false;
-
-    for (unsigned i = 0; i < sizeof(name); i++) {
-        if (name[i] == 0) {
-            terminated = true;
-            break;
-        }
-    }
-    if (!terminated)
-        errno_return(EINVAL);
 
     static char  exec_strs[8192];
     static char *exec_argv[MAX_EXEC_VECS + 1];
@@ -1422,6 +1527,7 @@ long sys_wait(regs_t *regs) {
         errno_return(EINVAL);
 
     if (parent == NULL) {
+        kprintf("[warn] wait: task 0 asked to wait for %ld\n", (long)pid);
         errno_return(ECHILD);
     }
 
@@ -1430,8 +1536,11 @@ long sys_wait(regs_t *regs) {
      * that failed to be found -- it has run out of children, which is what ECHILD is for,
      * and what a shell's `wait` with nothing to wait for has to be able to tell apart from
      * an error. */
-    if (parent->child == NULL)
+    if (parent->child == NULL) {
+        kprintf("[warn] wait: task %lu (%s) has no children and asked to wait for %ld\n",
+                (unsigned long)parent->id, parent->name, (long)pid);
         errno_return(ECHILD);
+    }
 
     for (;;) {
         for (task_t *c = parent->child; c != NULL; c = c->sibling) {
