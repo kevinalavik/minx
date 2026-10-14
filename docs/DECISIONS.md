@@ -1266,3 +1266,35 @@ for the real thing. On a machine where a write to a read-only page does not trap
 at the `fork` *is* the correct implementation, and the lazy version is the incorrect one:
 it is only correct because of a processor feature the kernel cannot ask for. The cost is
 real and is stated above; the correctness is not a compromise.
+
+## `exec`'s scratch is per processor, not per machine
+
+**Decision.** The arena `sys_exec()` copies argument and environment strings into is one per
+CPU (`exec_arenas[MAX_CPU_COUNT]`), not one `static` for the kernel.
+
+**Why.** It was one static array, justified as "not reentrant, and does not need to be:
+`exec` replaces the program, so there is no second `exec` in flight from the same task". The
+premise is true and the conclusion does not follow, because the invariant that would make it
+safe is *per task* and the shared state is *per machine*. A pipeline has two tasks calling
+`exec` at the same instant on two processors. They wrote at the same `used` offset and each
+took the other's pointers, so `ls /tmp/shtest-* | head -n 1` handed `ls` the arguments of
+`head -n 1` about one run in four.
+
+Nothing faulted. The pointers were valid — for somebody else — which is why the only symptom
+was a program rejecting an option it had never been given, in a script that otherwise ran to
+completion.
+
+**Alternatives considered.**
+
+- *A lock around the arena.* Rejected for two reasons. The arena has to stay valid for the
+  whole of `elf_load()`, which maps segments and builds a stack, so the lock would have to
+  be held across page allocation and into the loader's own locking; and the contention is
+  real, not theoretical, since the only thing that makes two `exec`s overlap is exactly the
+  pipeline that the shell runs hundreds of times.
+- *Put the arena in `task_t`.* Correct, and about 8 KiB per task on a 16 KiB stack for
+  `task_t` alone. Per-CPU is free and equally correct.
+
+**Why per-CPU is safe without a lock.** A task is on exactly one processor at a time, and
+`syscall_dispatch()` holds interrupts off for the whole of a handler, so a CPU never has two
+`exec`s in flight. That is the same argument that makes the static arena safe per task, moved
+up one level to where the sharing actually was.

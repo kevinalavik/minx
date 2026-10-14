@@ -118,7 +118,7 @@ Eight consecutive boots now produce zero interleaved lines.
 | 6 | Userspace entry | VERIFIED | Per-process address spaces with a shared kernel half, a ring-3 task, `int $0x80` with page-table-checked pointer validation, an ELF64 loader, and a freestanding `hello` linked `ET_EXEC` at 4 MiB and embedded in the kernel image. `kernel/mm/vmm_user.c`, `kernel/lib/elf.c`, `kernel/lib/syscall.c`, `user/hello/`. `phase6-pointers` (the kernel image, the direct map, the top of user space, `~0` and a wrapping range are all refused as user pointers; an empty range at a legal address is not), `phase6-elf` (a short file, the wrong machine, a 32-bit class and an image with no loadable segments are each refused *and say why*), `phase6-aspace` (two tasks, two address spaces, each writing its own page, neither able to reach the other's, both reaching the kernel), `phase6-user` (the program is loaded, entered at ring 3, reads its own `argc` and `argv[0]`, writes to the console, is refused EBADF for a bad descriptor, EFAULT for an unmapped pointer, EFAULT for a kernel pointer and ENOSYS for an unimplemented call, is preempted in ring 3 and resumed, and exits 0). **VERIFIED** by `make test` → `run-tests: PASS` and by three `-smp 4` runs at 38/38. |
 | 7 | Processes, signals, pipes | VERIFIED | `fork` with copy-on-write, `wait`, a per-process descriptor table and pipes, `exec`, and signals. `phase7-fork` (four children, four pipes drained, all reaped by `wait`, no children left), `phase7-cow` (the parent's 8192 bytes survive the child's writes through shared pages), `phase7-signal` (a handler runs with the right number and the interrupted registers are intact; a blocked signal is *pending*, not lost, and arrives on unblocking; a signal with no handler does its default thing, SIGCHLD ignored and SIGUSR2 fatal). See "Phase 7, where it got to". |
 | 8 | VFS + ramfs + initrd + devfs | VERIFIED | `phase8-ramfs` (the tree, from inside the kernel) and `phase8-vfs` (`fstest`, the same filesystem through `int $0x80` and nothing else -- create, write, read back through a new descriptor, the mode surviving, the errno for each of six distinct mistakes, a kernel address refused as a path, rename with both halves checked, a failed rename not creating its destination, a hard link being one inode with a count of 2 that drops to 1 when one name goes, a directory refusing to be hard-linked, `lstat` a link and `stat` the file, `readlink` giving a *relative* target, `getdents` listing every entry once each with the right `DT_*`, `rmdir` refusing a non-empty directory, and `/proc/self/status` describing the reading process). `make test` → 43/43, three runs. A normal boot mounts `/dev` and `/proc`, finds `/init` in the initrd and runs it; `init` execs `/bin/hello`, which reports `hello: ok`. |
-| 9 | TTY + libc + sh | VERIFIED | The graphical console and the keyboard are done (`make run` boots to a console you can type at), `libctest` is **115/115**, and `sh` runs the whole of `shtest`'s script. `make WITH_SHELL=1 test` → **45/45**, and `shtest` reports **53 of 53 lines matched** -- word splitting, globbing, `$?`/`$#`/`$*`/`$@`, arithmetic, `if`/`for`/`while`/`until`/`case`, functions, `break`/`continue`/`return`, subshells, groups, redirections including `>&2` and `2>&1` on a compound, pipelines, command substitution nested three deep, `cd`, `pwd`, background commands and `sh -c`. `make test` (no shell) stays at 44/44. See "What finally fixed the intermittent fork" and "Known bugs". |
+| 9 | TTY + libc + sh | VERIFIED | The graphical console and the keyboard are done (`make run` boots to a console you can type at), `libctest` is **115/115**, and `sh` runs the whole of `shtest`'s script. `make WITH_SHELL=1 test` → **45/45**, and `shtest` reports **53 of 53 lines matched** -- word splitting, globbing, `$?`/`$#`/`$*`/`$@`, arithmetic, `if`/`for`/`while`/`until`/`case`, functions, `break`/`continue`/`return`, subshells, groups, redirections including `>&2` and `2>&1` on a compound, pipelines, command substitution nested three deep, `cd`, `pwd`, background commands and `sh -c`. `make test` (no shell) stays at 44/44. See "What finally fixed the intermittent fork" and "The last flake". |
 | 10 | Coreutils + procfs | IN PROGRESS | `procfs` is done enough for `/proc/self/status` (phase 8). Seven coreutils exist and work: `user/echo`, `user/cat`, `user/wc`, `user/head`, `user/tail`, `user/ls`, `user/rm`. Each is tested on the host against GNU's behaviour for the cases `shtest` needs -- `wc`'s padding rule (GNU right-aligns a count in a field of seven when there is more than one count or a name, and prints a single bare count when there is neither, which is what makes `lines=$(wc -l < f)` come out `2` rather than `       2`), `ls` sorting its names before printing any of them, `head -n 0` printing nothing *and draining* so a pipeline cannot deadlock, `tail`'s ring of lines rather than of bytes. `rm -r` and `tail -n -N` are **not implemented and say so** rather than doing something else. |
 | 11 | Hardening / stress | NOT STARTED | |
 | 12 | Polish | NOT STARTED | |
@@ -645,38 +645,50 @@ The two things that were *wrong* along the way and are worth not repeating:
   program's memory, and a correct `ls a b` comes out as a duplicated, unsorted list.  It
   looked exactly like the bug being hunted.
 
-### What is still broken
+### The last flake: one `exec` arena for the whole machine
 
-One symptom, and it is not the fork any more:
+`ls /tmp/shtest-* | head -n 1` inside a command substitution passed `-n` to `ls` in
+roughly one run in four.  `shtest`'s `glob=` line came out empty and the run reported
+`ls: -n: unknown option`; every other line was exactly right.
 
-**`ls /tmp/shtest-* | head -n 1` inside a command substitution occasionally passes `-n` to
-`ls`.**  In roughly one run in four, `shtest`'s `glob=` line comes out empty and the run
-reports `ls: -n: unknown option`; the other three lines are exactly right.
+`sys_exec()` copied the calling program's argument and environment strings into one
+`static` arena -- `static char exec_strs[8192]`, `static char *exec_argv[]`,
+`static char *exec_envp[]` and a `static size_t used` -- on the argument that it does not
+need to be reentrant, because "`exec` replaces the program, so there is no second `exec` in
+flight from the same task".
 
-**What has been established**, so that the next session does not repeat it:
+**That is true and it is the wrong question.**  A *pipeline* has two tasks calling `exec` at
+the same moment, on two processors.  Both were writing at the same `used` offset and handing
+each other the pointers they had just stored, so `ls` was exec'd with the other half's
+arguments.
 
-- Not the parser.  The tree for `ls /tmp/shtest-* | head -n 1` is `pipe { simple[ls,
-  /tmp/shtest-*], simple[head, -n, 1] }`, from the host parser harness and from a guest
-  diagnostic that printed `c->nwords` and `c->words` at the point of use: stage 0 always
-  reports `nw=2 w=<ls></tmp/shtest-*>`.
-- Not the expander's ownership.  `field_add()` and `vec_add()` both `strdup`, so nothing
-  is read after it is freed.
-- Not `glob()` returning the pattern.  `glob()` now returns 0 for a match and
-  `GLOB_NOMATCH` (3, nonzero) for none, and the libc's own tests check both; a failing
-  glob would be visible as `ls: /tmp/shtest-*: no such file or directory`, which is the
-  symptom this bug *was*, before the libc fix.
-- Not the shell's logic in general.  The same source built against glibc runs `shtest`'s
-  whole script 30 times out of 30 with the `glob=` line correct every time.  So it is not
-  reproducible on the host, which means it is either minx's libc or the kernel.
-- Not `fork`.  With `fork` copying, the child's stack is private from its first
-  instruction, and the interleaved-write corruption that used to require the shared frame
-  is gone.
+The arena is one per processor now, which needs no lock: a task is on exactly one processor
+at a time and `syscall_dispatch()` holds interrupts off for the whole of the handler, so
+there is never more than one `exec` in flight on a given CPU.  A machine with 64 processors
+now runs 64 `exec`s at once and none of them wait for each other.
 
-**What has not been established**: where the extra `-n` comes from.  The instrumented runs
-did not reproduce it -- adding the diagnostics changes the timing and the failure did not
-come back in four consecutive runs.  The next thing to try is a diagnostic that fires only
-for a pipeline stage, so it does not perturb the schedule, and that records the words at
-the point of use rather than the expanded `argv`.
+**Nothing faulted, which is why it looked like a shell bug.**  The pointers were valid.  They
+were valid for somebody else.  Both processes finished normally and the only evidence was one
+program reporting an option it had never been given.
+
+**How it was found**, because two of the steps are worth not repeating:
+
+1. A probe in `program_exec_into()` printing `argv` at the point of `exec`.  It showed
+   `[x]exec /bin/ls argv: <head> <-n> <1>` -- the path says `ls` and the arguments say
+   `head -n 1`.
+2. The path is a local `char name[VFS_NAME_MAX]` and the arguments are the static arena, so
+   that one line says two *different* processes were involved, which no amount of reading
+   the shell would have suggested.  The shell was innocent the whole time.
+3. Two checks that came back clean and meant nothing: one keyed on `switch_count == 0`,
+   which the scheduler has already incremented by the time its own code runs, and a
+   side-by-side walk of the parent's and child's page tables that compared **zero** leaves in
+   every fork.  It was comparing zero because `pt_get()` cannot walk the half-built child,
+   and a check that cannot look reports nothing forever while looking as though it is
+   watching.  Rewritten as a self-contained walk it reported 78 leaves checked and 0 shared,
+   which is what finally ruled the memory manager out.
+4. A copy-on-write hypothesis that the same ruling killed: the shell's `args` array did look
+   like it had been overwritten by its sibling's expansion.  It had not.  `args` was read out
+   of the shared arena.
 
 ### 0. `phase6-user`, progress this session -- four real bugs found and fixed
 
@@ -1312,8 +1324,8 @@ keys'                                                 # type at the console head
 `could not read Username for 'https://github.com'` — no credential helper and no
 token available, and AGENTS.md forbids putting tokens in files or remotes. Retried
 at the end of phase 8, again after the four kernel fixes below, again after this
-session's nine, and again after the nine commits that finished phase 9; same answer
-every time. Every phase since phase one has
+session's nine, and again after the nine commits that finished phase 9, and again after the `exec`
+arena fix; same answer every time. Every phase since phase one has
 committed locally for the same reason (see the commit "docs: record phase one push
 limitation").
 
@@ -1432,17 +1444,11 @@ for the length of a null pointer.
 
 ## Next
 
-**Phase 9 is done. Phase 10's coreutils are in and `sh` runs the script; the first thing
-on this list is the last flake, and it is a different bug from the one the list used to
-name.**
+**Phase 9 is done -- 45/45, `shtest` 53 of 53 -- and the coreutils of phase 10 are in.**
 
-`ls /tmp/shtest-* | head -n 1` inside a command substitution passes `-n` to `ls` in
-roughly one run in four, so `shtest`'s `glob=` line comes out empty.  "What is still
-broken" has what has been ruled out — the parser, the expander's ownership, `glob()`'s
-return value, and the shell's logic in general, since the same source against glibc runs
-the script 30 times out of 30 — and so is where to start.  The diagnostics tried so far
-change the timing enough that the failure did not come back, so a probe that fires only for
-a pipeline stage and records the words at the point of use is the thing to try next.
+The last flake this session ended up not being the one the list named at the start of the
+day.  The `ls ... | head -n 1` line that was passing `-n` to `ls` was a single `static`
+`exec` arena shared by all processors; see "The last flake".
 
 **Then: `node_alloc()` bounds-checking its free list.**  It indexes `nodes[ino - 1]`
 before checking that `ino` is a node number, and the kernel redzone reports a node whose

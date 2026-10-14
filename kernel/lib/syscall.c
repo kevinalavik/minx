@@ -645,6 +645,17 @@ long sys_pipe(regs_t *regs) {
  * that gets them truncated and a message, which is a usable answer where a fault is not. */
 #define MAX_EXEC_VECS 256
 
+/* One processor's `exec` scratch: the argument and environment strings, copied out of the
+ * calling program and validated before the loader builds the new stack around them.  Sized
+ * so that a program with the maximum number of arguments and a generous 32 bytes each still
+ * fits, which is far more than anything the shell builds. */
+typedef struct {
+    char  strs[8192];
+    char *argv[MAX_EXEC_VECS + 1];
+    char *envp[MAX_EXEC_VECS + 1];
+    size_t used;
+} exec_arena_t;
+
 static int copy_user_vector(uint64_t from, const char **into, int max) {
     int n = 0;
 
@@ -916,9 +927,27 @@ static long do_exec(regs_t *regs, char *name,
  * `MAX_EXEC_VECS` entries gets that many.  Neither is a crash, and both are answers a
  * shell can report.
  *
- * The arena is static and this is not reentrant -- and it does not need to be.  `exec`
- * replaces the program, so there is no second `exec` in flight from the same task: the
- * `#!` recursion happens *after* everything has been copied, and works from the copies. */
+ *
+ * **One per processor, and not one for the machine.**
+ *
+ * It was one `static` array, on the argument that this is not reentrant "and does not need
+ * to be": `exec` replaces the program, so there is no second `exec` in flight from the same
+ * task.  That is true and it is the wrong question.  A *pipeline* has two tasks execing at
+ * the same moment on two processors, and they were writing at the same `used` offset and
+ * handing each other the pointers they had just stored.
+ *
+ * The symptom is the shell's `ls /tmp/shtest-* | head -n 1` passing `-n` to `ls` about one
+ * run in four.  `ls` was handed the *other* half's arguments -- `head -n 1` -- while the
+ * path, which is a local and so was never shared, still said `/bin/ls`, and `ls` reported
+ * "unknown option" for a flag it had never been given.  Nothing faulted: the pointers were
+ * valid, they were just valid for somebody else, and both processes finished normally.
+ *
+ * Per processor is enough and needs no lock, because a task is on exactly one processor at
+ * a time and `syscall_dispatch()` holds interrupts off for the whole of the handler, so
+ * there is never more than one `exec` in flight on a given CPU.  It is also the answer that
+ * scales: a machine with 64 processors runs 64 `exec`s at once and none of them wait. */
+static exec_arena_t exec_arenas[MAX_CPU_COUNT];
+
 long sys_exec(regs_t *regs) {
     uint64_t path = arg(regs, 0);
     uint64_t argv = arg(regs, 1);
@@ -948,10 +977,7 @@ long sys_exec(regs_t *regs) {
         errno_return(nlen == -ENAMETOOLONG ? ENAMETOOLONG : EFAULT);
     }
 
-    static char  exec_strs[8192];
-    static char *exec_argv[MAX_EXEC_VECS + 1];
-    static char *exec_envp[MAX_EXEC_VECS + 1];
-    size_t       used = 0;
+    exec_arena_t *a = &exec_arenas[percpu_self_index()];
 
     /* Copy one string into the arena, or say that there was no room.  Returning false is
      * not an error for the caller: a program whose arguments do not fit gets the ones that
@@ -960,7 +986,7 @@ long sys_exec(regs_t *regs) {
         do {                                                                      \
             size_t len = 0;                                                       \
                                                                                   \
-            while (used + len + 1 < sizeof(exec_strs) && len < 4096) {            \
+            while (a->used + len + 1 < sizeof(a->strs) && len < 4096) {           \
                 char ch;                                                          \
                                                                                   \
                 if (!syscall_copy_from_user(&ch, (src) + len, 1))                 \
@@ -969,13 +995,13 @@ long sys_exec(regs_t *regs) {
                 if (ch == 0)                                                      \
                     break;                                                        \
                                                                                   \
-                exec_strs[used + len] = ch;                                       \
+                a->strs[a->used + len] = ch;                                      \
                 len++;                                                            \
             }                                                                     \
                                                                                   \
-            exec_strs[used + len] = 0;                                            \
-            (dst_index) = exec_strs + used;                                       \
-            used += len + 1;                                                      \
+            a->strs[a->used + len] = 0;                                           \
+            (dst_index) = a->strs + a->used;                                      \
+            a->used += len + 1;                                                    \
         } while (0)
 
     {
@@ -986,16 +1012,16 @@ long sys_exec(regs_t *regs) {
             return -EFAULT;
 
         for (int i = 0; i < n; i++) {
-            if (used >= sizeof(exec_strs) - 1) {
+            if (a->used >= sizeof(a->strs) - 1) {
                 kprintf("exec: %s has arguments past %zu bytes; truncating\n",
-                        name, sizeof(exec_strs));
+                        name, sizeof(a->strs));
                 break;
             }
 
-            COPY_ONE(exec_argv[i], (uint64_t)(uintptr_t)raw[i]);
+            COPY_ONE(a->argv[i], (uint64_t)(uintptr_t)raw[i]);
         }
 
-        exec_argv[n] = NULL;
+        a->argv[n] = NULL;
     }
 
     {
@@ -1006,13 +1032,13 @@ long sys_exec(regs_t *regs) {
             return -EFAULT;
 
         for (int i = 0; i < n; i++) {
-            if (used >= sizeof(exec_strs) - 1)
+            if (a->used >= sizeof(a->strs) - 1)
                 break;
 
-            COPY_ONE(exec_envp[i], (uint64_t)(uintptr_t)raw[i]);
+            COPY_ONE(a->envp[i], (uint64_t)(uintptr_t)raw[i]);
         }
 
-        exec_envp[n] = NULL;
+        a->envp[n] = NULL;
     }
 
     #undef COPY_ONE
@@ -1020,8 +1046,8 @@ long sys_exec(regs_t *regs) {
     /* The arena is `char *[]` because that is what `COPY_ONE` fills in, and `do_exec`
      * promises not to write through either vector.  The cast says that once, here, rather
      * than making the whole path copy strings twice. */
-    return do_exec(regs, name, (const char *const *)exec_argv,
-                   (const char *const *)exec_envp);
+    return do_exec(regs, name, (const char *const *)a->argv,
+                   (const char *const *)a->envp);
 }
 
 long sys_open(regs_t *regs) {
